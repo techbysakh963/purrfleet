@@ -9,6 +9,7 @@ Read-only over Claude Code's own files:
 Its only write is its own cache: $XDG_RUNTIME_DIR/claude-fleet/cache.json, holding the
 byte offset reached in each transcript, so each run parses only the lines that are new.
 """
+import fcntl
 import json
 import os
 import stat
@@ -25,6 +26,11 @@ HUD = os.path.join(RT, "claude-hud") if RT and os.path.isdir(os.path.join(RT, "c
 # the cache lives in a private per-user folder, never a shared temp folder
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "purrfleet")
 CACHE = os.path.join(CACHE_DIR, "cache.json")
+SNAPSHOT = os.path.join(CACHE_DIR, "snapshot.json")  # the last result, shared by every Claude window
+LOCK = os.path.join(CACHE_DIR, "scan.lock")
+FRESH_FOR = 1.2  # seconds a snapshot is reused before anyone scans again
+HISTORY_EVERY = 30  # seconds between walks of every transcript folder
+RECENT_WINDOW = 600  # the Feed's tally covers the last 10 minutes
 CACHE_VERSION = 3
 GIT_EVERY = 20  # seconds between `git diff --shortstat` runs per folder
 READ_BUDGET = 24 * 1024 * 1024   # bytes of transcript parsed per run; a big backlog catches up over runs
@@ -387,7 +393,8 @@ def scan_file(path, entry, budget, feed_sid, feed, names):
     return len(chunk)
 
 
-def main():
+def build():
+    """One full scan: the snapshot every window shows."""
     now = time.time()
     cache = load_cache()
     files = cache["files"]
@@ -421,18 +428,23 @@ def main():
             if g.endswith(".jsonl"):
                 live_paths[os.path.join(sub, g)] = s["sessionId"]
     cutoff = now - DAYS * 86400
-    recent = []
-    pd = os.path.join(CLAUDE, "projects")
-    for root, _, fs in os.walk(pd):
-        for g in fs:
-            if g.endswith(".jsonl"):
-                p = os.path.join(root, g)
-                try:
-                    if os.path.getmtime(p) >= cutoff:
-                        recent.append(p)
-                except OSError:
-                    pass
+    # walking every transcript folder is the slow part, so it happens every 30 s; live
+    # sessions' transcripts are read on every scan regardless
+    if now - cache.get("historyAt", 0) >= HISTORY_EVERY or not isinstance(cache.get("history"), list):
+        found = []
+        for root, _, fs in os.walk(os.path.join(CLAUDE, "projects")):
+            for g in fs:
+                if g.endswith(".jsonl"):
+                    p = os.path.join(root, g)
+                    try:
+                        if os.path.getmtime(p) >= cutoff:
+                            found.append(p)
+                    except OSError:
+                        pass
+        cache["history"], cache["historyAt"] = found, now
+    recent = [p for p in cache["history"] if os.path.exists(p)]
     is_first = {p: p not in files for p in live_paths}
+    feed_before = len(feed)
     for p in list(live_paths) + [p for p in recent if p not in live_paths]:
         entry = files.setdefault(p, {})
         # the very first read of a live transcript would flood the feed with history
@@ -445,6 +457,15 @@ def main():
     for p in list(files):
         if p not in keep:
             del files[p]
+    # every call of the last 10 minutes is counted, not just the few the Feed keeps
+    tally_log = cache.get("tally", []) if isinstance(cache.get("tally"), list) else []
+    tally_log += [[e["t"], e["sid"], e["tool"]] for e in feed[feed_before:]]
+    tally_log = [x for x in tally_log if now - x[0] < RECENT_WINDOW][-20000:]
+    cache["tally"] = tally_log
+    tally = {}
+    for _, sid, tool in tally_log:
+        tally.setdefault(sid, {}).setdefault(tool, 0)
+        tally[sid][tool] += 1
     feed = sorted(feed, key=lambda e: e["t"])[-FEED_KEEP:]
     cache["feed"] = feed
 
@@ -502,11 +523,12 @@ def main():
     sysinfo = system(cache, now)
     save_cache(cache)
     total_in = tot["in"] + tot["cw"] + tot["cr"]
-    json.dump({
+    return {
         "now": int(now),
         "sys": sysinfo,
         "sessions": out_sessions,
         "feed": feed[-40:],
+        "tally": tally,
         "cost": {
             "today": round(per_day.get(today, 0), 4),
             "tokens": sum(tot.values()),
@@ -515,7 +537,39 @@ def main():
             "models": {m: round(v, 4) for m, v in sorted(models.items(), key=lambda kv: -kv[1])},
             "pendingBytes": pending,
         },
-    }, sys.stdout, separators=(",", ":"))
+    }
+
+
+def fresh_snapshot():
+    """The shared snapshot, when another window wrote it a moment ago."""
+    try:
+        if time.time() - os.path.getmtime(SNAPSHOT) < FRESH_FOR:
+            with open(SNAPSHOT, encoding="utf-8") as f:
+                return f.read()
+    except OSError:
+        pass
+    return None
+
+
+def main():
+    # Several Claude windows each run FLEET: one scans while holding the lock, and the
+    # rest reuse its snapshot, so the work happens once however many windows are open.
+    private_dir(CACHE_DIR)
+    text = fresh_snapshot()
+    if text is None:
+        fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            text = fresh_snapshot()  # whoever held the lock may have just written one
+            if text is None:
+                text = json.dumps(build(), separators=(",", ":"))
+                tmp_fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=".snap-")
+                with os.fdopen(tmp_fd, "w") as f:
+                    f.write(text)
+                os.replace(tmp, SNAPSHOT)
+        finally:
+            os.close(fd)
+    sys.stdout.write(text)
 
 
 if __name__ == "__main__":

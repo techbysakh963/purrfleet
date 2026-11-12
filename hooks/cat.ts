@@ -189,7 +189,8 @@ export function catPixels(t: number, w: number, h: number, mood: Mood, p: Palett
     // z's drift up and to the right, fading
     for (let k = 0; k < 2; k++) {
       const phase = (t * 0.3 + k / 2) % 1
-      const zx = ox + W + 3 + phase * 10 + (k === 1 ? 2 : 0)
+      // the z's drift up beside the head, and never off the canvas
+      const zx = Math.min(w - 5, ox + W + 1 + phase * 6 + (k === 1 ? 1 : 0))
       const zy = oy + 3 - phase * (h * 0.45)
       if (zy > -5) glyph(c, phase > 0.5 ? 'Z' : 'z', zx, zy, mix(p.void, p.star, 1 - phase * 0.8))
     }

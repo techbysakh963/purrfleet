@@ -2,7 +2,6 @@ import type { Elements } from 'claude-code'
 
 import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
 import { modeLabel, summaryOf } from './crew'
-import { idleFrame } from './anim'
 import { ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, spark, tok, usd } from './fmt'
 import type { Palette } from './theme'
 import { heat, ramp } from './theme'
@@ -34,6 +33,8 @@ export type Acts = {
   noteRemove: (folder: string, id: number) => void
   noteApprove: (folder: string, id: number) => void
   openNote: (file: string) => void
+  showAllThreads: () => void
+  showAllTurns: (thread: string) => void
 }
 
 export type View = {
@@ -48,7 +49,6 @@ export type View = {
   /** pixel art, drawn only where the surface has a Raster (the terminal) */
   aurora: Node | null
   hero: Node | null
-  frame: number
   threads: readonly CrewThread[]
   crewSel: string | null
   crewAgent: CrewAgent
@@ -57,6 +57,8 @@ export type View = {
   launcher: Node | null
   /** the turn whose whole answer is open: "thread#n" */
   crewOpenTurn: string | null
+  crewShowAll: boolean
+  crewAllTurns: string | null
   notebook: { folder: string; file: string; notes: readonly CrewNote[] }
 }
 
@@ -160,47 +162,6 @@ export function Pane(E: Els, v: View, act: Acts) {
         </Button>
         <Text color={p.dim}>ctrl+x tab: keys</Text>
       </Box>
-    </Box>
-  )
-}
-
-function Legend(E: Els, v: View) {
-  const { Box, Text } = E
-  const { p } = v
-  const c = v.snap.cost
-  return (
-    <Box flexDirection="column" marginLeft={2} flexGrow={1}>
-      {v.snap.sessions.some(needsYou) ? (
-        <Text color={p.warn} weight="bold">
-          ▲ someone needs you
-        </Text>
-      ) : v.snap.sessions.some(isBusy) ? (
-        <Text color={p.accent}>◉ the fleet is working</Text>
-      ) : (
-        <Text color={p.dim}>○ all quiet · the cat is napping</Text>
-      )}
-      {v.snap.sessions.map(s => {
-        const look = phaseLook(s.phase, p)
-        return (
-          <Text wrap="truncate-end">
-            <Text color={sessionColor(s, p)}>● </Text>
-            <Text color={p.text}>{cut(s.name, 18).padEnd(18)} </Text>
-            <Text color={look.color}>{look.label}</Text>
-            <Text color={p.dim}> {ago(v.snap.now - s.phaseSince)}</Text>
-          </Text>
-        )
-      })}
-      <Text> </Text>
-      <Text>
-        <Text color={p.dim}>today </Text>
-        <Text color={p.gold}>{usd(c.today)}</Text>
-        <Text color={p.dim}> · {tok(c.tokens)} tok</Text>
-      </Text>
-      <Text>
-        <Text color={p.dim}>cache </Text>
-        {Gauge(E, c.cacheHit * 100, 8, { ...p, ok: p.bad, bad: p.ok })}
-        <Text color={p.ok}> {Math.round(c.cacheHit * 100)}%</Text>
-      </Text>
     </Box>
   )
 }
@@ -311,30 +272,60 @@ function Row(E: Els, v: View, s: Session, act: Acts) {
   )
 }
 
+/** What the whole fleet is up to, in one line. */
+function FleetStatus(E: Els, v: View) {
+  const { Text } = E
+  const { p } = v
+  const need = v.snap.sessions.filter(needsYou)
+  const busy = v.snap.sessions.filter(isBusy).length
+  if (need.length > 0) {
+    return (
+      <Text color={p.warn} weight="bold" wrap="truncate-end">
+        ▲ {need.map(s => s.name).join(', ')} {need.length === 1 ? 'needs' : 'need'} you
+      </Text>
+    )
+  }
+  return busy > 0 ? (
+    <Text color={p.accent}>
+      ◉ {busy} of {v.snap.sessions.length} working
+    </Text>
+  ) : (
+    <Text color={p.dim}>○ all quiet · the cat is napping</Text>
+  )
+}
+
+const CAT_COLS = 26 // the compact cat beside the rows (Raster columns)
+
 function Live(E: Els, v: View, act: Acts) {
   const { Box, Text } = E
   const { p } = v
-  const isQuiet = !v.snap.sessions.some(s => isBusy(s) || needsYou(s))
+  // the rows come first; the cat sits beside them when there is room, else below
+  const isBeside = v.hero !== null && v.width >= 70
+  const rowsView = isBeside ? { ...v, width: v.width - CAT_COLS - 2 } : v
+  const rows = ordered(v.snap.sessions).map(s =>
+    s.sid === v.selected ? Card(E, rowsView, s, act) : Row(E, rowsView, s, act),
+  )
 
   return (
     <Box flexDirection="column">
-      {v.hero ? (
+      {FleetStatus(E, v)}
+      <Text color={p.border}>{'─'.repeat(Math.max(10, v.width))}</Text>
+      {isBeside ? (
         <Box flexDirection="row">
-          {v.hero}
-          {Legend(E, v)}
-        </Box>
-      ) : isQuiet && v.scene !== 'off' ? (
-        <Box flexDirection="column">
-          {idleFrame(v.frame, v.width).map(line => (
-            <Text color={p.accent}>{line}</Text>
-          ))}
+          <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+            {rows}
+          </Box>
+          <Box marginLeft={2} flexShrink={0}>
+            {v.hero}
+          </Box>
         </Box>
       ) : (
-        Legend(E, v)
+        <Box flexDirection="column">
+          {rows}
+          {v.hero ? <Box marginTop={1}>{v.hero}</Box> : null}
+        </Box>
       )}
-      <Text color={p.border}>{'─'.repeat(Math.max(10, v.width))}</Text>
-      {ordered(v.snap.sessions).map(s => (s.sid === v.selected ? Card(E, v, s, act) : Row(E, v, s, act)))}
-      <Text color={p.dim}>press a row for its details · 6 for its actions</Text>
+      <Text color={p.dim}>press a row for its details · 6 for actions and the guide</Text>
     </Box>
   )
 }
@@ -369,9 +360,23 @@ function Feed(E: Els, v: View, act: Acts) {
   const { p } = v
   const colorOf = new Map(v.snap.sessions.map(s => [s.sid, sessionColor(s, p)]))
   const all = v.snap.feed.filter(f => !v.feedFilter || f.sid === v.feedFilter)
-  const recent = all.filter(f => v.snap.now - f.t < 600)
+  // the collector counts every call of the last 10 minutes; the feed itself keeps only a few
   const tally = new Map<string, number>()
-  for (const f of recent) tally.set(kindOf(f.tool), (tally.get(kindOf(f.tool)) ?? 0) + 1)
+  let recentCount = 0
+  if (v.snap.tally) {
+    for (const [sid, tools] of Object.entries(v.snap.tally)) {
+      if (v.feedFilter && sid !== v.feedFilter) continue
+      for (const [tool, n] of Object.entries(tools)) {
+        tally.set(kindOf(tool), (tally.get(kindOf(tool)) ?? 0) + n)
+        recentCount += n
+      }
+    }
+  } else {
+    for (const f of all.filter(x => v.snap.now - x.t < 600)) {
+      tally.set(kindOf(f.tool), (tally.get(kindOf(f.tool)) ?? 0) + 1)
+      recentCount += 1
+    }
+  }
   const items = all.slice(-24).reverse()
   const w = Math.max(30, v.width)
 
@@ -399,7 +404,7 @@ function Feed(E: Els, v: View, act: Acts) {
       </Box>
       <Text wrap="truncate-end">
         <Text color={p.dim}>last 10 min </Text>
-        <Text color={p.text}>{recent.length}</Text>
+        <Text color={p.text}>{recentCount}</Text>
         <Text color={p.dim}> calls</Text>
         {[...tally]
           .sort((a, b) => b[1] - a[1])
@@ -513,7 +518,14 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
           ◇ carried-over brief: {cut(t.brief.replace(/\s+/g, ' '), w - 24)}
         </Text>
       ) : null}
-      {t.turns.slice(-4).map(u => {
+      {t.turns.length > 4 ? (
+        <Button key={`turns-${t.name}`} plain onPress={() => act.showAllTurns(t.name)}>
+          <Text color={p.cyan}>
+            {v.crewAllTurns === t.name ? '▾ show only the last 4 messages' : `▸ show all ${t.turns.length} messages`}
+          </Text>
+        </Button>
+      ) : null}
+      {(v.crewAllTurns === t.name ? t.turns : t.turns.slice(-4)).map(u => {
         const tl = turnLook(v, u.status)
         return (
           <Box flexDirection="column" marginTop={1}>
@@ -582,7 +594,6 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
           </Box>
         )
       })}
-      {t.turns.length > 4 ? <Text color={p.dim}>+{t.turns.length - 4} earlier messages (crew_read turn n)</Text> : null}
     </Box>
   )
 }
@@ -675,8 +686,12 @@ function Crew(E: Els, v: View, act: Acts) {
         </Box>
       ) : (
         <Box flexDirection="column" marginTop={1}>
-          {list.slice(0, 8).map(t => ThreadView(E, v, t, act))}
-          {list.length > 8 ? <Text color={p.dim}>+{list.length - 8} older threads</Text> : null}
+          {(v.crewShowAll ? list : list.filter((t, i) => i < 8 || t.name === v.crewSel)).map(t => ThreadView(E, v, t, act))}
+          {list.length > 8 ? (
+            <Button key="threads-all" plain onPress={act.showAllThreads}>
+              <Text color={p.cyan}>{v.crewShowAll ? '▾ show only the 8 newest threads' : `▸ show all ${list.length} threads`}</Text>
+            </Button>
+          ) : null}
         </Box>
       )}
     </Box>
@@ -986,7 +1001,9 @@ function Actions(E: Els, v: View, act: Acts) {
   )
 }
 
-export function Band(E: Els, snap: Snapshot, p: Palette) {
+export type BandInfo = { age: number; isStale: boolean; crew: { running: number; failed: number } }
+
+export function Band(E: Els, snap: Snapshot, p: Palette, info: BandInfo = { age: 0, isStale: false, crew: { running: 0, failed: 0 } }) {
   const { Box, Text } = E
   const busy = snap.sessions.filter(isBusy).length
   const agents = snap.sessions.reduce((n, s) => n + s.agents.length, 0)
@@ -1011,6 +1028,24 @@ export function Band(E: Els, snap: Snapshot, p: Palette) {
         {Sep(E, p)}
         <Text color={p.gold}>{usd(snap.cost.today)}</Text>
         <Text color={p.dim}> today</Text>
+        {info.crew.running ? (
+          <Text>
+            {Sep(E, p)}
+            <Text color={p.violet}>◇ crew {info.crew.running} running</Text>
+          </Text>
+        ) : null}
+        {info.crew.failed ? (
+          <Text>
+            {Sep(E, p)}
+            <Text color={p.bad}>× {info.crew.failed} failed</Text>
+          </Text>
+        ) : null}
+        {info.isStale ? (
+          <Text>
+            {Sep(E, p)}
+            <Text color={p.warn}>◌ stale {info.age}s</Text>
+          </Text>
+        ) : null}
       </Text>
       {need.length > 0 ? (
         <Text>

@@ -1,10 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Snapshot } from '../types'
-import { IDLE_ROWS, idleFrame } from './anim'
 import { ago, bar, spark, usd } from './fmt'
 import { catCells } from './cat'
-import { argvFor, brief, lines, needsCompaction, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
+import { argvFor, brief, lines, needsCompaction, notebookDelta, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
 import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { PALETTES } from './theme'
@@ -99,14 +98,6 @@ test('the cat paints a full raster in every mood and palette', async () => {
     }
   }
   expect(toBase64(Uint32Array.of(0x2588, 0xff8800, 0x01000000))).toBe('iCUAAACI/wAAAAAB')
-})
-
-test('the idle scene keeps its size and moves', async () => {
-  const a = idleFrame(0, 40)
-  const b = idleFrame(5, 40)
-  expect(a.length).toBe(IDLE_ROWS)
-  expect(a.join('\n')).not.toBe(b.join('\n'))
-  expect(a[a.length - 1]).toContain('standby')
 })
 
 test('before the first scan the pane says it is scanning', async ($, on) => {
@@ -390,4 +381,60 @@ test('regressions from the Codex review stay fixed', async () => {
   expect(r).toContain('"turn": 3')
   // a last stream line without a newline is held, then still counts at the end
   expect(lines('', '{"type":"thread.started","thread_id":"t1"}').rest).toContain('thread.started')
+})
+
+test('Live: the fleet status, then the rows; the cat beside them when wide, below when narrow', async ($, on) => {
+  on('state.get', (_, e, next) =>
+    e.key === 'snap' ? { value: { value: { shape: 'snap-2', value: SNAP }, version: 1 } } : next(e),
+  )
+  const wide = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 100 } })
+  expect(await wide.find({ type: 'Text', text: /argus needs you/ })).toBeDefined()
+  expect(await wide.find({ key: 's-sid-a' })).toBeDefined()
+  expect(await wide.find({ key: 'hero' })).toBeDefined()
+  await wide.unmount()
+  const narrow = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 50 } })
+  expect(await narrow.find({ key: 'hero' })).toBeDefined()
+  await narrow.unmount()
+})
+
+test('a resumed helper gets only the notebook changes; a fresh one gets all of it', async () => {
+  const a = { id: 1, text: 'tests use vitest', by: 'you' as const, at: 0 }
+  const b = { id: 2, text: 'deploy via CI', by: 'claude' as const, at: 0 }
+  const first = notebookDelta(undefined, [a], true)
+  expect(first.isDelta).toBe(false)
+  expect(first.text).toContain('tests use vitest')
+  const same = notebookDelta(first.sent, [a], false)
+  expect(same.text).toBe('') // nothing changed: nothing sent
+  const changed = notebookDelta(first.sent, [b], false)
+  expect(changed.isDelta).toBe(true)
+  expect(changed.text).toContain('+ deploy via CI')
+  expect(changed.text).toContain('no longer valid: tests use vitest')
+  expect(notebookDelta(changed.sent, [a, b], true).isDelta).toBe(false) // compaction: all again
+})
+
+test('the band shows crew counts and says when data is stale; old threads and turns can be browsed', async ($, on) => {
+  const turn = (n: number) => ({ n, by: 'you' as const, ask: `q${n}`, status: 'done' as const, started: 0, answer: `SUMMARY: a${n}`, log: [], contextTokens: 1, outputTokens: 1, isHanded: true })
+  const thread = (i: number, status: 'idle' | 'running' | 'failed' = 'idle') => ({
+    name: `t${i}`, agent: 'codex' as const, model: 'default', effort: 'default', mode: 'read' as const, cwd: '/p', by: 'you' as const,
+    session: 's', status, turns: i === 0 ? [1, 2, 3, 4, 5, 6].map(turn) : [turn(1)], compactions: 0, brief: '', created: 0, updated: 10 - i,
+  })
+  const list = [thread(0), thread(1, 'running'), thread(2, 'failed'), ...[3, 4, 5, 6, 7, 8, 9].map(i => thread(i))]
+  let tab = 'crew'
+  on('state.get', (_, e, next) => {
+    if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: { ...SNAP, now: Math.floor(Date.now() / 1000) - 60 } }, version: 1 } }
+    if (e.key === 'threads') return { value: { value: { shape: 'threads-1', value: list }, version: 1 } }
+    if (e.key === 'tab') return { value: { value: tab, version: 1 } }
+    if (e.key === 'crewSel') return { value: { value: 't0', version: 1 } }
+    return next(e)
+  })
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await band.find({ type: 'Text', text: /crew 1 running/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /1 failed/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /stale/ })).toBeDefined()
+  await band.unmount()
+  const crew = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await crew.find({ type: 'Text', text: /show all 10 threads/ })).toBeDefined()
+  expect(await crew.find({ type: 'Text', text: /show all 6 messages/ })).toBeDefined()
+  expect(await crew.find({ type: 'Text', text: /data is \d+s old/ })).toBeDefined()
+  await crew.unmount()
 })

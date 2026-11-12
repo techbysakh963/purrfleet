@@ -63,6 +63,8 @@ export type Cost = {
 export type Snapshot = {
   now: number
   sys?: SysInfo
+  /** every tool call of the last 10 minutes: session id → tool → count */
+  tally?: Record<string, Record<string, number>>
   sessions: Session[]
   feed: FeedItem[]
   cost: Cost
@@ -119,6 +121,8 @@ export type CrewThread = {
   compactions: number
   /** the turn number the last compaction happened before (0: never) */
   compactedAt?: number
+  /** the approved notes this helper's conversation has already been sent */
+  sentNotes?: { id: number; text: string }[]
   /** the state brief a compaction carried into the fresh conversation */
   brief: string
   created: number
@@ -163,6 +167,8 @@ declare module 'claude-code' {
       crewOpenTurn: string | null
       crewDraft: string
       crewInputGen: number
+      crewShowAll: boolean
+      crewAllTurns: string | null
       notebooks: Record<string, CrewNote[]>
     }
   }

@@ -31,7 +31,8 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   `/crew new codex|agy <message>` opens a thread, `/crew @thread <message>` picks one, `/crew` lists them.
 - `/fleet` opens or closes the pane. The band above the prompt is always on.
 - `ctrl+x tab` gives the pane the keyboard: `1`–`6` switch tabs, `t` cycles the theme, `a` toggles the cat.
-- **Live**: one calm row per session, needs-you on top; press a row to expand it.
+- **Live**: a one-line fleet status, then one calm row per session (needs-you on top; press one
+  to expand it) with a small cat beside them that naps, works or panics with the fleet.
 - **Feed**: every tool call across sessions, grouped, with a 10-minute summary.
 - **Crew**: named, ongoing threads with Codex (`codex exec` / `exec resume`) and Antigravity
   (`agy -p` / `--conversation`), each with its own model, effort and mode. Claude talks to them
@@ -53,7 +54,8 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
 
 ## How it reads the machine
 
-Read-only: `~/.claude/sessions/*.json`, the Claude Core HUD hook state under
+One collector serves every Claude window: it scans under a lock and the others reuse its snapshot
+(fresh for 1.2 s); the full transcript walk runs every 30 s. Read-only: `~/.claude/sessions/*.json`, the Claude Core HUD hook state under
 `$XDG_RUNTIME_DIR/claude-hud/`, and transcripts under `~/.claude/projects/`, parsed incrementally
 by `bin/fleet_scan.py`. Cost is an estimate at API list prices (`PRICES` in that file).
 

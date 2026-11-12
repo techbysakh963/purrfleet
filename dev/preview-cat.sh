@@ -6,7 +6,7 @@ for f in theme cat; do sed -E "s#from '\./([a-z]+)'#from './\1.ts'#" "$H/hooks/$
 cat > "$B/dump.mjs" <<'JS'
 import { catCells } from './cat.ts'
 import { PALETTES } from './theme.ts'
-const cols = 34, rows = 12, out = []
+const cols = 26, rows = 9, out = []
 for (const mood of ['sleep', 'work', 'alarm'])
   out.push({ label: mood, frames: [0.3, 1.0, 1.65, 2.4, 3.71].map(t => ({ cols, rows, cells: Array.from(catCells(t, cols, rows, mood, PALETTES[0])) })) })
 console.log(JSON.stringify(out))

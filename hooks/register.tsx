@@ -15,7 +15,7 @@ import {
   listing,
   modeLabel,
   needsCompaction,
-  notebookText,
+  notebookDelta,
   notesIn,
   parseLine,
   report,
@@ -55,6 +55,8 @@ const crewOpenTurn = atom({ plugin: 'fleet', key: 'crewOpenTurn' } as const, nul
 const notebooks = atom({ plugin: 'fleet', key: 'notebooks' } as const, {})
 const crewDraft = atom({ plugin: 'fleet', key: 'crewDraft' } as const, '')
 // bumped after each send: a fresh, empty field (the field owns its text while you type)
+const crewShowAll = atom({ plugin: 'fleet', key: 'crewShowAll' } as const, false)
+const crewAllTurns = atom({ plugin: 'fleet', key: 'crewAllTurns' } as const, null)
 const crewInputGen = atom({ plugin: 'fleet', key: 'crewInputGen' } as const, 0)
 
 // Module variables start over on a reload; everything drawn lives in $.state.
@@ -73,6 +75,7 @@ let vaultDir = ''
 const lastWritten = new Map<string, string>() // what FLEET last wrote to each notebook note
 const lastSeen = new Map<string, number>() // the mtime FLEET last looked at
 let pollCount = 0
+let lastOk = Date.now() // when the collector last answered
 // the children of running crew turns, by thread; leaving a loop (return) kills its child
 const running = new Map<string, AsyncIterator<unknown, unknown>>()
 
@@ -103,6 +106,7 @@ async function poll($: EngineInterface): Promise<void> {
       return
     }
     const next = JSON.parse(run.stdout) as Snapshot
+    lastOk = Date.now()
     remember(next)
     await update($, snap, () => next)
     await update($, error, () => null)
@@ -132,6 +136,11 @@ async function alertOnNew($: EngineInterface, sessions: Session[]): Promise<void
 }
 
 /** Repaint every mounted Raster in place; one that no longer stands is forgotten. */
+async function watchdog($: EngineInterface): Promise<void> {
+  const age = Math.round((Date.now() - lastOk) / 1000)
+  if (age > 6) await update($, error, () => `the collector hasn't answered for ${age}s; what you see may be out of date`)
+}
+
 let isPainting = false
 
 async function paint($: EngineInterface): Promise<void> {
@@ -346,7 +355,9 @@ async function runTurn(
   }
   if (await isStopped()) return
   const notes = (await read($, notebooks))[t.cwd] ?? []
-  const res = await execTurn($, t, brief(t, by, task, context, seed, notebookText(notes)), n, false)
+  const nb = notebookDelta(t.sentNotes, notes, !t.session)
+  await patchThread($, name, x => ({ ...x, sentNotes: nb.sent }))
+  const res = await execTurn($, t, brief(t, by, task, context, seed, nb.text, nb.isDelta), n, false)
   // what the helper offered for the shared notebook goes in, signed by it
   if (res.ok) await addNotes($, t.cwd, notesIn(res.answer), t.agent)
   await patchThread($, name, x => {
@@ -949,6 +960,8 @@ function acts($: EngineInterface): Acts {
     crewOpen: key => void update($, crewOpenTurn, cur => (cur === key ? null : key)),
     noteRemove: (folder, id) => void removeNote($, folder, id),
     noteApprove: (folder, id) => void approveNote($, folder, id),
+    showAllThreads: () => void update($, crewShowAll, x => !x),
+    showAllTurns: name => void update($, crewAllTurns, cur => (cur === name ? null : name)),
     openNote: file => void openPath($, `obsidian://open?path=${encodeURIComponent(file)}`),
   }
 }
@@ -1000,6 +1013,8 @@ export const register: Register = on => {
     void poll($)
     $.clock.every(POLL_MS, () => void poll($))
     $.clock.every(FRAME_MS, () => void (mounted.size > 0 ? paint($) : undefined))
+    // the watchdog: a collector that stopped answering is said out loud, not left looking current
+    $.clock.every(5000, () => void watchdog($))
     // the pane opens only on /fleet; the band above the prompt is always there
 
     return started
@@ -1146,11 +1161,17 @@ export const register: Register = on => {
           </Box>
         </Box>
       ) : null
-      const hero = currentTab === 'live' && sceneName !== 'off' ? raster('hero', { kind: 'cat', cols: 34, rows: 12 }) : null
+      const hero = currentTab === 'live' && sceneName !== 'off' ? raster('hero', { kind: 'cat', cols: 26, rows: 9 }) : null
       mounted = next
 
+      const age = Math.max(0, Math.round(Date.now() / 1000 - s.now))
       return (
         <Box flexDirection="column">
+          {err || age > 6 ? (
+            <Text color={palette.warn} wrap="wrap">
+              ◌ {err ?? `data is ${age}s old`}
+            </Text>
+          ) : null}
           {Pane(
             E,
             {
@@ -1164,13 +1185,14 @@ export const register: Register = on => {
               scene: sceneName === 'off' ? 'off' : 'cat',
               aurora,
               hero,
-              frame: Math.floor(Date.now() / 140),
               threads: cThreads,
               crewSel: target ? target.name : null,
               crewAgent: cAgent,
               crewMode: await read($, crewMode),
               launcher,
               crewOpenTurn: await read($, crewOpenTurn),
+              crewShowAll: await read($, crewShowAll),
+              crewAllTurns: await read($, crewAllTurns),
               notebook: {
                 file: vaultDir ? notebookPath(vaultDir, target?.cwd ?? cFolder) : '',
                 folder: target?.cwd ?? cFolder,
@@ -1179,7 +1201,6 @@ export const register: Register = on => {
             },
             acts($),
           )}
-          {err ? <Text color={palette.bad}>{err}</Text> : null}
         </Box>
       )
     } catch (failure) {
@@ -1198,6 +1219,12 @@ export const register: Register = on => {
     const s = await read($, snap)
     if (e.props.hasSurvey || s === null) return next(e)
 
-    return Band($.ui.resolve(e), s, paletteOf(await read($, theme)))
+    const list = await read($, threads)
+    const crewNow = {
+      running: list.filter(t => t.status === 'running').length,
+      failed: list.filter(t => t.status === 'failed').length,
+    }
+    const age = Math.max(0, Math.round(Date.now() / 1000 - s.now))
+    return Band($.ui.resolve(e), s, paletteOf(await read($, theme)), { age, isStale: age > 6 || (await read($, error)) !== null, crew: crewNow })
   })
 }
