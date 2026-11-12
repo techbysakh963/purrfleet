@@ -73,6 +73,14 @@ export type Tab = 'live' | 'needs' | 'feed' | 'crew' | 'cost' | 'system' | 'acti
 export type CrewAgent = 'codex' | 'agy'
 export type CrewMode = 'read' | 'edit'
 
+/** A fact in a project's shared crew notebook: what every helper's brief carries. */
+export type CrewNote = {
+  id: number
+  text: string
+  by: 'claude' | 'codex' | 'agy' | 'you'
+  at: number
+}
+
 /** One message to a crew thread and the helper's answer to it. */
 export type CrewTurn = {
   n: number
@@ -147,6 +155,9 @@ declare module 'claude-code' {
       crewModel: string
       crewEffort: string
       crewModels: { codex: string[]; agy: string[] }
+      crewFolder: string | null
+      crewOpenTurn: string | null
+      notebooks: Record<string, CrewNote[]>
     }
   }
 }

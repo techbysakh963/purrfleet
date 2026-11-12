@@ -4,7 +4,7 @@ import type { Snapshot } from '../types'
 import { IDLE_ROWS, idleFrame } from './anim'
 import { ago, bar, spark, usd } from './fmt'
 import { catCells } from './cat'
-import { argvFor, brief, lines, parseLine, report, slug, summaryOf } from './crew'
+import { argvFor, brief, lines, needsCompaction, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
 import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { PALETTES } from './theme'
@@ -224,6 +224,8 @@ test('the Crew and System tabs draw threads and process groups', async ($, on) =
     if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: { ...SNAP, sys } }, version: 1 } }
     if (e.key === 'threads') return { value: { value: { shape: 'threads-1', value: [thread] }, version: 1 } }
     if (e.key === 'tab') return { value: { value: tab, version: 1 } }
+    if (e.key === 'crewSel') return { value: { value: 'auth-review', version: 1 } }
+    if (e.key === 'crewOpenTurn') return { value: { value: 'auth-review#1', version: 1 } }
     return next(e)
   })
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -231,6 +233,8 @@ test('the Crew and System tabs draw threads and process groups', async ($, on) =
     const crew = await $.ui.mount({ ...PANE, surface })
     expect(await crew.find({ type: 'Text', text: /auth-review/ })).toBeDefined()
     expect(await crew.find({ type: 'Text', text: /Two issues/ })).toBeDefined()
+    expect(await crew.find({ type: 'Text', text: /hide full answer/ })).toBeDefined()
+    expect(await crew.find({ type: 'Text', text: /shared notebook/ })).toBeDefined()
     await crew.unmount()
     tab = 'system'
     const system = await $.ui.mount({ ...PANE, surface })
@@ -238,4 +242,42 @@ test('the Crew and System tabs draw threads and process groups', async ($, on) =
     expect(await system.find({ type: 'Text', text: /on 8 cores/ })).toBeDefined()
     await system.unmount()
   }
+})
+
+test('the shared notebook: helpers offer NOTE lines, every brief carries it, capped', async () => {
+  expect(notesIn('SUMMARY: x\nNOTE: dates live in src/time.rs\n- NOTE: **tests** use vitest\nNOTE: a\nNOTE: b')).toEqual([
+    'dates live in src/time.rs',
+    'tests use vitest',
+    'a',
+  ])
+  const many = Array.from({ length: 200 }, (_, i) => ({ id: i, text: `fact ${i} `.repeat(8), by: 'codex' as const, at: i }))
+  const text = notebookText(many)
+  expect(text.length).toBeLessThan(6_200)
+  expect(text.startsWith('- fact 199')).toBe(true) // newest first
+  const t: CrewThread = {
+    name: 'x', agent: 'agy', model: 'default', effort: 'default', mode: 'read', cwd: '/p', by: 'you',
+    session: '', status: 'idle', compactions: 0, brief: '', created: 0, updated: 0, turns: [],
+  }
+  expect(brief(t, 'you', 'go', '', undefined, '- pinned fact (claude)')).toContain('Shared crew notebook')
+  expect(brief(t, 'you', 'go', '')).toContain('NOTE:')
+})
+
+test('threads compact after many turns or one very heavy one, not on an ordinary review', async () => {
+  const turn = (n: number, ctx: number) => ({
+    n, by: 'you' as const, ask: 'q', status: 'done' as const, started: 0, answer: 'a', log: [], contextTokens: ctx, outputTokens: 1, isHanded: false,
+  })
+  const base: CrewThread = {
+    name: 'x', agent: 'codex', model: 'default', effort: 'default', mode: 'read', cwd: '/p', by: 'you',
+    session: 's', status: 'idle', compactions: 0, brief: '', created: 0, updated: 0, turns: [],
+  }
+  expect(needsCompaction({ ...base, turns: [turn(1, 23_000), turn(2, 306_000)] })).toBe(false)
+  expect(needsCompaction({ ...base, turns: [turn(1, 700_000)] })).toBe(true)
+  expect(needsCompaction({ ...base, turns: Array.from({ length: 10 }, (_, i) => turn(i + 1, 1000)) })).toBe(true)
+})
+
+test("crew_note answers with the project's notebook", async ($, on) => {
+  on('state.get', (_, e, next) => next(e))
+  const call = $.tool.call as unknown as (input: { tool: string }) => Promise<{ text?: string; result?: unknown }>
+  const r = await call({ tool: 'mcp__fleet__crew_note' })
+  expect(r.text ?? JSON.stringify(r.result)).toContain('notebook')
 })

@@ -4,7 +4,7 @@
 // message is wrapped in, how its streamed JSON is read, and what Claude is
 // shown. The runner lives in register.tsx.
 
-import type { CrewAgent, CrewMode, CrewThread, CrewTurn } from '../types'
+import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn } from '../types'
 
 export const AGENTS: { id: CrewAgent; label: string }[] = [
   { id: 'codex', label: 'Codex' },
@@ -12,8 +12,47 @@ export const AGENTS: { id: CrewAgent; label: string }[] = [
 ]
 export const EFFORTS = ['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 
-/** A thread whose last turn used more context than this is compacted before its next turn. */
-export const COMPACT_AT = 120_000
+/**
+ * When a thread is compacted before its next turn. A turn's input count adds up
+ * every request the helper made in it (each tool call re-sends the context), so it
+ * is a rough signal: compact after many turns, or after one turn that had to read a lot.
+ */
+export const COMPACT_AFTER_TURNS = 10
+export const COMPACT_AT_PROCESSED = 600_000
+
+export function needsCompaction(t: CrewThread): boolean {
+  const since = t.turns.filter(u => u.status === 'done' && !u.isCompaction).length - t.compactions * COMPACT_AFTER_TURNS
+  const last = [...t.turns].reverse().find(u => u.status === 'done')
+  return since >= COMPACT_AFTER_TURNS || (last?.contextTokens ?? 0) > COMPACT_AT_PROCESSED
+}
+
+// ── the shared notebook ──────────────────────────────────────────────────────
+// Facts every helper on a project starts from, so Claude, Codex and Antigravity
+// share what matters without re-reading each other's conversations.
+
+export const NOTEBOOK_CAP = 6_000 // characters, about 1.5k tokens, sent with every message
+
+/** The notebook as the brief carries it: newest first, cut to the cap. */
+export function notebookText(notes: readonly CrewNote[]): string {
+  const out: string[] = []
+  let size = 0
+  for (const n of [...notes].reverse()) {
+    const line = `- ${n.text} (${n.by})`
+    if (size + line.length > NOTEBOOK_CAP) break
+    out.push(line)
+    size += line.length
+  }
+  return out.join('\n')
+}
+
+/** The NOTE: lines a helper offered for the notebook, at most three, each short. */
+export function notesIn(answer: string): string[] {
+  return [...answer.matchAll(/^\s*[-*]?\s*NOTE:\s*(.+)$/gim)]
+    .map(m => (m[1] ?? '').replace(/\*\*/g, '').trim())
+    .filter(Boolean)
+    .slice(0, 3)
+    .map(n => (n.length > 220 ? `${n.slice(0, 219)}…` : n))
+}
 
 // ── command lines ────────────────────────────────────────────────────────────
 // Every prompt is bound so it can never be read as a flag: after `--` for Codex,
@@ -77,7 +116,14 @@ export const modeLabel = (agent: CrewAgent, mode: CrewMode): string =>
  * every turn asks for the answer in a fixed shape, so Claude can read the
  * SUMMARY alone and pull the rest only when it needs to.
  */
-export function brief(t: CrewThread, from: 'claude' | 'you', task: string, context: string, seed?: string): string {
+export function brief(
+  t: CrewThread,
+  from: 'claude' | 'you',
+  task: string,
+  context: string,
+  seed?: string,
+  notebook = '',
+): string {
   const first = t.turns.length === 0 || seed !== undefined
   const rules = first
     ? [
@@ -96,6 +142,9 @@ export function brief(t: CrewThread, from: 'claude' | 'you', task: string, conte
   return [
     ...rules,
     ...(seed ? ['State brief carried over from earlier in this thread:', seed, ''] : []),
+    ...(notebook
+      ? ['Shared crew notebook for this project (facts Claude and the other helpers pinned; trust but verify):', notebook, '']
+      : []),
     `Message from ${from === 'claude' ? 'Claude (the lead)' : 'the user'}:`,
     task,
     ...(context ? ['', 'Context:', context] : []),
@@ -105,6 +154,7 @@ export function brief(t: CrewThread, from: 'claude' | 'you', task: string, conte
     'KEY POINTS: up to 6 bullets; cite files as path:line.',
     'CONFIDENCE: high, medium or low, and what you did not check.',
     'DETAILS: anything longer, last.',
+    'NOTE: optional, up to 3 lines, each a durable fact the other agents on this project should know.',
   ].join('\n')
 }
 

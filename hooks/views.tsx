@@ -1,6 +1,6 @@
 import type { Elements } from 'claude-code'
 
-import type { CrewAgent, CrewMode, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
+import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
 import { modeLabel, summaryOf } from './crew'
 import { idleFrame } from './anim'
 import { ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, spark, tok, usd } from './fmt'
@@ -29,6 +29,9 @@ export type Acts = {
   crewNew: () => void
   crewModel: (model: string) => void
   crewEffort: (effort: string) => void
+  crewFolder: (folder: string) => void
+  crewOpen: (key: string) => void
+  noteRemove: (folder: string, id: number) => void
 }
 
 export type View = {
@@ -50,6 +53,9 @@ export type View = {
   crewMode: CrewMode
   /** the launch box: an Input, where the surface has one */
   launcher: Node | null
+  /** the turn whose whole answer is open: "thread#n" */
+  crewOpenTurn: string | null
+  notebook: { folder: string; notes: readonly CrewNote[] }
 }
 
 const TABS: { tab: Tab; label: string; key: string }[] = [
@@ -471,7 +477,7 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
         {t.model !== 'default' ? `${t.model} · ` : ''}
         {t.effort !== 'default' ? `${t.effort} · ` : ''}
         {t.turns.length} msg{t.turns.length === 1 ? '' : 's'}
-        {tokens ? ` · ${tok(tokens)} tok` : ''}
+        {tokens ? ` · ${tok(tokens)} processed` : ''}
         {t.compactions ? ` · compacted ${t.compactions}×` : ''}
       </Text>
       <Text color={t.by === 'claude' ? p.violet : p.gold}> ‹{t.by === 'claude' ? 'Claude' : 'you'}›</Text>
@@ -521,7 +527,18 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
                   </Text>
                 ))
               : null}
-            {u.answer ? (
+            {u.answer && v.crewOpenTurn === `${t.name}#${u.n}` ? (
+              <Box flexDirection="column" borderStyle="single" borderColor={p.border} paddingX={1}>
+                {u.answer
+                  .trim()
+                  .split('\n')
+                  .map(line => (
+                    <Text wrap="wrap" color={/^(SUMMARY|KEY POINTS|CONFIDENCE|DETAILS|NOTE):/i.test(line) ? p.accent : p.text}>
+                      {line || ' '}
+                    </Text>
+                  ))}
+              </Box>
+            ) : u.answer ? (
               <Text wrap="wrap">
                 <Text color={tl.color}>{tl.glyph} </Text>
                 <Text color={p.text}>{summaryOf(u.answer)}</Text>
@@ -545,13 +562,18 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
                 </Button>
               )}
               {u.answer ? (
+                <Button key={`open-${t.name}-${u.n}`} plain onPress={() => act.crewOpen(`${t.name}#${u.n}`)}>
+                  <Text color={p.cyan}>{v.crewOpenTurn === `${t.name}#${u.n}` ? '▾ hide full answer' : '▸ read full answer'}</Text>
+                </Button>
+              ) : null}
+              {u.answer ? (
                 <Button key={`copy-${t.name}-${u.n}`} plain onPress={() => act.copy(u.answer, `${t.name} answer`)}>
-                  <Text color={p.dim}>◇ copy full answer</Text>
+                  <Text color={p.dim}>◇ copy</Text>
                 </Button>
               ) : null}
               {u.contextTokens ? (
                 <Text color={p.dim}>
-                  {tok(u.contextTokens)} in · {tok(u.outputTokens)} out
+                  {tok(u.contextTokens)} processed · {tok(u.outputTokens)} written
                 </Text>
               ) : null}
             </Box>
@@ -559,6 +581,41 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
         )
       })}
       {t.turns.length > 4 ? <Text color={p.dim}>+{t.turns.length - 4} earlier messages (crew_read turn n)</Text> : null}
+    </Box>
+  )
+}
+
+/** The crew's shared memory for the project in view: what every helper message carries. */
+function Notebook(E: Els, v: View, act: Acts) {
+  const { Box, Text, Button } = E
+  const { p } = v
+  const notes = v.notebook.notes
+  const isOpen = v.crewOpenTurn === 'notebook'
+  const w = Math.max(30, v.width - 8)
+  return (
+    <Box flexDirection="column">
+      <Button key="notebook" plain onPress={() => act.crewOpen('notebook')}>
+        <Text color={p.violet}>{isOpen ? '▾' : '▸'} shared notebook </Text>
+        <Text color={p.dim}>
+          {notes.length} note{notes.length === 1 ? '' : 's'} · {v.notebook.folder.replace(/^\/home\/[^/]+/, '~')} · every helper gets it
+        </Text>
+      </Button>
+      {isOpen && notes.length === 0 ? (
+        <Text color={p.dim}>  empty: helpers add NOTE: lines, and Claude pins facts with crew_note</Text>
+      ) : null}
+      {isOpen
+        ? notes.map(n => (
+            <Box flexDirection="row" columnGap={1}>
+              <Button key={`note-x-${n.id}`} plain onPress={() => act.noteRemove(v.notebook.folder, n.id)}>
+                <Text color={p.bad}>×</Text>
+              </Button>
+              <Text wrap="wrap">
+                <Text color={n.by === 'claude' ? p.violet : n.by === 'you' ? p.gold : p.cyan}>{n.by} </Text>
+                <Text color={p.text}>{cut(n.text, w * 3)}</Text>
+              </Text>
+            </Box>
+          ))
+        : null}
     </Box>
   )
 }
@@ -593,6 +650,7 @@ function Crew(E: Els, v: View, act: Acts) {
         )}
       </Box>
       {v.launcher ?? <Text color={p.dim}>(the input box needs the terminal or the desktop app)</Text>}
+      {Notebook(E, v, act)}
       {list.length === 0 ? (
         <Box flexDirection="column" marginTop={1}>
           <Text color={p.dim}>No threads yet. Type a task above, or ask Claude:</Text>

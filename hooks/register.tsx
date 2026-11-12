@@ -1,12 +1,11 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
-import type { CrewAgent, CrewMode, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
+import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
 import { isBusy, needsYou } from './fmt'
 import type { Mood } from './cat'
 import { catCells } from './cat'
 import {
-  COMPACT_AT,
   COMPACT_PROMPT,
   EFFORTS,
   argvFor,
@@ -15,6 +14,9 @@ import {
   lines,
   listing,
   modeLabel,
+  needsCompaction,
+  notebookText,
+  notesIn,
   parseLine,
   report,
   slug,
@@ -47,6 +49,9 @@ const crewMode = atom({ plugin: 'fleet', key: 'crewMode' } as const, 'read')
 const crewModel = atom({ plugin: 'fleet', key: 'crewModel' } as const, 'default')
 const crewEffort = atom({ plugin: 'fleet', key: 'crewEffort' } as const, 'default')
 const crewModels = atom({ plugin: 'fleet', key: 'crewModels' } as const, { codex: [], agy: [] })
+const crewFolder = atom({ plugin: 'fleet', key: 'crewFolder' } as const, null)
+const crewOpenTurn = atom({ plugin: 'fleet', key: 'crewOpenTurn' } as const, null)
+const notebooks = atom({ plugin: 'fleet', key: 'notebooks' } as const, {})
 
 // Module variables start over on a reload; everything drawn lives in $.state.
 let self = ''
@@ -200,6 +205,7 @@ type AskOpts = {
   task: string
   context: string
   by: 'claude' | 'you'
+  folder?: string
 }
 
 /** Sends a message to a thread, opening it if it is new. Answers an error string, or the thread. */
@@ -213,13 +219,16 @@ async function sendToThread($: EngineInterface, o: AskOpts): Promise<CrewThread 
     return `Thread "${name}" talks to ${existing.agent}, not ${o.agent}. Pick another thread name for ${o.agent}.`
   }
   if (!existing && !o.agent) return `There is no thread "${name}" yet; say which agent opens it ("codex" or "agy").`
+  if (existing && o.folder && existing.cwd !== o.folder) {
+    return `Thread "${name}" works in ${existing.cwd}. Open another thread for ${o.folder}.`
+  }
   const base: CrewThread = existing ?? {
     name,
     agent: o.agent ?? 'codex',
     model: 'default',
     effort: 'default',
     mode: 'read',
-    cwd: sessionCwd,
+    cwd: o.folder ?? sessionCwd,
     by: o.by,
     session: '',
     status: 'idle',
@@ -268,11 +277,10 @@ async function runTurn(
   // A long thread is compacted first: the helper writes a state brief, and a
   // fresh conversation starts from it, so the thread keeps what matters.
   let seed: string | undefined
-  const lastDone = [...t.turns].reverse().find(u => u.status === 'done')
   // A Codex edit turn always starts a fresh worktree session (a resumed one would
   // edit your real tree), so it carries the thread over as a state brief too.
   const isCodexEdit = t.agent === 'codex' && t.mode === 'edit'
-  if (t.session && ((lastDone?.contextTokens ?? 0) > COMPACT_AT || isCodexEdit)) {
+  if (t.session && (needsCompaction(t) || isCodexEdit)) {
     const briefRun = await execTurn($, { ...t, mode: 'read' }, COMPACT_PROMPT, n, true)
     if (briefRun.ok && briefRun.answer.trim()) {
       seed = briefRun.answer.trim()
@@ -283,7 +291,10 @@ async function runTurn(
     t = (await findThread($, name)) ?? t
     t = { ...t, session: '' }
   }
-  const res = await execTurn($, t, brief(t, by, task, context, seed), n, false)
+  const notes = (await read($, notebooks))[t.cwd] ?? []
+  const res = await execTurn($, t, brief(t, by, task, context, seed, notebookText(notes)), n, false)
+  // what the helper offered for the shared notebook goes in, signed by it
+  if (res.ok) await addNotes($, t.cwd, notesIn(res.answer), t.agent)
   await patchThread($, name, x => ({
     ...x,
     status: res.ok ? 'idle' : 'failed',
@@ -417,6 +428,8 @@ async function answerCrewAsk($: EngineInterface, e: Args): Promise<Answer> {
   const task = optStr(e.task)
   if (!name || !task) return { deny: 'crew_ask needs a thread name and a task.' }
   const agent = e.agent === 'agy' || e.agent === 'codex' ? e.agent : undefined
+  const folder = optStr(e.folder)
+  if (folder && !(await isFolder($, folder))) return { deny: `${folder} is not a folder on this machine.` }
   const mode: CrewMode | undefined = e.mode === 'edit' ? 'edit' : e.mode === 'read' ? 'read' : undefined
   const existing = await findThread($, slug(name))
   if ((mode ?? existing?.mode) === 'edit' && existing?.mode !== 'edit') {
@@ -436,6 +449,7 @@ async function answerCrewAsk($: EngineInterface, e: Args): Promise<Answer> {
     task,
     context: optStr(e.context) ?? '',
     by: 'claude',
+    ...(folder ? { folder } : {}),
     ...(agent ? { agent } : {}),
     ...(optStr(e.model) ? { model: optStr(e.model) } : {}),
     ...(optStr(e.effort) ? { effort: optStr(e.effort) } : {}),
@@ -509,6 +523,10 @@ async function registerCrewTools($: EngineInterface): Promise<void> {
         task: { type: 'string', description: 'the message: a complete, self-contained instruction or follow-up' },
         agent: { type: 'string', enum: ['codex', 'agy'], description: 'which helper; required to open a new thread' },
         context: { type: 'string', description: 'optional facts, snippets or file paths the helper should start from' },
+        folder: {
+          type: 'string',
+          description: 'absolute project folder the helper works in (new threads only); defaults to this session\'s folder',
+        },
         model: {
           type: 'string',
           description:
@@ -519,6 +537,22 @@ async function registerCrewTools($: EngineInterface): Promise<void> {
         mode: { type: 'string', enum: ['read', 'edit'], description: 'read (default) or edit (asks the user first)' },
       },
       required: ['thread', 'task'],
+    },
+    isDeferred: false,
+  })
+  await $.tool.register({
+    name: 'crew_note',
+    description:
+      "The crew's shared memory for a project folder: short, durable facts every helper message carries (about 1.5k " +
+      'tokens at most), so Claude, Codex and Antigravity work from the same knowledge without re-sending history. ' +
+      'Helpers add NOTE: lines themselves; you curate. add pins a fact, remove deletes one by id; with neither it lists them.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        add: { type: 'string', description: 'a fact worth every helper knowing, one line' },
+        remove: { type: 'integer', description: 'a note id to delete' },
+        folder: { type: 'string', description: "the project folder; defaults to this session's" },
+      },
     },
     isDeferred: false,
   })
@@ -537,6 +571,46 @@ async function registerCrewTools($: EngineInterface): Promise<void> {
     },
     isDeferred: false,
   })
+}
+
+// ── the shared notebook ──────────────────────────────────────────────────────
+
+async function addNotes($: EngineInterface, folder: string, texts: string[], by: CrewNote['by']): Promise<void> {
+  if (texts.length === 0) return
+  await update($, notebooks, all => {
+    const list = all[folder] ?? []
+    let id = list.reduce((m, n) => Math.max(m, n.id), 0)
+    const known = new Set(list.map(n => n.text.toLowerCase()))
+    const fresh = texts.filter(t => !known.has(t.toLowerCase())).map(text => ({ id: ++id, text, by, at: now() }))
+    return { ...all, [folder]: [...list, ...fresh].slice(-40) }
+  })
+  await $.store.set('notebooks', await read($, notebooks))
+}
+
+async function removeNote($: EngineInterface, folder: string, id: number): Promise<void> {
+  await update($, notebooks, all => ({ ...all, [folder]: (all[folder] ?? []).filter(n => n.id !== id) }))
+  await $.store.set('notebooks', await read($, notebooks))
+}
+
+async function isFolder($: EngineInterface, path: string): Promise<boolean> {
+  const st = await $.fs.stat(path).catch(() => undefined)
+  return st?.kind === 'dir'
+}
+
+async function answerCrewNote($: EngineInterface, e: Args): Promise<Answer> {
+  const folder = optStr(e.folder) ?? sessionCwd
+  if (optStr(e.add)) await addNotes($, folder, [optStr(e.add) ?? ''], 'claude')
+  if (typeof e.remove === 'number') await removeNote($, folder, e.remove)
+  const notes = (await read($, notebooks))[folder] ?? []
+  return {
+    result:
+      notes.length === 0
+        ? `The crew notebook for ${folder} is empty. Pin a fact with crew_note {"add": "..."}.`
+        : [
+            `Crew notebook for ${folder} (every helper message carries it; ${notes.length} notes):`,
+            ...notes.map(n => `#${n.id} [${n.by}] ${n.text}`),
+          ].join('\n'),
+  }
 }
 
 async function toggleCrewAgent($: EngineInterface): Promise<void> {
@@ -559,8 +633,10 @@ async function launchFromPane($: EngineInterface, task: string): Promise<void> {
   const taken = new Set((await read($, threads)).map(t => t.name))
   let name = base
   for (let i = 2; taken.has(name); i++) name = `${base}-${i}`
+  const folder = await read($, crewFolder)
   const res = await sendToThread($, {
     name: current ? current.name : name,
+    ...(!current && folder ? { folder } : {}),
     task: text,
     context: '',
     by: 'you',
@@ -596,6 +672,9 @@ function acts($: EngineInterface): Acts {
     crewNew: () => void update($, crewSel, () => null),
     crewModel: value => void update($, crewModel, () => value),
     crewEffort: value => void update($, crewEffort, () => value),
+    crewFolder: value => void update($, crewFolder, () => value),
+    crewOpen: key => void update($, crewOpenTurn, cur => (cur === key ? null : key)),
+    noteRemove: (folder, id) => void removeNote($, folder, id),
   }
 }
 
@@ -609,6 +688,8 @@ export const register: Register = on => {
     const savedModels = (await $.store.get('models')) as { codex: string[]; agy: string[] } | undefined
     if (Array.isArray(savedThreads) && (await read($, threads)).length === 0) await update($, threads, () => savedThreads)
     if (savedModels?.codex && savedModels.agy) await update($, crewModels, () => savedModels)
+    const savedNotes = (await $.store.get('notebooks')) as Record<string, CrewNote[]> | undefined
+    if (savedNotes && typeof savedNotes === 'object') await update($, notebooks, () => savedNotes)
     await update($, threads, list =>
       list.map(t =>
         t.status !== 'running'
@@ -646,6 +727,7 @@ export const register: Register = on => {
     const name: string = e.tool
     if (name === 'mcp__fleet__crew_ask') return answerCrewAsk($, e as unknown as Args)
     if (name === 'mcp__fleet__crew_read') return answerCrewRead($, e as unknown as Args)
+    if (name === 'mcp__fleet__crew_note') return answerCrewNote($, e as unknown as Args)
     return next(e)
   })
 
@@ -706,15 +788,26 @@ export const register: Register = on => {
       const target = cSel ? cThreads.find(t => t.name === cSel) : undefined
       const modelList = ['default', ...(await read($, crewModels))[target?.agent ?? cAgent]]
       const actions = acts($)
+      // folders a new thread can work in: the live sessions', FLEET's own source, earlier threads'
+      const folders = [...new Set([sessionCwd, ...s.sessions.map(x => x.cwd), $.plugin.root, ...cThreads.map(t => t.cwd)])].filter(Boolean)
+      const cFolder = (await read($, crewFolder)) ?? sessionCwd
+      const shortPath = (f: string) => f.replace(/^\/home\/[^/]+/, '~')
       const pickers =
         Select && !target ? (
-          <Box flexDirection="row" columnGap={2}>
+          <Box flexDirection="row" columnGap={2} flexWrap="wrap">
             <Select
               key="crew-model"
               label="model "
               value={modelList.includes(cModel) ? cModel : 'default'}
               options={modelList.map(m => ({ value: m, label: m }))}
               onSelect={value => actions.crewModel(value)}
+            />
+            <Select
+              key="crew-folder"
+              label="folder "
+              value={folders.includes(cFolder) ? cFolder : (folders[0] ?? '')}
+              options={folders.map(f => ({ value: f, label: f === $.plugin.root ? `${shortPath(f)} (FLEET)` : shortPath(f) }))}
+              onSelect={value => actions.crewFolder(value)}
             />
             <Select
               key="crew-effort"
@@ -734,6 +827,7 @@ export const register: Register = on => {
               label={target ? `▸ ${target.name} ` : `▸ new ${cAgent} thread `}
               placeholder={target ? 'follow up in this thread…' : 'describe a task, then enter…'}
               submitLabel="send"
+              rows={4}
               onSubmit={value => actions.crewLaunch(value)}
             />
           </Box>
@@ -763,6 +857,11 @@ export const register: Register = on => {
               crewAgent: cAgent,
               crewMode: await read($, crewMode),
               launcher,
+              crewOpenTurn: await read($, crewOpenTurn),
+              notebook: {
+                folder: target?.cwd ?? cFolder,
+                notes: (await read($, notebooks))[target?.cwd ?? cFolder] ?? [],
+              },
             },
             acts($),
           )}

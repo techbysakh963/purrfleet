@@ -37,6 +37,9 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   first, so Claude reads summaries and pulls full answers on demand. Threads over ~120k tokens
   of context compact themselves into a state brief and continue fresh. Read-only by default;
   edits need your approval (Codex edits in its own git worktree).
+- **Shared notebook**: per project folder, a short list of durable facts (about 1.5k tokens at
+  most) that every helper message carries, so Claude, Codex and Antigravity share what matters
+  without re-sending history. Helpers add `NOTE:` lines; Claude curates with `crew_note`.
 - **System**: CPU and memory of everything Claude-related (Claude windows, their MCP servers,
   the tools they started, Codex, Antigravity, FLEET), with sparklines and the busiest processes.
 - **Cost** and **Actions**: estimated spend, and per-session actions (copy, open transcript, stop).
