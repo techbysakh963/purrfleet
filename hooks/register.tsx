@@ -35,7 +35,7 @@ import { toBase64 } from './scenes'
 import { PALETTES, paletteOf } from './theme'
 import type { Palette } from './theme'
 import { fleetReport } from './brief'
-import { inbox } from './inbox'
+import { inbox, moodOf } from './inbox'
 import { deliveryLine, newCodexWorktrees, parseNumstat, parseWorktrees } from './delivery'
 import type { Depth, Part } from './crew'
 import { isUnread } from './inbox'
@@ -105,8 +105,9 @@ function frameOf(m: Mounted): string {
   return toBase64(catCells(now(), m.cols, m.rows, mood, palette))
 }
 
-function remember(s: Snapshot): void {
-  mood = s.sessions.some(needsYou) ? 'alarm' : s.sessions.some(isBusy) ? 'work' : 'sleep'
+/** The cat's mood, from the same headline as the band: a failed helper wakes it too. */
+function remember(s: Snapshot, list: readonly CrewThread[] = [], nbs: Readonly<Record<string, readonly CrewNote[]>> = {}): void {
+  mood = moodOf(inbox(s.sessions, list, nbs))
 }
 
 async function poll($: EngineInterface): Promise<void> {
@@ -122,7 +123,7 @@ async function poll($: EngineInterface): Promise<void> {
     }
     const next = JSON.parse(run.stdout) as Snapshot
     lastOk = Date.now()
-    remember(next)
+    remember(next, await read($, threads), await read($, notebooks))
     await update($, snap, () => next)
     await update($, error, () => null)
     await alertOnNew($, next.sessions)
@@ -206,7 +207,7 @@ async function cycleTheme($: EngineInterface): Promise<void> {
   await update($, theme, () => next)
   await $.store.set('theme', next)
   const s = await read($, snap)
-  if (s) remember(s)
+  if (s) remember(s, await read($, threads), await read($, notebooks))
 }
 
 async function cycleScene($: EngineInterface): Promise<void> {
@@ -1456,8 +1457,8 @@ async function launchFromPane($: EngineInterface, task: string): Promise<void> {
  */
 async function crewCommand($: EngineInterface, args: string): Promise<string> {
   const text = args.trim()
+  // the pane opens only on /fleet: /crew just turns it to Crew for next time
   await update($, tab, () => 'crew')
-  if (!(await isPaneShown($))) void $.ui.open({ id: PANE, title: 'FLEET' })
   if (!text) {
     const sel = await read($, crewSel)
     return [
@@ -1646,12 +1647,18 @@ export const register: Register = on => {
       if (s === null) {
         return (
           <Box flexDirection="column">
-            <Text color={palette.accent}>◆ FLEET</Text>
-            <Text color={palette.dim}>{err ?? 'Scanning your sessions…'}</Text>
+            <Text color={palette.work} weight="bold">
+              FLEET
+            </Text>
+            {err ? (
+              <Text color={palette.fail}>× FLEET cannot read your sessions: {err}</Text>
+            ) : (
+              <Text color={palette.dim}>scanning your sessions…</Text>
+            )}
           </Box>
         )
       }
-      remember(s)
+      remember(s, await read($, threads), await read($, notebooks))
       const sel = await read($, selected)
       const sceneName = await read($, scene)
       const currentTab = await read($, tab)
@@ -1721,14 +1728,14 @@ export const register: Register = on => {
         <Box flexDirection="column">
           {pickers}
           {needsPreview ? (
-            <Box borderStyle="single" borderColor={palette.border} paddingX={1} flexDirection="column">
+            <Box borderStyle="single" borderColor={palette.faint} paddingX={1} flexDirection="column">
               <Text color={palette.dim}>your message ({draft.length} chars)</Text>
               <Text color={palette.text} wrap="wrap">
                 {draft.length > 3000 ? `…${draft.slice(-3000)}` : draft}
               </Text>
             </Box>
           ) : null}
-          <Box borderStyle="round" borderColor={palette.accent} paddingX={1}>
+          <Box borderStyle="round" borderColor={palette.work} paddingX={1}>
             <Input
               key={`crew-task-${inputGen}`}
               label={target ? `▸ ${target.name} ` : `▸ new ${cAgent} thread `}
@@ -1747,15 +1754,11 @@ export const register: Register = on => {
       const age = Math.max(0, Math.round(Date.now() / 1000 - s.now))
       return (
         <Box flexDirection="column">
-          {err || age > 6 ? (
-            <Text color={palette.warn} wrap="wrap">
-              ◌ {err ?? `data is ${age}s old`}
-            </Text>
-          ) : null}
           {Pane(
             E,
             {
               snap: s,
+              health: { age, err },
               tab: currentTab,
               // nothing starts expanded: you open the row you want
               selected: sel && (s.sessions.some(x => x.sid === sel) || /^(crew|notes):/.test(sel)) ? sel : null,
@@ -1792,8 +1795,10 @@ export const register: Register = on => {
       mounted = new Map()
       return (
         <Box flexDirection="column">
-          <Text color={palette.accent}>◆ FLEET</Text>
-          <Text color={palette.bad}>This draw failed: {String(failure).slice(0, 300)}</Text>
+          <Text color={palette.work} weight="bold">
+            FLEET
+          </Text>
+          <Text color={palette.fail}>× this draw failed: {String(failure).slice(0, 300)}</Text>
           <Text color={palette.dim}>It retries on the next update (about 1.5 s).</Text>
         </Box>
       )
@@ -1810,8 +1815,8 @@ export const register: Register = on => {
       const { Text } = $.ui.resolve(e)
       const p = paletteOf(await read($, theme))
       return (
-        <Text color={p.warn} wrap="truncate-end">
-          ◆ FLEET ◌ {err}
+        <Text color={p.fail} wrap="truncate-end">
+          FLEET  × cannot read your sessions: {err}
         </Text>
       )
     }

@@ -64,3 +64,34 @@ export function tally(items: readonly Item[]): Record<Group, number> {
   for (const x of items) out[x.group]++
   return out
 }
+
+export type Segment = { state: 'need' | 'failed' | 'read' | 'work' | 'quiet'; n: number; text: string }
+
+/** Whether an item is a failure: a session that ended on an error, or a helper turn that failed. */
+export const isFailure = (x: Item): boolean =>
+  (x.kind === 'session' && x.s.phase === 'error') || (x.kind === 'turn' && x.group === 'need' && x.u.status === 'failed')
+
+/**
+ * The one headline: the band, Live, the tab badges, the cat and fleet_read all say
+ * this, in this order. ▲ needs you · × failed · ◆ to read · ● working, then ○ quiet
+ * last (or "○ all quiet" when nothing else shows).
+ */
+export function segments(items: readonly Item[]): Segment[] {
+  const count = tally(items)
+  const failed = items.filter(isFailure).length
+  const need = count.need - failed
+  const out: Segment[] = []
+  if (need) out.push({ state: 'need', n: need, text: `${need} need${need === 1 ? 's' : ''} you` })
+  if (failed) out.push({ state: 'failed', n: failed, text: `${failed} failed` })
+  if (count.read) out.push({ state: 'read', n: count.read, text: `${count.read} to read` })
+  if (count.work) out.push({ state: 'work', n: count.work, text: `${count.work} working` })
+  if (out.length === 0) out.push({ state: 'quiet', n: count.quiet, text: 'all quiet' })
+  else if (count.quiet) out.push({ state: 'quiet', n: count.quiet, text: `${count.quiet} quiet` })
+  return out
+}
+
+/** The cat's mood from the same headline: alarm on anything that needs you or failed. */
+export const moodOf = (items: readonly Item[]): 'alarm' | 'work' | 'sleep' => {
+  const s = segments(items)
+  return s.some(x => x.state === 'need' || x.state === 'failed') ? 'alarm' : s.some(x => x.state === 'work') ? 'work' : 'sleep'
+}

@@ -2,25 +2,33 @@
 // and the pixel scenes (0xRRGGBB numbers). No engine imports, so a plain Node
 // script can render previews from the very same values.
 
+/**
+ * A palette by ROLE, never by colour name: each role has one place it may appear.
+ *   need   ▲ waiting on the user          fail  × something failed; destructive words; diff −
+ *   read   ◆ an unread result; diff @@     work  ● running now; filled bar cells
+ *   ok     constructive words; diff +     money any $ amount, and nothing else
+ *   text   content                         dim   supporting: ages, labels, keys, quiet rows
+ *   faint  decoration only: rules, empty bar cells, borders
+ * State colours belong to the mark column (and its rail, and the four inbox heads).
+ * Contrast targets on dark backgrounds: text ≥ 7:1, dim and marks ≥ 4.5:1.
+ */
 export type Palette = {
   name: string
-  /** pixel scenes */
-  void: number // deepest background
-  deep: number // nebula / glow base
-  glowA: number // first glow colour
-  glowB: number // second glow colour
+  /** pixel scenes (the cat) */
+  void: number
+  deep: number
+  glowA: number
+  glowB: number
   star: number
-  /** text */
-  accent: string // headings, brand mark
-  cyan: string // models, tools
-  violet: string // agents, branch
+  need: string
+  fail: string
+  read: string
+  work: string
   ok: string
-  warn: string
-  bad: string
-  gold: string // money
-  dim: string
+  money: string
   text: string
-  border: string
+  dim: string
+  faint: string
 }
 
 export const PALETTES: Palette[] = [
@@ -31,16 +39,15 @@ export const PALETTES: Palette[] = [
     glowA: 0x7c6cff,
     glowB: 0x34d4ff,
     star: 0xe8ecff,
-    accent: '#9d8cff',
-    cyan: '#4fd1ff',
-    violet: '#b48cff',
+    need: '#ffa53d',
+    fail: '#ff6b86',
+    read: '#4fd1ff',
+    work: '#9d8cff',
     ok: '#3ddc97',
-    warn: '#ffa53d', // needs-you: a strong amber
-    bad: '#ff5c7a',
-    gold: '#e9d58f', // money: a pale gold, clearly not the warning
-    dim: '#6b7394',
+    money: '#e9d58f',
     text: '#e6e9f5',
-    border: '#3a3f66',
+    dim: '#8f97b8',
+    faint: '#4a5080',
   },
   {
     name: 'ember',
@@ -49,16 +56,15 @@ export const PALETTES: Palette[] = [
     glowA: 0xff6a3d,
     glowB: 0xffc247,
     star: 0xfff1e0,
-    accent: '#ff8a5c',
-    cyan: '#5eead4',
-    violet: '#f0a6ff',
+    need: '#ffd23f',
+    fail: '#ff5d7a',
+    read: '#5eead4',
+    work: '#ff8a5c',
     ok: '#7ee08a',
-    warn: '#ffa940',
-    bad: '#ff5a5a',
-    gold: '#eadbab',
-    dim: '#8a7468',
+    money: '#eadbab',
     text: '#f5ebe4',
-    border: '#5a3a2c',
+    dim: '#a8948a',
+    faint: '#6b4a3a',
   },
   {
     name: 'synthwave',
@@ -67,16 +73,33 @@ export const PALETTES: Palette[] = [
     glowA: 0xff3fd2,
     glowB: 0x22d3ee,
     star: 0xfdf4ff,
-    accent: '#ff5fd7',
-    cyan: '#22d3ee',
-    violet: '#c084fc',
+    need: '#fde047',
+    fail: '#ff6a55',
+    read: '#22d3ee',
+    work: '#ff5fd7',
     ok: '#4ade80',
-    warn: '#fde047',
-    bad: '#fb7185',
-    gold: '#f6b86b', // money: a warm amber, never the warning yellow
-    dim: '#7c6a93',
+    money: '#f0dfb4',
     text: '#f5e9ff',
-    border: '#4b2a66',
+    dim: '#a08fb8',
+    faint: '#5a3a78',
+  },
+  {
+    // for light terminals: every role readable on white
+    name: 'paper',
+    void: 0xf3f1ea,
+    deep: 0xd9d4ea,
+    glowA: 0x6d28d9,
+    glowB: 0x0369a1,
+    star: 0x1f2330,
+    need: '#b45309',
+    fail: '#c81e3a',
+    read: '#0369a1',
+    work: '#6d28d9',
+    ok: '#15803d',
+    money: '#7a5c00',
+    text: '#1f2330',
+    dim: '#5b6272',
+    faint: '#c4c8d4',
   },
 ]
 
@@ -99,12 +122,17 @@ export const mix = (a: number, b: number, t: number): number => {
 export const hexToNum = (hex: string): number => parseInt(hex.slice(1), 16)
 export const numToHex = (n: number): string => `#${n.toString(16).padStart(6, '0')}`
 
-/** Green → yellow → red, the way a fuel gauge reads: t in 0..1. */
-export const heat = (t: number, p: Palette): string => {
-  const ok = hexToNum(p.ok)
-  const warn = hexToNum(p.warn)
-  const bad = hexToNum(p.bad)
-  return numToHex(t < 0.55 ? mix(ok, warn, t / 0.55) : mix(warn, bad, (t - 0.55) / 0.45))
+/** WCAG contrast ratio between two hex colours (for the palette tests). */
+export function contrast(a: string, b: string): number {
+  const lum = (hex: string) => {
+    const [r, g, bl] = rgb(hexToNum(hex)).map(v => {
+      const c = v / 255
+      return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
+    })
+    return 0.2126 * r! + 0.7152 * g! + 0.0722 * bl!
+  }
+  const [x, y] = [lum(a), lum(b)].sort((m, n) => n - m)
+  return (x! + 0.05) / (y! + 0.05)
 }
 
 /** A per-character gradient between two hex colours. */

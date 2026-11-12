@@ -36,23 +36,6 @@ export const needsYou = (s: Session): boolean => s.phase === 'waiting' || s.phas
 export const isBusy = (s: Session): boolean =>
   s.phase === 'thinking' || s.phase === 'compacting' || s.tools.length > 0 || s.agents.length > 0
 
-/** How a state looks: a text glyph (never an emoji), a word, a palette colour. */
-export const phaseLook = (phase: Phase, p: Palette): { glyph: string; label: string; color: string } => {
-  switch (phase) {
-    case 'thinking':
-      return { glyph: '◉', label: 'BUSY', color: p.accent }
-    case 'compacting':
-      return { glyph: '◎', label: 'COMPACTING', color: p.violet }
-    case 'waiting':
-      return { glyph: '▲', label: 'NEEDS YOU', color: p.warn }
-    case 'error':
-      return { glyph: '×', label: 'ERROR', color: p.bad }
-    case 'ready':
-      return { glyph: '◇', label: 'READY', color: p.ok }
-    default:
-      return { glyph: '○', label: 'IDLE', color: p.dim }
-  }
-}
 
 /** Elapsed time as 00:03:20, the way a stopwatch reads. */
 export const hms = (seconds: number): string => {

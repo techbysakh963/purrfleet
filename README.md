@@ -50,6 +50,16 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   changes card), or a notebook's suggestions with keep · edit · reject.
 - **Cost** is one table on the same grid: this week, today by session and by model (one-colour
   bars), crew usage (not priced), and three machine lines plus a `hot` row when a process runs hot.
+- **Colour by role** (v0.13): every colour has one job: ▲ need, × fail, ◆ read, ● work, then ok,
+  money, text, dim, faint. State colour appears only in the mark column (plus its rail and the four
+  inbox heads). Each theme is checked for contrast: text ≥ 7:1 and marks and dim ≥ 4.5:1 on dark
+  backgrounds. A fourth theme, `paper`, is for light terminals.
+- **One headline** drives the band, Live, the tab badges, the cat's mood and `fleet_read`: ▲ needs
+  you · × failed · ◆ to read · ● working · ○ quiet. A session that stopped on an error is `×`, like a
+  failed helper. The band spells out a count of one.
+- **Keys**: `/fleet` then Enter opens the most urgent row (it has the focus). An open answer:
+  `r` full · `s` send to Claude · `c` copy · `e` earlier turns · `g` open in Crew · `x` stop.
+  Codex changes: `v` diff · `p` apply · `d` discard. Feed: `f` filter. A test keeps hotkeys unique.
 - One mark per state, everywhere: ▲ needs you · × failed · ◆ to read · ● working · ○ quiet.
   Buttons are plain words; the tab or filter you're on is bold and underlined.
 - Notices: threads Claude started that finish together reach Claude as one notice (it waits up to

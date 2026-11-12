@@ -3,11 +3,11 @@ import type { Elements } from 'claude-code'
 import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Delivery, Session, Snapshot, Tab } from '../types'
 import { NOTEBOOK_CAP, modeLabel, plain, sections, summaryOf } from './crew'
 import { deliveryLine } from './delivery'
-import { activity, ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, spark, tok, usd } from './fmt'
+import { activity, ago, ctxPct, cut, hms, isBusy, needsYou, spark, tok, usd } from './fmt'
 import type { Group, Item } from './inbox'
-import { inbox, tally } from './inbox'
+import { inbox, isFailure, segments, tally } from './inbox'
 import type { Palette } from './theme'
-import { heat, ramp } from './theme'
+import { ramp } from './theme'
 
 /** Box, Text and Button: the elements every surface carries, with the same props. */
 export type Els = Pick<Elements['desktop'], 'Box' | 'Text' | 'Button'>
@@ -56,6 +56,8 @@ export type Acts = {
 
 export type View = {
   snap: Snapshot
+  /** how fresh the data is, and the collector's error if it has one */
+  health?: { age: number; err: string | null }
   tab: Tab
   selected: string | null
   feedFilter: string | null
@@ -82,6 +84,8 @@ export type View = {
   notebook: { folder: string; file: string; notes: readonly CrewNote[] }
   /** every project's notebook: pending suggestions show up on Live */
   notebooks: Readonly<Record<string, readonly CrewNote[]>>
+  /** the `who` column width, from the whole pane's width so columns line up across tabs */
+  ww?: number
   /** the Codex diff open under its card */
   crewDiff?: { key: string; text: string } | null
 }
@@ -99,30 +103,25 @@ const TABS: { tab: Tab; label: string; key: string }[] = [
  * FLEET's one visual grammar: each mark means one thing, everywhere.
  *   ▲ needs you   × failed   ◆ to read   ● working   ○ quiet
  */
-export function mark(v: { p: Palette }, state: 'need' | 'error' | 'failed' | 'read' | 'work' | 'quiet'): { glyph: string; color: string } {
+export function mark(v: { p: Palette }, state: 'need' | 'failed' | 'read' | 'work' | 'quiet'): { glyph: string; color: string } {
   const { p } = v
   switch (state) {
     case 'need':
-      return { glyph: '▲', color: p.warn }
-    case 'error':
-      return { glyph: '▲', color: p.bad }
+      return { glyph: '▲', color: p.need }
     case 'failed':
-      return { glyph: '×', color: p.bad }
+      return { glyph: '×', color: p.fail }
     case 'read':
-      return { glyph: '◆', color: p.cyan }
+      return { glyph: '◆', color: p.read }
     case 'work':
-      return { glyph: '●', color: p.accent }
+      return { glyph: '●', color: p.work }
     default:
       return { glyph: '○', color: p.dim }
   }
 }
 
 const sessionMark = (v: { p: Palette }, s: Session) =>
-  mark(v, s.phase === 'error' ? 'error' : needsYou(s) ? 'need' : isBusy(s) ? 'work' : 'quiet')
+  mark(v, s.phase === 'error' ? 'failed' : needsYou(s) ? 'need' : isBusy(s) ? 'work' : 'quiet')
 
-/** The colour a session keeps everywhere: its legend dot, its band dot, its feed name. */
-export const sessionColor = (s: Session, p: Palette): string =>
-  needsYou(s) ? phaseLook(s.phase, p).color : isBusy(s) ? p.accent : s.phase === 'ready' ? p.ok : p.cyan
 
 function Grad(E: Els, text: string, from: string, to: string, bold = false) {
   const { Text } = E
@@ -135,25 +134,16 @@ function Grad(E: Els, text: string, from: string, to: string, bold = false) {
   )
 }
 
-/** A fuel gauge: filled cells shade green → yellow → red along the bar. */
-function Gauge(E: Els, pct: number, cells: number, p: Palette) {
-  const { Text } = E
-  const full = Math.round((Math.max(0, Math.min(100, pct)) / 100) * cells)
-  return (
-    <Text>
-      {Array.from({ length: cells }, (_, i) =>
-        i < full ? <Text color={heat(i / (cells - 1), p)}>■</Text> : <Text color={p.border}>□</Text>,
-      )}
-    </Text>
-  )
-}
 
-const Sep = (E: Els, p: Palette) => <E.Text color={p.border}> │ </E.Text>
+const Sep = (E: Els, p: Palette) => <E.Text color={p.dim}> · </E.Text>
 
-export function Pane(E: Els, v: View, act: Acts) {
+export function Pane(E: Els, v0: View, act: Acts) {
   const { Box, Text, Button } = E
+  // one who-column width for every tab, from the whole pane (Live's cat doesn't change it)
+  const v: View = { ...v0, ww: v0.ww ?? whoWidth(v0.width) }
   const { p } = v
-  const count = tally(inbox(v.snap.sessions, v.threads, v.notebooks))
+  const segs = segments(inbox(v.snap.sessions, v.threads, v.notebooks))
+  const badge = (state: string) => segs.find(x => x.state === state)?.n ?? 0
   const unread = v.threads.filter(t => t.turns.some(u => u.unread)).length
   const crewBusy = v.threads.filter(t => t.status === 'running').length
   const need = mark(v, 'need')
@@ -164,7 +154,7 @@ export function Pane(E: Els, v: View, act: Acts) {
     <Box flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between">
         <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
-          {Grad(E, 'FLEET', p.accent, p.cyan, true)}
+          {Grad(E, 'FLEET', p.work, p.read, true)}
           {TABS.map(t => (
             <Button key={`tab-${t.tab}`} plain hotkey={t.key} onPress={() => act.tab(t.tab)}>
               {t.tab === v.tab ? (
@@ -174,8 +164,9 @@ export function Pane(E: Els, v: View, act: Acts) {
               ) : (
                 <Text color={p.dim}>{t.label}</Text>
               )}
-              {t.tab === 'live' && count.need > 0 ? <Text color={need.color}> {need.glyph}{count.need}</Text> : ''}
-              {t.tab === 'live' && count.read > 0 ? <Text color={read.color}> {read.glyph}{count.read}</Text> : ''}
+              {t.tab === 'live' && badge('need') > 0 ? <Text color={need.color}> {need.glyph}{badge('need')}</Text> : ''}
+              {t.tab === 'live' && badge('failed') > 0 ? <Text color={p.fail}> ×{badge('failed')}</Text> : ''}
+              {t.tab === 'live' && badge('read') > 0 ? <Text color={read.color}> {read.glyph}{badge('read')}</Text> : ''}
               {t.tab === 'crew' && crewBusy > 0 ? <Text color={work.color}> {work.glyph}{crewBusy}</Text> : ''}
               {t.tab === 'crew' && unread > 0 ? <Text color={read.color}> {read.glyph}{unread}</Text> : ''}
             </Button>
@@ -190,8 +181,14 @@ export function Pane(E: Els, v: View, act: Acts) {
           </Button>
         </Box>
       </Box>
-      <Text color={p.border}>{'─'.repeat(Math.max(10, v.width))}</Text>
-      {v.toured ? null : Tour(E, v, act)}
+      <Text color={p.faint}>{'─'.repeat(Math.max(10, v.width))}</Text>
+      {v.health?.err ? (
+        <Text color={p.fail} wrap="wrap">
+          × FLEET cannot read your sessions: {v.health.err} · what you see is the last good snapshot ({v.health.age}s old)
+        </Text>
+      ) : v.health && v.health.age > 6 ? (
+        <Text color={p.need}>data {v.health.age}s old · the collector may have stopped</Text>
+      ) : null}
       {(v.tab === 'live' || v.tab === 'needs') && Live(E, v, act)}
       {v.tab === 'feed' && Feed(E, v, act)}
       {v.tab === 'crew' && Crew(E, v, act)}
@@ -221,11 +218,11 @@ export function fitWho(who: string, max: number): string {
 function GridRow(
   E: Els,
   v: View,
-  o: { key: string; m: Mark; who: string; what: string; age?: string; quiet?: boolean; press?: () => void },
+  o: { key: string; m: Mark; who: string; what: string; age?: string; quiet?: boolean; press?: () => void; focus?: boolean },
 ) {
   const { Text, Button } = E
   const { p } = v
-  const ww = whoWidth(v.width)
+  const ww = v.ww ?? whoWidth(v.width)
   const age = o.age ?? ''
   const room = Math.max(8, v.width - 2 - ww - 5)
   const body = [
@@ -235,7 +232,7 @@ function GridRow(
     <Text color={p.dim}> {age.padStart(4)}</Text>,
   ]
   return o.press ? (
-    <Button key={o.key} plain onPress={o.press}>
+    <Button key={o.key} plain onPress={o.press} {...(o.focus ? { autoFocus: true as const } : {})}>
       {body}
     </Button>
   ) : (
@@ -302,7 +299,7 @@ const sessionWhat = (s: Session): string =>
   activity(s) + (s.agents.length ? ` · ${s.agents.length} agent${s.agents.length === 1 ? '' : 's'}` : '')
 
 /** A session's row; opened, its detail and actions hang under it. */
-function SessionRow(E: Els, v: View, s: Session, act: Acts) {
+function SessionRow(E: Els, v: View, s: Session, act: Acts, focus = false) {
   const { Box, Text } = E
   const { p } = v
   const m = sessionMark(v, s)
@@ -314,6 +311,7 @@ function SessionRow(E: Els, v: View, s: Session, act: Acts) {
     age: age(v.snap.now - s.phaseSince),
     quiet: !needsYou(s) && !isBusy(s),
     press: () => act.select(s.sid),
+    focus,
   })
   if (s.sid !== v.selected) return row
   const pct = ctxPct(s)
@@ -325,13 +323,13 @@ function SessionRow(E: Els, v: View, s: Session, act: Acts) {
   const session = (
     <Text>
       <Text color={p.text}>{s.model} · context </Text>
-      <Text color={pct >= 80 ? heat(pct / 100, p) : p.text}>{pct}%</Text>
+      <Text color={pct >= 80 ? p.need : p.text}>{pct}%</Text>
       <Text color={p.text}> · </Text>
-      <Text color={p.gold}>{usd(s.cost)}</Text>
+      <Text color={p.money}>{usd(s.cost)}</Text>
       <Text color={p.text}> · up {hms(v.snap.now - s.startedAt)}</Text>
       {s.branch ? <Text color={p.text}> · {cut(s.branch, 24)}</Text> : ''}
       {s.added ? <Text color={p.ok}> · +{s.added}</Text> : ''}
-      {s.removed ? <Text color={p.bad}> −{s.removed}</Text> : ''}
+      {s.removed ? <Text color={p.fail}> −{s.removed}</Text> : ''}
     </Text>
   )
   return (
@@ -349,7 +347,7 @@ function SessionRow(E: Els, v: View, s: Session, act: Acts) {
             { key: 'a-id', label: 'copy id', hotkey: 'c', press: () => act.copy(s.sid, 'session id') },
             { key: 'a-dir', label: 'copy folder', hotkey: 'f', press: () => act.copy(s.cwd, 'folder') },
             { key: 'a-open', label: 'open transcript', hotkey: 'o', press: () => act.open(s.transcript) },
-            s.sid === v.self ? null : { key: 'a-stop', label: 'stop…', color: p.bad, hotkey: 'x', press: () => act.stop(s) },
+            s.sid === v.self ? null : { key: 'a-stop', label: 'stop…', color: p.fail, hotkey: 'x', press: () => act.stop(s) },
           ]),
         ])}
     </Box>
@@ -395,21 +393,10 @@ function Tour(E: Els, v: View, act: Acts) {
 }
 
 /** The headline: what the whole fleet wants from you. The band says the same words. */
-export function headline(items: readonly Item[]): { state: Parameters<typeof mark>[1]; text: string }[] {
-  const count = tally(items)
-  const out: { state: Parameters<typeof mark>[1]; text: string }[] = []
-  if (count.need) out.push({ state: 'need', text: `${count.need} need${count.need === 1 ? 's' : ''} you` })
-  if (count.read) out.push({ state: 'read', text: `${count.read} to read` })
-  if (count.work) out.push({ state: 'work', text: `${count.work} working` })
-  if (out.length === 0) out.push({ state: 'quiet', text: 'all quiet · the cat is napping' })
-  else if (count.quiet) out.push({ state: 'quiet', text: `${count.quiet} quiet` })
-  return out
-}
-
 function Headline(E: Els, v: View, items: readonly Item[], right: Node) {
   const { Box, Text } = E
   const { p } = v
-  const parts = headline(items)
+  const parts = segments(items)
   return (
     <Box flexDirection="row" justifyContent="space-between">
       <Text wrap="truncate-end">
@@ -443,9 +430,9 @@ function Keys(E: Els, v: View, text: string) {
 const HEADS: Record<Group, string> = { need: 'NEEDS YOU', read: 'TO READ', work: 'WORKING', quiet: 'QUIET' }
 
 /** One row for a crew item in the inbox; pressing it opens it in place, like a session. */
-function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Acts) {
+function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Acts, focus = false) {
   const { Box } = E
-  const row = CrewLine(E, v, x, act)
+  const row = CrewLine(E, v, x, act, focus)
   const key = x.kind === 'notes' ? `notes:${x.folder}` : `crew:${x.t.name}`
   if (v.selected !== key) return row
   if (x.kind === 'notes') {
@@ -460,7 +447,7 @@ function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Ac
             ActionLine(E, v, [
               { key: `live-ok-${n.id}`, label: 'keep', color: p.ok, press: () => act.noteApprove(x.folder, n.id) },
               { key: `live-ed-${n.id}`, label: 'edit', press: () => act.noteEdit(x.folder, n.id) },
-              { key: `live-x-${n.id}`, label: 'reject', color: p.bad, press: () => act.noteRemove(x.folder, n.id) },
+              { key: `live-x-${n.id}`, label: 'reject', color: p.fail, press: () => act.noteRemove(x.folder, n.id) },
             ]),
           ]),
           ActionLine(E, v, [{ key: `live-nb-${x.folder}`, label: 'open the notebook in Crew', color: p.dim, press: () => act.openNotebook(x.folder) }]),
@@ -477,7 +464,7 @@ function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Ac
   )
 }
 
-function CrewLine(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Acts) {
+function CrewLine(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Acts, focus = false) {
   const now = v.snap.now
   if (x.kind === 'notes') {
     return GridRow(E, v, {
@@ -485,6 +472,7 @@ function CrewLine(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: A
       m: mark(v, 'read'),
       who: 'notebook',
       what: `${x.count} suggestion${x.count === 1 ? '' : 's'} to keep or reject · ${x.folder.replace(/^\/home\/[^/]+/, '~')}`,
+      focus,
       press: () => act.openInline(`notes:${x.folder}`),
     })
   }
@@ -497,6 +485,7 @@ function CrewLine(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: A
       who,
       what: u?.log[u.log.length - 1] ?? 'working…',
       age: u ? age(now - u.started) : '',
+      focus,
       press: () => act.openInline(`crew:${x.t.name}`),
     })
   }
@@ -510,7 +499,8 @@ function CrewLine(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: A
       ? `changes to review: ${deliveryLine(d)}`
       : failed ? `failed: ${x.u.log[x.u.log.length - 1] ?? (summaryOf(x.u.answer) || 'no answer')}` : summaryOf(x.u.answer) || 'answered',
     age: age(now - (x.u.ended ?? now)),
-    press: () => act.openInline(`crew:${x.t.name}`),
+    focus,
+      press: () => act.openInline(`crew:${x.t.name}`),
   })
 }
 
@@ -528,13 +518,14 @@ function Live(E: Els, v: View, act: Acts) {
   // group headings only when there is more than one kind of thing to look at
   const isGrouped = new Set(items.map(x => x.group)).size > 1
   const rows: Node[] = [
-    Headline(E, rowsView, items, <Text color={p.gold}>{usd(v.snap.cost.today)} today</Text>),
+    Headline(E, rowsView, items, <Text color={p.money}>{usd(v.snap.cost.today)} today</Text>),
     <Text> </Text>,
+    ...(v.toured ? [] : [Tour(E, rowsView, act)]),
   ]
   let last: Group | null = null
   for (const x of items) {
     if (isGrouped && x.group !== last) {
-      const color = x.group === 'need' ? p.warn : x.group === 'read' ? p.cyan : x.group === 'work' ? p.accent : p.dim
+      const color = x.group === 'need' ? p.need : x.group === 'read' ? p.read : x.group === 'work' ? p.work : p.dim
       rows.push(
         <Text color={color} weight="bold">
           {HEADS[x.group]}
@@ -542,7 +533,10 @@ function Live(E: Els, v: View, act: Acts) {
       )
       last = x.group
     }
-    rows.push(x.kind === 'session' ? SessionRow(E, rowsView, x.s, act) : CrewRow(E, rowsView, x, act))
+    rows.push(x.kind === 'session' ? SessionRow(E, rowsView, x.s, act, x === items[0]) : CrewRow(E, rowsView, x, act, x === items[0]))
+  }
+  if (segments(items).every(x => x.state === 'quiet')) {
+    rows.push(<Text color={p.dim}>Nothing needs you. Hand off work with /crew &lt;task&gt;, or press 3.</Text>)
   }
 
   return (
@@ -562,7 +556,7 @@ function Live(E: Els, v: View, act: Acts) {
           {v.hero ? <Box marginTop={1}>{v.hero}</Box> : null}
         </Box>
       )}
-      {Keys(E, v, 'tab move · enter open · 1-6 tabs · t theme · a cat · /fleet close')}
+      {Keys(E, v, 'enter open · tab move · 1-6 tabs · t theme · a cat · /fleet close')}
     </Box>
   )
 }
@@ -596,15 +590,14 @@ function bursts(items: readonly FeedItem[]): FeedItem[] {
   return out
 }
 
-type Kind = { glyph: string; color: (p: Palette) => string; label: string }
-const KINDS: Record<string, Kind> = {
-  read: { glyph: '·', color: p => p.cyan, label: 'reads' },
-  write: { glyph: '■', color: p => p.gold, label: 'edits' },
-  run: { glyph: '$', color: p => p.accent, label: 'commands' },
-  agent: { glyph: '+', color: p => p.violet, label: 'agents' },
-  web: { glyph: '◎', color: p => p.ok, label: 'web' },
-  ask: { glyph: '▲', color: p => p.warn, label: 'questions' },
-  other: { glyph: '›', color: p => p.dim, label: 'other' },
+const KIND_LABEL: Record<string, string> = {
+  read: 'reads',
+  write: 'edits',
+  run: 'commands',
+  agent: 'agents',
+  web: 'web',
+  ask: 'questions',
+  other: 'other',
 }
 const kindOf = (tool: string): string =>
   /^read \d|^(Read|Glob|Grep|LS|NotebookRead)$/.test(tool)
@@ -634,95 +627,97 @@ const kindOfTool = (tool: string): string =>
               ? 'ask'
               : 'other'
 
+/** Feed: what everyone is doing, in time order. IN FLIGHT (running now), then RECENT, on the grid. */
 function Feed(E: Els, v: View, act: Acts) {
   const { Box, Text, Button } = E
   const { p } = v
-  const colorOf = new Map(v.snap.sessions.map(s => [s.sid, sessionColor(s, p)]))
+  const sessions = v.snap.sessions.filter(s => !v.feedFilter || s.sid === v.feedFilter)
+  const bySid = new Map(v.snap.sessions.map(s => [s.sid, s]))
   const all = v.snap.feed.filter(f => !v.feedFilter || f.sid === v.feedFilter)
   // the collector counts every call of the last 10 minutes; the feed itself keeps only a few
   const tally = new Map<string, number>()
-  let recentCount = 0
+  let total = 0
   if (v.snap.tally) {
     for (const [sid, tools] of Object.entries(v.snap.tally)) {
       if (v.feedFilter && sid !== v.feedFilter) continue
       for (const [tool, n] of Object.entries(tools)) {
         tally.set(kindOf(tool), (tally.get(kindOf(tool)) ?? 0) + n)
-        recentCount += n
+        total += n
       }
     }
   } else {
     for (const f of all.filter(x => v.snap.now - x.t < 600)) {
       tally.set(kindOf(f.tool), (tally.get(kindOf(f.tool)) ?? 0) + 1)
-      recentCount += 1
+      total += 1
     }
   }
-  const items = all.slice(-24).reverse()
-  const w = Math.max(30, v.width)
-
-  // runs of the same session read as one block under its name
-  const blocks: { sid: string; name: string; items: typeof items }[] = []
-  for (const f of items) {
-    const last = blocks[blocks.length - 1]
-    if (last && last.sid === f.sid) last.items.push(f)
-    else blocks.push({ sid: f.sid, name: f.name, items: [f] })
-  }
-
+  const filterName = v.feedFilter ? (bySid.get(v.feedFilter)?.name ?? 'one session') : 'all sessions'
+  // f cycles: all → each session → all
+  const order = v.snap.sessions.map(s => s.sid)
+  const nextFilter = v.feedFilter === null ? (order[0] ?? null) : (order[order.indexOf(v.feedFilter) + 1] ?? null)
+  const headline = (
+    <Box flexDirection="row" justifyContent="space-between">
+      <Text wrap="truncate-end">
+        {total === 0 ? (
+          <Text color={p.dim}>no tool calls in the last 10 minutes</Text>
+        ) : (
+          [
+            <Text color={p.text}>{total}</Text>,
+            <Text color={p.dim}> tool calls in the last 10 min</Text>,
+            ...[...tally]
+              .sort((a, b) => b[1] - a[1])
+              .flatMap(([k, n]) => [<Text color={p.dim}> · </Text>, <Text color={p.text}>{n}</Text>, <Text color={p.dim}> {KIND_LABEL[k] ?? k}</Text>]),
+          ]
+        )}
+      </Text>
+      <Button key="feed-filter" plain hotkey="f" onPress={() => act.filter(nextFilter)}>
+        <Text color={p.text}>{cut(filterName, 20)}</Text>
+        <Text color={p.dim}> · f filter</Text>
+      </Button>
+    </Box>
+  )
+  // IN FLIGHT: each tool call running now, with its session's mark
+  const flight = sessions.flatMap(s =>
+    s.tools.map((tl, i) => {
+      const m = sessionMark(v, s)
+      const waits = needsYou(s) && i === s.tools.length - 1
+      return GridRow(E, v, {
+        key: `fl-${s.sid}-${i}`,
+        m,
+        who: i === 0 ? s.name : '',
+        what: `${tl.tool} ${tl.detail}`.trim() + (waits ? ' · waiting for you' : ''),
+        age: age(v.snap.now - tl.since),
+      })
+    }),
+  )
+  // RECENT: newest first, bursts collapsed; a session's name only on the first row of its run
+  const items = bursts(all.slice(-40).reverse()).slice(0, 24)
+  const recent = items.map((f, i) => {
+    const prev = items[i - 1]
+    return GridRow(E, v, {
+      key: `rc-${i}`,
+      m: { glyph: ' ', color: p.dim },
+      who: prev && prev.sid === f.sid ? '' : f.name + (f.sid === v.self ? ' (here)' : ''),
+      // a collapsed burst reads "read 12 files: a, b, c…"
+      what: `${f.agent ? '↳ ' : ''}${f.tool}${/^\w+ \d+ \w+$/.test(f.tool) && f.detail ? ':' : ''} ${f.detail}`.trim(),
+      age: age(v.snap.now - f.t),
+    })
+  })
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
-        <Button key="f-all" plain onPress={() => act.filter(null)}>
-          <Text color={v.feedFilter === null ? p.text : p.dim} weight={v.feedFilter === null ? 'bold' : 'regular'} underline={v.feedFilter === null}>all</Text>
-        </Button>
-        {v.snap.sessions.map(s => (
-          <Button key={`f-${s.sid}`} plain onPress={() => act.filter(s.sid)}>
-            <Text color={v.feedFilter === s.sid ? p.text : p.dim} weight={v.feedFilter === s.sid ? 'bold' : 'regular'} underline={v.feedFilter === s.sid}>
-              {cut(s.name, 16)}
-            </Text>
-          </Button>
-        ))}
-      </Box>
-      <Text wrap="truncate-end">
-        <Text color={p.dim}>last 10 min </Text>
-        <Text color={p.text}>{recentCount}</Text>
-        <Text color={p.dim}> tool calls</Text>
-        {[...tally]
-          .sort((a, b) => b[1] - a[1])
-          .map(([k, n]) => {
-            const kind = KINDS[k] ?? KINDS.other!
-            return (
-              <Text>
-                <Text color={p.border}> · </Text>
-                <Text color={kind.color(p)}>
-                  {kind.glyph} {n}
-                </Text>
-                <Text color={p.dim}> {kind.label}</Text>
-              </Text>
-            )
-          })}
+      {headline}
+      <Text> </Text>
+      {flight.length ? (
+        <Text color={p.dim} weight="bold">
+          IN FLIGHT
+        </Text>
+      ) : null}
+      {flight}
+      <Text color={p.dim} weight="bold">
+        RECENT <Text weight="regular">· newest first</Text>
       </Text>
-      {items.length === 0 ? <Text color={p.dim}>No activity yet. Tool calls stream in here as they happen.</Text> : null}
-      {blocks.map(b => (
-        <Box flexDirection="column" marginTop={1}>
-          <Text>
-            <Text color={colorOf.get(b.sid) ?? p.dim}>● </Text>
-            <Text color={p.text} weight="bold">
-              {b.name}
-            </Text>
-          </Text>
-          {bursts(b.items).map(f => {
-            const kind = KINDS[kindOf(f.tool)] ?? KINDS.other!
-            return (
-              <Text wrap="truncate-end">
-                <Text color={p.dim}>{ago(v.snap.now - f.t).padStart(6)} </Text>
-                <Text color={p.border}>{f.agent ? '┊ ' : '│ '}</Text>
-                <Text color={kind.color(p)}>{kind.glyph} </Text>
-                <Text color={f.agent ? p.violet : p.text}>{f.tool}</Text>
-                <Text color={p.dim}> {cut(f.detail, w - 14 - f.tool.length)}</Text>
-              </Text>
-            )
-          })}
-        </Box>
-      ))}
+      {recent.length ? recent : <Text color={p.dim}>  Calls appear here as sessions make them.</Text>}
+      {Keys(E, v, 'f filter · tab move · 1-6 tabs · t theme · a cat · /fleet close')}
     </Box>
   )
 }
@@ -733,7 +728,7 @@ const threadMark = (v: View, t: CrewThread): Mark =>
     ? mark(v, 'work')
     : t.turns.some(u => u.unread && u.status === 'failed')
       ? mark(v, 'failed')
-      : t.turns.some(u => u.unread)
+      : t.turns.some(u => u.unread || u.delivery?.state === 'pending')
         ? mark(v, 'read')
         : mark(v, 'quiet')
 
@@ -809,32 +804,37 @@ function ThreadDetail(E: Els, v: View, t: CrewThread, m: Mark, act: Acts, isOnLi
                   </Text>
                 ))
             : []),
-          ...(last.delivery ? DeliveryCard(E, v, t, last.n, last.delivery, act) : []),
+          ...(last.delivery ? DeliveryCard(E, v, t, last.n, last.delivery, act, last.delivery.state === 'pending') : []),
           // an earlier turn's changes still waiting for a decision keep their card and buttons
           ...t.turns
             .filter(u => u.n !== last.n && u.delivery?.state === 'pending')
-            .flatMap(u => [Labeled(E, v, `turn ${u.n}`, 'changes from this earlier turn are still waiting'), ...DeliveryCard(E, v, t, u.n, u.delivery!, act)]),
+            .flatMap((u, i) => [
+              Labeled(E, v, `turn ${u.n}`, 'changes from this earlier turn are still waiting'),
+              // keys go to one card only: the latest turn's when it has one, else the first earlier one
+              ...DeliveryCard(E, v, t, u.n, u.delivery!, act, i === 0 && last.delivery?.state !== 'pending'),
+            ]),
           <Text color={p.dim} wrap="truncate-end">
             {meta}
           </Text>,
           ActionLine(E, v, [
-            last.status === 'running' ? { key: `stop-${t.name}`, label: 'stop', color: p.bad, press: () => act.crewStop(t.name) } : null,
+            last.status === 'running' ? { key: `stop-${t.name}`, label: 'stop', color: p.fail, hotkey: 'x', press: () => act.crewStop(t.name) } : null,
             last.answer
-              ? { key: `open-${t.name}-${last.n}`, label: isFull ? 'show the summary' : 'read full answer', press: () => act.crewOpen(`${t.name}#${last.n}`) }
+              ? { key: `open-${t.name}-${last.n}`, label: isFull ? 'show the summary' : 'read full answer', hotkey: 'r', press: () => act.crewOpen(`${t.name}#${last.n}`) }
               : null,
             last.status !== 'running' && !last.isHanded
-              ? { key: `send-${t.name}-${last.n}`, label: 'send to Claude', press: () => act.crewSend(t.name, last.n) }
+              ? { key: `send-${t.name}-${last.n}`, label: 'send to Claude', hotkey: 's', press: () => act.crewSend(t.name, last.n) }
               : null,
-            last.answer ? { key: `copy-${t.name}-${last.n}`, label: 'copy', color: p.dim, press: () => act.copy(last.answer, `${t.name} answer`) } : null,
+            last.answer ? { key: `copy-${t.name}-${last.n}`, label: 'copy', color: p.dim, hotkey: 'c', press: () => act.copy(last.answer, `${t.name} answer`) } : null,
             t.turns.length > 1
               ? {
                   key: `turns-${t.name}`,
                   label: v.crewAllTurns === t.name ? 'hide earlier turns' : `${t.turns.length - 1} earlier turn${t.turns.length === 2 ? '' : 's'}`,
                   color: p.dim,
+                  hotkey: 'e',
                   press: () => act.showAllTurns(t.name),
                 }
               : null,
-            isOnLive ? { key: `crew-tab-${t.name}`, label: 'open in Crew', color: p.dim, press: () => act.openThread(t.name) } : null,
+            isOnLive ? { key: `crew-tab-${t.name}`, label: 'open in Crew', color: p.dim, hotkey: 'g', press: () => act.openThread(t.name) } : null,
           ]),
           last.isHanded && last.status !== 'running' ? <Text color={p.dim}>Claude has this answer</Text> : null,
         ])
@@ -844,7 +844,7 @@ function ThreadDetail(E: Els, v: View, t: CrewThread, m: Mark, act: Acts, isOnLi
  * What a Codex edit turn changed, as rail lines: the files, the diff on demand, and
  * accept or discard. Nothing reaches your tree until you accept.
  */
-function DeliveryCard(E: Els, v: View, t: CrewThread, n: number, d: Delivery, act: Acts): Node[] {
+function DeliveryCard(E: Els, v: View, t: CrewThread, n: number, d: Delivery, act: Acts, withKeys = true): Node[] {
   const { Text } = E
   const { p } = v
   const key = `${t.name}#${n}`
@@ -857,7 +857,7 @@ function DeliveryCard(E: Els, v: View, t: CrewThread, n: number, d: Delivery, ac
       v,
       'changes',
       <Text>
-        <Text color={d.state === 'pending' ? mark(v, 'read').color : p.dim}>{deliveryLine(d)}</Text>
+        <Text color={d.state === 'pending' ? p.text : p.dim}>{deliveryLine(d)}</Text>
         <Text color={p.dim}> · {state}</Text>
       </Text>,
     ),
@@ -869,16 +869,16 @@ function DeliveryCard(E: Els, v: View, t: CrewThread, n: number, d: Delivery, ac
         <Text>
           <Text color={p.text}>{f.path} </Text>
           <Text color={p.ok}>+{f.added}</Text>
-          <Text color={p.bad}> −{f.removed}</Text>
+          <Text color={p.fail}> −{f.removed}</Text>
         </Text>,
       ),
     ),
     d.files.length > 8 ? Labeled(E, v, '', `… and ${d.files.length - 8} more`) : null,
-    d.note ? Labeled(E, v, 'note', <Text color={p.warn}>{d.note}</Text>) : null,
+    d.note ? Labeled(E, v, 'note', <Text color={p.need}>{d.note}</Text>) : null,
   ].filter(x => x !== null)
   if (isOpen && v.crewDiff) {
     for (const line of v.crewDiff.text.split('\n').slice(0, 400)) {
-      const color = /^\+(?!\+\+)/.test(line) ? p.ok : /^-(?!--)/.test(line) ? p.bad : /^@@/.test(line) ? p.cyan : p.dim
+      const color = /^\+(?!\+\+)/.test(line) ? p.ok : /^-(?!--)/.test(line) ? p.fail : /^@@/.test(line) ? p.read : p.dim
       lines.push(
         <Text color={color} wrap="truncate-end">
           {line || ' '}
@@ -889,9 +889,9 @@ function DeliveryCard(E: Els, v: View, t: CrewThread, n: number, d: Delivery, ac
   if (d.state === 'pending') {
     lines.push(
       ActionLine(E, v, [
-        { key: `dv-${key}`, label: isOpen ? 'hide diff' : 'view diff', press: () => act.deliveryView(t.name, n) },
-        { key: `da-${key}`, label: 'accept into your tree', color: p.ok, press: () => act.deliveryAccept(t.name, n) },
-        { key: `dd-${key}`, label: 'discard', color: p.bad, press: () => act.deliveryDiscard(t.name, n) },
+        { key: `dv-${key}`, label: isOpen ? 'hide diff' : 'view diff', ...(withKeys ? { hotkey: 'v' } : {}), press: () => act.deliveryView(t.name, n) },
+        { key: `da-${key}`, label: 'accept into your tree', color: p.ok, ...(withKeys ? { hotkey: 'p' } : {}), press: () => act.deliveryAccept(t.name, n) },
+        { key: `dd-${key}`, label: 'discard', color: p.fail, ...(withKeys ? { hotkey: 'd' } : {}), press: () => act.deliveryDiscard(t.name, n) },
       ]),
     )
   }
@@ -927,7 +927,7 @@ function Notebook(E: Els, v: View, act: Acts) {
   return (
     <Box flexDirection="column">
       {head}
-      <Text color={used > NOTEBOOK_CAP * 0.8 ? p.warn : p.dim}>
+      <Text color={used > NOTEBOOK_CAP * 0.8 ? p.need : p.dim}>
         {'  '}
         {used.toLocaleString('en-US')} of {NOTEBOOK_CAP.toLocaleString('en-US')} characters · sent with every helper message
       </Text>
@@ -943,7 +943,7 @@ function Notebook(E: Els, v: View, act: Acts) {
             ActionLine(E, v, [
               { key: `note-ok-${n.id}`, label: 'keep', color: p.ok, press: () => act.noteApprove(v.notebook.folder, n.id) },
               { key: `note-ed-${n.id}`, label: 'edit', press: () => act.noteEdit(v.notebook.folder, n.id) },
-              { key: `note-x-${n.id}`, label: 'reject', color: p.bad, press: () => act.noteRemove(v.notebook.folder, n.id) },
+              { key: `note-x-${n.id}`, label: 'reject', color: p.fail, press: () => act.noteRemove(v.notebook.folder, n.id) },
             ]),
           ])}
         </Box>
@@ -1013,9 +1013,11 @@ function Crew(E: Els, v: View, act: Acts) {
   if (failed) seg('failed', `${failed} failed`)
   if (earlier.length) parts.push(<Text color={p.dim}>{earlier.length} earlier</Text>)
   if (parts.length === 0) parts.push(<Text color={p.dim}>no threads yet</Text>)
-  const where = target
-    ? `to ${target.agent} › ${target.name} · ${modeLabel(target.agent, target.mode)}`
-    : `to ${v.crewAgent} · ${modeLabel(v.crewAgent, v.crewMode)} · ${v.crewSummary} · new thread`
+  // only the mode words carry colour: ok when read-only, need when the helper may edit
+  const askMode = target ? target.mode : v.crewMode
+  const askAgent = target ? target.agent : v.crewAgent
+  const askTo = target ? `to ${target.agent} › ${target.name} · ` : `to ${v.crewAgent} · `
+  const askRest = target ? '' : ` · ${v.crewSummary} · new thread`
 
   return (
     <Box flexDirection="column">
@@ -1033,7 +1035,9 @@ function Crew(E: Els, v: View, act: Acts) {
       <Box flexDirection="row" justifyContent="space-between">
         <Text wrap="truncate-end">
           <Text color={p.dim}>{'  '}</Text>
-          <Text color={(target ?? { mode: v.crewMode }).mode === 'edit' ? p.warn : p.text}>{where}</Text>
+          <Text color={p.text}>{askTo}</Text>
+          <Text color={askMode === 'edit' ? p.need : p.ok}>{modeLabel(askAgent, askMode)}</Text>
+          <Text color={p.text}>{askRest}</Text>
         </Text>
         <Box flexDirection="row" columnGap={2}>
           {target ? (
@@ -1092,80 +1096,97 @@ function Crew(E: Els, v: View, act: Acts) {
   )
 }
 
-const GROUP_COLOR = (p: Palette, name: string): string =>
-  name === 'Claude Code'
-    ? p.accent
-    : name === 'MCP servers'
-      ? p.violet
-      : name === 'Codex'
-        ? p.cyan
-        : name === 'Antigravity'
-          ? p.ok
-          : name === 'FLEET'
-            ? p.gold
-            : p.dim
+/**
+ * One bar row on the grid, shared by Cost and System: mark · label · bar · value · note.
+ * When the pane is narrow the bar goes first; the value is never cut.
+ */
+function BarRow(
+  E: Els,
+  v: View,
+  o: { m?: Mark; label: string; frac: number; value: string; valueColor?: string; note?: string; bold?: boolean; quiet?: boolean },
+) {
+  const { Text } = E
+  const { p } = v
+  const ww = v.ww ?? whoWidth(v.width)
+  const cells = Math.min(40, v.width - 2 - ww - 10 - 24)
+  return (
+    <Text wrap="truncate-end">
+      <Text color={o.m?.color ?? p.dim}>{o.m ? `${o.m.glyph} ` : '  '}</Text>
+      <Text color={o.quiet ? p.dim : p.text}>{fitWho(o.label, ww - 1).padEnd(ww)}</Text>
+      {cells >= 6 ? HBar(E, v, o.frac, cells, o.bold) : ''}
+      <Text color={o.valueColor ?? p.text}> {o.value.padStart(8)}</Text>
+      <Text color={p.dim}>{o.note ? `   ${o.note}` : ''}</Text>
+    </Text>
+  )
+}
 
+const HOT_CPU = 80 // a process at or over this % of one core is "hot"
+
+/** System: the machine on the same bar table as Cost. */
 function SystemView(E: Els, v: View) {
   const { Box, Text } = E
   const { p } = v
   const sys = v.snap.sys
-  if (!sys) return <Text color={p.dim}>Measuring… (CPU needs two samples, about 2 s)</Text>
-  const memPct = sys.memTotalMb ? (sys.memUsedMb / sys.memTotalMb) * 100 : 0
-  const loadPct = (sys.load[0] ?? 0) / sys.cores * 100
-  const claudeCpu = sys.groups.reduce((n, g) => n + g.cpu, 0)
-  const claudeMem = sys.groups.reduce((n, g) => n + g.rssMb, 0)
-
+  const keys = Keys(E, v, 'tab move · 1-6 tabs · t theme · a cat · /fleet close')
+  if (!sys) {
+    return (
+      <Box flexDirection="column">
+        <Text color={p.dim}>measuring… about 2 s (CPU needs two samples)</Text>
+        {keys}
+      </Box>
+    )
+  }
+  const memPct = sys.memTotalMb ? Math.round((sys.memUsedMb / sys.memTotalMb) * 100) : 0
+  const load = sys.load[0] ?? 0
+  const stackCpu = Math.round(sys.groups.reduce((n, g) => n + g.cpu, 0))
+  const stackGb = sys.groups.reduce((n, g) => n + g.rssMb, 0) / 1024
+  const hotGroups = new Set(sys.top.filter(t => t.cpu >= HOT_CPU).map(t => t.group))
+  const need = mark(v, 'need')
+  const total = Math.max(1, sys.cores * 100)
   return (
     <Box flexDirection="column">
-      <Text>
-        <Text color={p.dim}>machine  mem </Text>
-        {Gauge(E, memPct, 12, p)}
-        <Text color={heat(memPct / 100, p)}> {Math.round(memPct)}%</Text>
-        <Text color={p.dim}>
-          {' '}
-          {(sys.memUsedMb / 1024).toFixed(1)}/{(sys.memTotalMb / 1024).toFixed(1)} GB
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text wrap="truncate-end">
+          <Text color={p.dim}>memory </Text>
+          <Text color={memPct >= 85 ? p.need : p.text}>{memPct}%</Text>
+          <Text color={p.dim}> of {(sys.memTotalMb / 1024).toFixed(0)} GB · load </Text>
+          <Text color={load >= sys.cores ? p.need : p.text}>{load.toFixed(1)}</Text>
+          <Text color={p.dim}> on {sys.cores} cores · Claude stack </Text>
+          <Text color={p.text}>{stackCpu}% cpu, {stackGb.toFixed(1)} GB</Text>
         </Text>
-        {Sep(E, p)}
-        <Text color={p.dim}>load </Text>
-        <Text color={heat(Math.min(1, loadPct / 100), p)}>{(sys.load[0] ?? 0).toFixed(1)}</Text>
-        <Text color={p.dim}> on {sys.cores} cores</Text>
-      </Text>
-      <Text>
-        <Text color={p.dim}>claude stack  </Text>
-        <Text color={p.text}>{claudeCpu.toFixed(0)}% cpu</Text>
-        <Text color={p.dim}> (100% = one core)</Text>
-        {Sep(E, p)}
-        <Text color={p.text}>{(claudeMem / 1024).toFixed(2)} GB</Text>
-        <Text color={p.dim}> memory</Text>
-      </Text>
-      <Box flexDirection="column" marginTop={1}>
-        {sys.groups.map(g => (
-          <Text wrap="truncate-end">
-            <Text color={GROUP_COLOR(p, g.name)}>● {g.name.padEnd(15)}</Text>
-            <Text color={g.count ? p.text : p.dim}>{String(g.count).padStart(3)} </Text>
-            {Gauge(E, Math.min(100, g.cpu / sys.cores), 8, p)}
-            <Text color={heat(Math.min(1, g.cpu / 100 / sys.cores), p)}>{`${g.cpu.toFixed(0)}%`.padStart(6)}</Text>
-            <Text color={p.dim}>{`${g.rssMb} MB`.padStart(9)} </Text>
-            <Text color={GROUP_COLOR(p, g.name)}>{spark(g.history.length ? g.history : [0])}</Text>
-          </Text>
-        ))}
+        <Text color={p.dim}>100% cpu = one core</Text>
       </Box>
-      <Box flexDirection="column" marginTop={1}>
-        <Text color={p.dim}>BUSIEST PROCESSES</Text>
-        {sys.top.map(t => (
-          <Text wrap="truncate-end">
-            <Text color={GROUP_COLOR(p, t.group)}>● </Text>
-            <Text color={p.text}>{`${t.cpu.toFixed(0)}%`.padStart(5)}</Text>
-            <Text color={p.dim}>{`${Math.round(t.rssMb)}MB`.padStart(8)} </Text>
-            <Text color={p.dim}>{t.cmd}</Text>
-          </Text>
-        ))}
-      </Box>
-      <Text color={p.dim}>groups: Claude Code windows · their MCP servers · tools and shells they started · Codex · Antigravity · FLEET</Text>
+      <Text> </Text>
+      <Text color={p.dim} weight="bold">
+        GROUPS
+      </Text>
+      {sys.groups.map(g =>
+        BarRow(E, v, {
+          ...(hotGroups.has(g.name) ? { m: need } : {}),
+          label: `${g.name} · ${g.count}`,
+          frac: g.cpu / total,
+          value: `${Math.round(g.cpu)}%`,
+          note: `${(g.rssMb / 1024).toFixed(1)} GB  ${g.history.length ? spark(g.history.slice(-8)) : ''}`,
+          quiet: g.count === 0,
+        }),
+      )}
+      <Text> </Text>
+      <Text color={p.dim} weight="bold">
+        PROCESSES <Text weight="regular">· busiest first</Text>
+      </Text>
+      {sys.top.map((t, i) =>
+        GridRow(E, v, {
+          key: `proc-${i}`,
+          m: t.cpu >= HOT_CPU ? need : { glyph: ' ', color: p.dim },
+          who: t.group,
+          what: `${t.cmd} · ${(t.rssMb / 1024).toFixed(1)} GB${t.cpu >= HOT_CPU ? ` · over ${HOT_CPU}% cpu` : ''}`,
+          age: `${Math.round(t.cpu)}%`,
+        }),
+      )}
+      {keys}
     </Box>
   )
 }
-
 
 /** A one-colour horizontal bar on the grid: filled to `frac`, the rest dim. */
 function HBar(E: Els, v: View, frac: number, cells: number, bold = false) {
@@ -1174,10 +1195,10 @@ function HBar(E: Els, v: View, frac: number, cells: number, bold = false) {
   const full = Math.round(Math.max(0, Math.min(1, frac)) * cells)
   return (
     <Text>
-      <Text color={p.accent} weight={bold ? 'bold' : 'regular'}>
+      <Text color={p.work} weight={bold ? 'bold' : 'regular'}>
         {'█'.repeat(full)}
       </Text>
-      <Text color={p.border}>{'░'.repeat(cells - full)}</Text>
+      <Text color={p.faint}>{'░'.repeat(cells - full)}</Text>
     </Text>
   )
 }
@@ -1187,8 +1208,7 @@ function CostView(E: Els, v: View) {
   const { Box, Text } = E
   const { p } = v
   const c = v.snap.cost
-  const ww = whoWidth(v.width)
-  const cells = Math.max(10, Math.min(40, v.width - 2 - ww - 10 - 26))
+  const ww = v.ww ?? whoWidth(v.width)
   const week = c.days.reduce((n, d) => n + d.usd, 0)
   const peak = Math.max(...c.days.map(d => d.usd), 0.01)
   // today's spend only: a session that also ran yesterday counts just today's part
@@ -1198,15 +1218,8 @@ function CostView(E: Els, v: View) {
   const top = Math.max(...live.map(todayOf), closed, 0.01)
   const models = Object.entries(c.models).sort((a, b) => b[1] - a[1])
   const topModel = Math.max(...models.map(([, n]) => n), 0.01)
-  const row = (mk: Node, label: string, frac: number, amount: number, note = '', bold = false, quiet = false) => (
-    <Text wrap="truncate-end">
-      {mk}
-      <Text color={quiet ? p.dim : p.text}>{cut(label, ww - 1).padEnd(ww)}</Text>
-      {HBar(E, v, frac, cells, bold)}
-      <Text color={p.gold}> {usd(amount).padStart(8)}</Text>
-      <Text color={p.dim}>{note ? `   ${note}` : ''}</Text>
-    </Text>
-  )
+  const row = (mk: Mark | undefined, label: string, frac: number, amount: number, note = '', bold = false, quiet = false) =>
+    BarRow(E, v, { ...(mk ? { m: mk } : {}), label, frac, value: usd(amount), valueColor: p.money, note, bold, quiet })
   const blank = <Text>{'  '}</Text>
   const head = (title: string, note = '') => (
     <Text>
@@ -1236,11 +1249,11 @@ function CostView(E: Els, v: View) {
     <Box flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between">
         <Text>
-          <Text color={p.gold} weight="bold">
+          <Text color={p.money} weight="bold">
             {usd(c.today)} today
           </Text>
           <Text color={p.dim}> · </Text>
-          <Text color={p.gold}>{usd(week)} this week</Text>
+          <Text color={p.money}>{usd(week)} this week</Text>
           <Text color={p.dim}> · cache hit {Math.round(c.cacheHit * 100)}%</Text>
         </Text>
         <Text color={p.dim}>an estimate at API list prices</Text>
@@ -1250,19 +1263,19 @@ function CostView(E: Els, v: View) {
       {c.days.map((d, i) => {
         const isToday = i === c.days.length - 1
         const day = 'Sun Mon Tue Wed Thu Fri Sat'.split(' ')[new Date(`${d.date}T12:00:00`).getDay()] ?? d.date
-        return row(<Text>{'  '}</Text>, `${day}${isToday ? ' today' : ''}`, d.usd / peak, d.usd, d.usd === peak && peak > 0.01 ? 'peak' : '', isToday)
+        return row(undefined, `${day}${isToday ? ' today' : ''}`, d.usd / peak, d.usd, d.usd === peak && peak > 0.01 ? 'peak' : '', isToday)
       })}
       {blank}
       {head('TODAY BY SESSION')}
       {live.map(s => {
         const m = sessionMark(v, s)
-        return row(<Text color={m.color}>{m.glyph} </Text>, s.name, todayOf(s) / top, todayOf(s), `${s.model} · ${tok(s.tokensToday ?? s.tokens)} tokens today`, false, !needsYou(s) && !isBusy(s))
+        return row(m, s.name, todayOf(s) / top, todayOf(s), `${s.model} · ${tok(s.tokensToday ?? s.tokens)} tokens today`, false, !needsYou(s) && !isBusy(s))
       })}
-      {closed > 0.005 ? row(<Text>{'  '}</Text>, 'closed sessions', closed / top, closed, '', false, true) : null}
+      {closed > 0.005 ? row(undefined, 'closed sessions', closed / top, closed, '', false, true) : null}
       {blank}
       {head('TODAY BY MODEL')}
       {models.length === 0 ? <Text color={p.dim}>  none yet</Text> : null}
-      {models.map(([m, n]) => row(<Text>{'  '}</Text>, m, n / topModel, n))}
+      {models.map(([m, n]) => row(undefined, m, n / topModel, n))}
       {blank}
       {head('CREW', 'not priced: helpers run on your Codex and Antigravity plans')}
       {crew.map(x => (
@@ -1279,7 +1292,7 @@ function CostView(E: Els, v: View) {
           <Text wrap="truncate-end">
             {'  '}
             <Text color={p.text}>{'memory'.padEnd(ww)}</Text>
-            <Text color={memPct >= 85 ? p.warn : p.text}>{memPct}%</Text>
+            <Text color={memPct >= 85 ? p.need : p.text}>{memPct}%</Text>
             <Text color={p.dim}>
               {' '}
               · {(sys.memUsedMb / 1024).toFixed(1)} of {(sys.memTotalMb / 1024).toFixed(1)} GB
@@ -1333,7 +1346,7 @@ const GUIDE: { title: string; rows: [string, string][] }[] = [
       ['/fleet', 'open or close this pane · /fleet help jumps here'],
       ['ctrl+x tab', 'give the pane the keyboard; tab walks the buttons, enter presses one'],
       ['1 – 6', 'switch tabs: Live · Feed · Crew · Cost · System · Actions'],
-      ['t · a', 'cycle the colour theme · show or hide the cat'],
+      ['t · a', 'cycle the theme (nebula · ember · synthwave · paper for light terminals) · show or hide the cat'],
       ['arrows', 'scroll the pane while it has the keyboard'],
     ],
   },
@@ -1341,10 +1354,10 @@ const GUIDE: { title: string; rows: [string, string][] }[] = [
     title: 'TABS',
     rows: [
       ['1 Live', 'everything that wants you: NEEDS YOU · TO READ · WORKING · QUIET; press a row to open it'],
-      ['2 Feed', 'every tool call across sessions, grouped, with a 10-minute tally'],
+      ['2 Feed', 'IN FLIGHT (running now) and RECENT tool calls, newest first; f cycles the session filter'],
       ['3 Crew', 'conversations with Codex and Antigravity that Claude (or you) start'],
       ['4 Cost', 'estimated spend this week and today, crew usage, and the machine in three lines'],
-      ['5 System', 'CPU and memory of Claude, its MCP servers and tools, Codex, Antigravity'],
+      ['5 System', 'the machine on a bar table: groups and the busiest processes; ▲ marks one running hot'],
       ['6 Actions', 'settings and this guide; session actions are on their rows in Live'],
     ],
   },
@@ -1410,18 +1423,20 @@ function Guide(E: Els, v: View, act: Acts) {
   return (
     <Box flexDirection="column" marginTop={1}>
       <Text>
-        <Text color={p.accent} weight="bold">
+        <Text color={p.dim} weight="bold">
           HOW TO USE FLEET
         </Text>
         <Text color={p.dim}> · /fleet help opens this</Text>
       </Text>
       {GUIDE.map(section => (
         <Box flexDirection="column" marginTop={1}>
-          <Text color={p.violet}>{section.title}</Text>
+          <Text color={p.dim} weight="bold">
+            {section.title}
+          </Text>
           {section.rows.map(([key, what]) => (
             <Box flexDirection="row">
               <Box width={keyWidth} flexShrink={0}>
-                <Text color={p.cyan} wrap="wrap">
+                <Text color={p.text} wrap="wrap">
                   {key}
                 </Text>
               </Box>
@@ -1435,10 +1450,10 @@ function Guide(E: Els, v: View, act: Acts) {
         </Box>
       ))}
       <Box flexDirection="column" marginTop={1}>
-        <Text color={p.violet}>HANDY COMMANDS · press one to copy it</Text>
+        <Text color={p.dim}>HANDY COMMANDS · press one to copy it</Text>
         {COMMANDS.map(([cmd, what]) => (
           <Button key={`tip-${cmd}`} plain onPress={() => act.copy(cmd, cmd)}>
-            <Text color={p.cyan}>{cmd.padEnd(keyWidth)}</Text>
+            <Text color={p.text}>{cmd.padEnd(keyWidth)}</Text>
             <Text color={p.dim}>{what}</Text>
           </Button>
         ))}
@@ -1476,41 +1491,38 @@ function Actions(E: Els, v: View, act: Acts) {
 
 export type BandInfo = { age: number; isStale: boolean; items?: readonly Item[] }
 
-/** The line above the prompt: the Live headline, with the first thing that needs you spelled out. */
+/**
+ * The line above the prompt: the Live headline, word for word, except that a
+ * needs-you or failed count of one is spelled out ("api-refactor: Bash npm test").
+ */
 export function Band(E: Els, snap: Snapshot, p: Palette, info: BandInfo = { age: 0, isStale: false }) {
   const { Box, Text } = E
   const v = { p }
   const items = info.items ?? inbox(snap.sessions, [], {})
   const parts: Node[] = []
-  const seg = (state: Parameters<typeof mark>[1], text: string, bold = false) => {
-    const m = mark(v, state)
+  for (const seg of segments(items)) {
+    const m = mark(v, seg.state)
+    let text = seg.text
+    if (seg.n === 1 && seg.state === 'need') {
+      const x = items.find(i => i.group === 'need' && !isFailure(i))
+      if (x?.kind === 'session') text = `${x.s.name}: ${activity(x.s)}`
+    }
+    if (seg.n === 1 && seg.state === 'failed') {
+      const x = items.find(isFailure)
+      if (x?.kind === 'session') text = `${x.s.name} stopped on an error`
+      if (x?.kind === 'turn') text = `${x.t.agent} › ${x.t.name} failed`
+    }
     parts.push(
-      <Text color={m.color} weight={bold ? 'bold' : 'regular'}>
+      <Text color={m.color} weight={seg.state === 'need' ? 'bold' : 'regular'}>
         {m.glyph} {text}
       </Text>,
     )
   }
-  const sessions = items.flatMap(x => (x.kind === 'session' && x.group === 'need' ? [x.s] : []))
-  const failed = items.flatMap(x => (x.kind === 'turn' && x.group === 'need' ? [x] : []))
-  // the reason to look at the band comes first, before it can be cut off
-  if (sessions.length === 1) {
-    const s = sessions[0]!
-    seg(s.phase === 'error' ? 'error' : 'need', `${s.name}: ${activity(s)}`, true)
-  } else if (sessions.length > 1) {
-    seg('need', `${sessions.length} need you: ${sessions.map(s => s.name).join(', ')}`, true)
-  }
-  if (failed.length === 1) seg('failed', `${failed[0]!.t.agent} › ${failed[0]!.t.name} failed`)
-  else if (failed.length > 1) seg('failed', `${failed.length} crew failed`)
-  const count = tally(items)
-  if (count.read) seg('read', `${count.read} to read`)
-  if (count.work) seg('work', `${count.work} working`)
-  const isUrgent = sessions.length + failed.length > 0
-  if (!isUrgent && !count.read && count.quiet) seg('quiet', `${count.quiet} quiet`)
-  if (info.isStale) parts.push(<Text color={p.warn}>data {info.age}s old</Text>)
-  else parts.push(<Text color={p.gold}>{usd(snap.cost.today)}{isUrgent ? '' : ' today'}</Text>)
+  if (info.isStale) parts.push(<Text color={p.need}>data {info.age}s old</Text>)
+  else parts.push(<Text color={p.money}>{usd(snap.cost.today)} today</Text>)
   return (
     <Box flexDirection="row">
-      {Grad(E, 'FLEET', p.accent, p.cyan, true)}
+      {Grad(E, 'FLEET', p.work, p.read, true)}
       <Text wrap="truncate-end">
         {'  '}
         {parts.flatMap((x, i) => (i ? [<Text color={p.dim}> · </Text>, x] : [x]))}

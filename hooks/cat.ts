@@ -159,7 +159,7 @@ function glyph(c: Canvas, g: string, x: number, y: number, color: number): void 
 }
 
 export function catPixels(t: number, w: number, h: number, mood: Mood, p: Palette): Uint32Array {
-  const glowColor = mood === 'alarm' ? parseInt(p.warn.slice(1), 16) : p.glowA
+  const glowColor = mood === 'alarm' ? parseInt(p.need.slice(1), 16) : p.glowA
   const cx = w / 2
   const c = canvas(w, h, (x, y) => {
     // a soft spotlight behind the cat, a floor line under it
@@ -196,7 +196,7 @@ export function catPixels(t: number, w: number, h: number, mood: Mood, p: Palett
     }
   }
   if (mood === 'alarm' && Math.floor(t * 4) % 2 === 0) {
-    glyph(c, '!', ox + W / 2 - 0.5, Math.max(0, oy - 7), parseInt(p.warn.slice(1), 16))
+    glyph(c, '!', ox + W / 2 - 0.5, Math.max(0, oy - 7), parseInt(p.need.slice(1), 16))
   }
   return c.px
 }

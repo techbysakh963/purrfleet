@@ -7,10 +7,10 @@ import { argvFor, batchNotice, brief, digest, editDecision, grepAnswer, receipt,
 import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { fleetReport } from './brief'
-import { inbox, tally } from './inbox'
+import { inbox, moodOf, segments, tally } from './inbox'
 import { deliveryLine, newCodexWorktrees, parseNumstat, parseWorktrees } from './delivery'
 import { age, fitWho } from './views'
-import { PALETTES } from './theme'
+import { PALETTES, contrast } from './theme'
 import { findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf, safeName } from './vault'
 
 const NOW = 1_794_434_000
@@ -108,7 +108,7 @@ test('before the first scan the pane says it is scanning', async ($, on) => {
   on('state.get', (_, e, next) => next(e))
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await ui.find({ type: 'Text', text: /Scanning/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /scanning your sessions/ })).toBeDefined()
     await ui.unmount()
   }
 })
@@ -446,7 +446,7 @@ test('the band shows crew counts and says when data is stale; old threads and tu
   expect(await crew.find({ type: 'Text', text: /^NEW$/ })).toBeDefined()
   expect(await crew.find({ type: 'Text', text: /7 threads you've seen/ })).toBeDefined() // seen threads fold away
   expect(await crew.find({ type: 'Text', text: /5 earlier turns/ })).toBeDefined()
-  expect(await crew.find({ type: 'Text', text: /data is \d+s old/ })).toBeDefined()
+  expect(await crew.find({ type: 'Text', text: /data \d+s old · the collector/ })).toBeDefined()
   await crew.unmount()
 })
 
@@ -536,7 +536,8 @@ test('the feed collapses bursts, the tour shows once, crew options stay folded u
   })
   const feed = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await feed.find({ type: 'Text', text: /read 5 files/ })).toBeDefined()
-  expect(await feed.find({ type: 'Text', text: /WELCOME TO FLEET/ })).toBeDefined()
+  expect(await feed.find({ type: 'Text', text: /WELCOME TO FLEET/ })).toBeUndefined() // the tour lives on Live only
+  expect(await feed.find({ key: 'feed-filter' })).toBeDefined()
   await feed.unmount()
   isToured = true
   tab = 'crew'
@@ -769,4 +770,102 @@ test('crew_read reads cheaply: a digest with KEY POINTS, every new answer at onc
   expect(brief(base, 'claude', 'x', '', undefined, '', false, 'brief')).not.toContain('DETAILS')
   expect(brief(base, 'claude', 'x', '', undefined, '', false, 'normal')).toContain('at most 400 words')
   expect(brief(base, 'claude', 'x', '', undefined, '', false, 'deep')).toContain('DETAILS: anything longer')
+})
+
+
+test('v0.13 colour: every palette reads (paper on light), one failure mark, one headline, the cat wakes on a failed helper', async ($, on) => {
+  for (const pal of PALETTES) {
+    const bgs = pal.name === 'paper' ? ['#ffffff', '#fdf6e3', '#f5f5f5'] : ['#0c0c0c', '#1e1e2e', '#282c34']
+    for (const bg of bgs) {
+      expect(contrast(pal.text, bg)).toBeGreaterThanOrEqual(7)
+      expect(contrast(pal.dim, bg)).toBeGreaterThanOrEqual(4.5)
+      for (const m of [pal.need, pal.fail, pal.read, pal.work]) expect(contrast(m, bg)).toBeGreaterThanOrEqual(4.5)
+    }
+  }
+  // a session that ended on an error is a failure: × on Live and in the headline, the cat alarmed
+  const errored = { ...SNAP.sessions[1]!, phase: 'error', tools: [] }
+  const snap = { ...SNAP, sessions: [errored] }
+  const items = inbox(snap.sessions, [], {})
+  expect(segments(items).map(x => x.state)).toEqual(['failed'])
+  expect(moodOf(items)).toBe('alarm')
+  const failedHelper = crewThread('x', { status: 'failed', turns: [doneTurn(1, { status: 'failed', unread: true })] })
+  expect(moodOf(inbox([], [failedHelper], {}))).toBe('alarm')
+  expect(segments(inbox([], [], {}))[0]?.text).toBe('all quiet')
+  on('state.get', (_, e, next) => {
+    if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: snap }, version: 1 } }
+    if (e.key === 'toured') return { value: { value: true, version: 1 } }
+    return next(e)
+  })
+  const live = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  expect(await live.find({ type: 'Text', text: /^× $/ })).toBeDefined()
+  expect(await live.find({ type: 'Text', text: /^▲ $/ })).toBeUndefined()
+  await live.unmount()
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await band.find({ type: 'Text', text: /stopped on an error/ })).toBeDefined()
+  await band.unmount()
+})
+
+test('v0.13 layout: Cost never cuts an amount when narrow; System on the grid; Feed shows what is in flight', async ($, on) => {
+  let tab = 'cost'
+  let cols = 44
+  const sys = {
+    groups: [{ name: 'MCP servers', count: 9, cpu: 101, rssMb: 1400, history: [1, 5, 9] }],
+    top: [{ pid: 1, group: 'MCP servers', cpu: 96, rssMb: 1200, cmd: 'node mcp-server-playwright' }],
+    memTotalMb: 32000, memUsedMb: 19000, load: [3.2, 3, 3], cores: 16,
+  }
+  on('state.get', (_, e, next) => {
+    if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: { ...SNAP, sys } }, version: 1 } }
+    if (e.key === 'tab') return { value: { value: tab, version: 1 } }
+    if (e.key === 'toured') return { value: { value: true, version: 1 } }
+    return next(e)
+  })
+  const narrow = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: cols } })
+  expect(await narrow.find({ type: 'Text', text: /\$1\.40/ })).toBeDefined() // the whole amount, no bar
+  expect(await narrow.find({ type: 'Text', text: /█/ })).toBeUndefined()
+  await narrow.unmount()
+  tab = 'system'
+  cols = 120
+  const system = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: cols } })
+  expect(await system.find({ type: 'Text', text: /GROUPS/ })).toBeDefined()
+  expect(await system.find({ type: 'Text', text: /over 80% cpu/ })).toBeDefined()
+  expect(await system.find({ type: 'Text', text: /^▲ $/ })).toBeDefined() // the hot group and process
+  await system.unmount()
+  tab = 'feed'
+  const feed = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: cols } })
+  expect(await feed.find({ type: 'Text', text: /IN FLIGHT/ })).toBeDefined()
+  expect(await feed.find({ type: 'Text', text: /Edit main\.rs/ })).toBeDefined()
+  await feed.unmount()
+})
+
+test('no two drawn buttons share a hotkey, on any tab, with a row open', async ($, on) => {
+  let tab = 'live'
+  const t = crewThread('fix', { mode: 'edit', turns: [doneTurn(1, { delivery: { path: '/h/.codex/worktrees/1/p', files: [], state: 'pending' } })] })
+  on('state.get', (_, e, next) => {
+    if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: SNAP }, version: 1 } }
+    if (e.key === 'tab') return { value: { value: tab, version: 1 } }
+    if (e.key === 'toured') return { value: { value: true, version: 1 } }
+    if (e.key === 'selected') return { value: { value: 'sid-a', version: 1 } }
+    if (e.key === 'crewSel') return { value: { value: 'fix', version: 1 } }
+    if (e.key === 'threads') return { value: { value: { shape: 'threads-1', value: [t] }, version: 1 } }
+    return next(e)
+  })
+  const keysIn = (n: unknown, out: string[] = []): string[] => {
+    if (!n || typeof n !== 'object') return out
+    if (Array.isArray(n)) {
+      for (const c of n) keysIn(c, out)
+      return out
+    }
+    const node = n as { props?: { hotkey?: string }; children?: unknown }
+    if (node.props?.hotkey) out.push(node.props.hotkey)
+    keysIn(node.children, out)
+    return out
+  }
+  for (const name of ['live', 'feed', 'crew', 'cost', 'system', 'actions']) {
+    tab = name
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+    const keys = keysIn(await ui.drawn())
+    const dupes = keys.filter((k, i) => keys.indexOf(k) !== i)
+    expect(`${name}: ${dupes.join(',')}`).toBe(`${name}: `)
+    await ui.unmount()
+  }
 })
