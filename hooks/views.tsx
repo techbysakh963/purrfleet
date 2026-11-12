@@ -33,6 +33,7 @@ export type Acts = {
   crewOpen: (key: string) => void
   noteRemove: (folder: string, id: number) => void
   noteApprove: (folder: string, id: number) => void
+  openNote: (file: string) => void
 }
 
 export type View = {
@@ -56,7 +57,7 @@ export type View = {
   launcher: Node | null
   /** the turn whose whole answer is open: "thread#n" */
   crewOpenTurn: string | null
-  notebook: { folder: string; notes: readonly CrewNote[] }
+  notebook: { folder: string; file: string; notes: readonly CrewNote[] }
 }
 
 const TABS: { tab: Tab; label: string; key: string }[] = [
@@ -602,6 +603,12 @@ function Notebook(E: Els, v: View, act: Acts) {
           {notes.some(n => n.pending) ? ` (${notes.filter(n => n.pending).length} pending)` : ''} · {v.notebook.folder.replace(/^\/home\/[^/]+/, '~')} · every helper gets it
         </Text>
       </Button>
+      {isOpen && v.notebook.file ? (
+        <Button key="notebook-obsidian" plain onPress={() => act.openNote(v.notebook.file)}>
+          <Text color={p.violet}>  ◇ open in Obsidian </Text>
+          <Text color={p.dim}>{v.notebook.file.replace(/^\/home\/[^/]+/, '~')} · tick to approve, edit freely</Text>
+        </Button>
+      ) : null}
       {isOpen && notes.length === 0 ? (
         <Text color={p.dim}>  empty: helpers add NOTE: lines, and Claude pins facts with crew_note</Text>
       ) : null}

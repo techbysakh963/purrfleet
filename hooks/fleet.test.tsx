@@ -8,6 +8,7 @@ import { argvFor, brief, lines, needsCompaction, notebookText, notesIn, parseLin
 import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { PALETTES } from './theme'
+import { findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, safeName } from './vault'
 
 const NOW = 1_794_434_000
 
@@ -298,4 +299,37 @@ test('the crew input grows as you type and keeps what you typed', async ($, on) 
   const after = (await ui.find({ key: 'crew-task-0' })) as { props?: { rows?: number } } | undefined
   expect(after?.props?.rows ?? 0).toBeGreaterThan(1)
   await ui.unmount()
+})
+
+test('the notebook round-trips through Obsidian markdown, and your edits come back', async () => {
+  const notes = [
+    { id: 11, text: 'dates live in src/time.rs', by: 'claude' as const, at: 0 },
+    { id: 12, text: 'tests use vitest', by: 'codex' as const, at: 0, pending: true },
+  ]
+  const md = notebookMarkdown('/home/u/demo-app', notes, 0)
+  expect(md).toContain('- [x] dates live in src/time.rs — claude ^n11')
+  expect(md).toContain('- [ ] tests use vitest — codex ^n12')
+  expect(parseNotebook(md, 0).map(n => [n.id, n.text, n.by, !!n.pending])).toEqual([
+    [11, 'dates live in src/time.rs', 'claude', false],
+    [12, 'tests use vitest', 'codex', true],
+  ])
+  // you tick the offer, delete the first line, and add your own
+  const edited = md
+    .replace('- [ ] tests use vitest', '- [x] tests use vitest')
+    .replace('- [x] dates live in src/time.rs — claude ^n11\n', '')
+    .concat('- [x] deploys go through CI only\n')
+  const back = parseNotebook(edited, 0)
+  expect(back.map(n => [n.text, n.by, !!n.pending])).toEqual([
+    ['tests use vitest', 'codex', false],
+    ['deploys go through CI only', 'you', false],
+  ])
+})
+
+test('vault paths stay inside the vault', async () => {
+  expect(safeName('../../etc/passwd')).not.toContain('/')
+  expect(safeName('a/b')).toBe('a b')
+  expect(notebookPath('/v', '/home/u/demo-app')).toBe('/v/demo-app/notebook.md')
+  expect(findingPath('/v', '/home/u/demo-app', '../escape', 0)).toMatch(/^\/v\/demo-app\/1970-01-01 \. escape\.md$|^\/v\/demo-app\/1970-01-01 [^/]+\.md$/)
+  expect(isInside('/v', '/v/demo-app/x.md')).toBe(true)
+  expect(isInside('/v', '/vault-other/x.md')).toBe(false)
 })

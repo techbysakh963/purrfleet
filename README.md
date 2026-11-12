@@ -40,6 +40,11 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
 - **Shared notebook**: per project folder, a short list of durable facts (about 1.5k tokens at
   most) that every helper message carries, so Claude, Codex and Antigravity share what matters
   without re-sending history. Helpers add `NOTE:` lines; Claude curates with `crew_note`.
+- **Long-term memory in Obsidian**: a vault (default `~/Desktop/purrfleet-memory`) with a folder
+  per project. `notebook.md` mirrors the crew notebook both ways: tick a helper's offer to approve
+  it, delete a line to remove it, add a `- [x]` line to pin a fact. Claude saves findings or
+  whole threads there with `crew_save`, and attaches a note to one message with
+  `crew_ask {"notes": [...]}`: the vault is never sent wholesale.
 - **System**: CPU and memory of everything Claude-related (Claude windows, their MCP servers,
   the tools they started, Codex, Antigravity, FLEET), with sparklines and the busiest processes.
 - **Cost** and **Actions**: estimated spend, and per-session actions (copy, open transcript, stop).
