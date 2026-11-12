@@ -586,12 +586,17 @@ async function addNotes($: EngineInterface, folder: string, texts: string[], by:
   if (texts.length === 0) return
   await update($, notebooks, all => {
     const list = all[folder] ?? []
-    let id = list.reduce((m, n) => Math.max(m, n.id), 0)
+    // ids only ever grow (time-based, above any id ever used), so one is never reused
+    let id = Math.max(Date.now(), list.reduce((m, n) => Math.max(m, n.id), 0))
     const known = new Set(list.map(n => n.text.toLowerCase()))
     const fresh = texts
       .filter(t => !known.has(t.toLowerCase()))
       .map(text => ({ id: ++id, text, by, at: now(), ...(by === 'codex' || by === 'agy' ? { pending: true } : {}) }))
-    return { ...all, [folder]: [...list, ...fresh].slice(-40) }
+    const all2 = [...list, ...fresh]
+    // separate caps: pending offers can't push approved notes out
+    const approved = all2.filter(n => !n.pending).slice(-40)
+    const pending = all2.filter(n => n.pending).slice(-10)
+    return { ...all, [folder]: [...approved, ...pending].sort((a, b) => a.id - b.id) }
   })
   await $.store.set('notebooks', await read($, notebooks))
 }
