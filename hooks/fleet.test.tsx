@@ -283,3 +283,19 @@ test("crew_note answers with the project's notebook", async ($, on) => {
   const r = await call({ tool: 'mcp__fleet__crew_note' })
   expect(r.text ?? JSON.stringify(r.result)).toContain('notebook')
 })
+
+test('the crew input grows as you type and keeps what you typed', async ($, on) => {
+  on('state.get', (_, e, next) => {
+    if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: SNAP }, version: 1 } }
+    if (e.key === 'tab') return { value: { value: 'crew', version: 1 } }
+    return next(e)
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const before = (await ui.find({ key: 'crew-task-0' })) as { props?: { rows?: number; value?: string } } | undefined
+  expect(before?.props?.rows).toBe(1)
+  expect(before?.props?.value).toBeUndefined() // the field owns its text
+  await ui.input({ key: 'crew-task-0', text: 'x'.repeat(400), kind: 'change' })
+  const after = (await ui.find({ key: 'crew-task-0' })) as { props?: { rows?: number } } | undefined
+  expect(after?.props?.rows ?? 0).toBeGreaterThan(1)
+  await ui.unmount()
+})

@@ -160,6 +160,7 @@ declare module 'claude-code' {
       crewFolder: string | null
       crewOpenTurn: string | null
       crewDraft: string
+      crewInputGen: number
       notebooks: Record<string, CrewNote[]>
     }
   }

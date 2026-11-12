@@ -53,6 +53,8 @@ const crewFolder = atom({ plugin: 'fleet', key: 'crewFolder' } as const, null)
 const crewOpenTurn = atom({ plugin: 'fleet', key: 'crewOpenTurn' } as const, null)
 const notebooks = atom({ plugin: 'fleet', key: 'notebooks' } as const, {})
 const crewDraft = atom({ plugin: 'fleet', key: 'crewDraft' } as const, '')
+// bumped after each send: a fresh, empty field (the field owns its text while you type)
+const crewInputGen = atom({ plugin: 'fleet', key: 'crewInputGen' } as const, 0)
 
 // Module variables start over on a reload; everything drawn lives in $.state.
 let self = ''
@@ -669,6 +671,7 @@ async function launchFromPane($: EngineInterface, task: string): Promise<void> {
   const text = task.trim()
   if (!text) return
   await update($, crewDraft, () => '')
+  await update($, crewInputGen, g => g + 1)
   const sel = await read($, crewSel)
   const current = sel ? await findThread($, sel) : undefined
   const agent = await read($, crewAgent)
@@ -863,8 +866,12 @@ export const register: Register = on => {
           </Box>
         ) : null
       // the box grows with what you type, 1 to 8 rows, then scrolls within
+      // The field owns its text while you type (a `value` drawn back would replace
+      // it mid-keystroke); the draft is only read to size the box. Generous width
+      // margin: the label sits left, the send hint right.
       const draft = await read($, crewDraft)
-      const boxWidth = Math.max(10, width - 6 - (target ? target.name.length + 4 : 18))
+      const inputGen = await read($, crewInputGen)
+      const boxWidth = Math.max(10, width - 30 - (target ? target.name.length + 4 : 18))
       const draftRows = Math.max(
         1,
         Math.min(8, draft.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / boxWidth)), 0)),
@@ -874,11 +881,10 @@ export const register: Register = on => {
           {pickers}
           <Box borderStyle="round" borderColor={palette.accent} paddingX={1}>
             <Input
-              key="crew-task"
+              key={`crew-task-${inputGen}`}
               label={target ? `▸ ${target.name} ` : `▸ new ${cAgent} thread `}
               placeholder={target ? 'follow up in this thread…' : 'describe a task, then enter…'}
               submitLabel="send"
-              value={draft}
               rows={draftRows}
               onInput={value => void update($, crewDraft, () => value)}
               onSubmit={value => actions.crewLaunch(value)}
