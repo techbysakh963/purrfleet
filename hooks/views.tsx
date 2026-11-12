@@ -1,9 +1,9 @@
 import type { Elements } from 'claude-code'
 
-import type { CrewAgent, CrewJob, CrewMode, Session, Snapshot, Tab } from '../types'
-import { modeLabel } from './crew'
+import type { CrewAgent, CrewMode, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
+import { modeLabel, summaryOf } from './crew'
 import { idleFrame } from './anim'
-import { ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, tok, usd } from './fmt'
+import { ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, spark, tok, usd } from './fmt'
 import type { Palette } from './theme'
 import { heat, ramp } from './theme'
 
@@ -23,8 +23,12 @@ export type Acts = {
   crewAgent: () => void
   crewMode: () => void
   crewLaunch: (task: string) => void
-  crewStop: (id: number) => void
-  crewSend: (id: number) => void
+  crewStop: (thread: string) => void
+  crewSend: (thread: string, turn: number) => void
+  crewSelect: (thread: string) => void
+  crewNew: () => void
+  crewModel: (model: string) => void
+  crewEffort: (effort: string) => void
 }
 
 export type View = {
@@ -40,7 +44,8 @@ export type View = {
   aurora: Node | null
   hero: Node | null
   frame: number
-  crew: readonly CrewJob[]
+  threads: readonly CrewThread[]
+  crewSel: string | null
   crewAgent: CrewAgent
   crewMode: CrewMode
   /** the launch box: an Input, where the surface has one */
@@ -52,7 +57,8 @@ const TABS: { tab: Tab; label: string; key: string }[] = [
   { tab: 'feed', label: 'Feed', key: '2' },
   { tab: 'crew', label: 'Crew', key: '3' },
   { tab: 'cost', label: 'Cost', key: '4' },
-  { tab: 'actions', label: 'Actions', key: '5' },
+  { tab: 'system', label: 'System', key: '5' },
+  { tab: 'actions', label: 'Actions', key: '6' },
 ]
 
 /** The colour a session keeps everywhere: its legend dot, its band dot, its feed name. */
@@ -91,7 +97,7 @@ export function Pane(E: Els, v: View, act: Acts) {
   const waiting = v.snap.sessions.filter(needsYou).length
   const busy = v.snap.sessions.filter(isBusy).length
   const agents = v.snap.sessions.reduce((n, s) => n + s.agents.length, 0)
-  const crewBusy = v.crew.filter(j => j.status === 'running').length
+  const crewBusy = v.threads.filter(t => t.status === 'running').length
 
   return (
     <Box flexDirection="column">
@@ -133,6 +139,7 @@ export function Pane(E: Els, v: View, act: Acts) {
       {v.tab === 'feed' && Feed(E, v, act)}
       {v.tab === 'crew' && Crew(E, v, act)}
       {v.tab === 'cost' && CostView(E, v)}
+      {v.tab === 'system' && SystemView(E, v)}
       {v.tab === 'actions' && Actions(E, v, act)}
       <Box flexDirection="row" columnGap={2} marginTop={1}>
         <Button key="cycle-theme" plain hotkey="t" onPress={act.theme}>
@@ -319,7 +326,7 @@ function Live(E: Els, v: View, act: Acts) {
       )}
       <Text color={p.border}>{'─'.repeat(Math.max(10, v.width))}</Text>
       {ordered(v.snap.sessions).map(s => (s.sid === v.selected ? Card(E, v, s, act) : Row(E, v, s, act)))}
-      <Text color={p.dim}>press a row for its details · 5 for its actions</Text>
+      <Text color={p.dim}>press a row for its details · 6 for its actions</Text>
     </Box>
   )
 }
@@ -429,66 +436,129 @@ function Feed(E: Els, v: View, act: Acts) {
 }
 
 
-function JobCard(E: Els, v: View, j: CrewJob, act: Acts) {
+function turnLook(v: View, status: CrewTurn['status']) {
+  const { p } = v
+  return status === 'running'
+    ? { glyph: '◉', color: p.accent }
+    : status === 'done'
+      ? { glyph: '◆', color: p.ok }
+      : status === 'failed'
+        ? { glyph: '×', color: p.bad }
+        : { glyph: '■', color: p.dim }
+}
+
+/** One thread as a row; the selected one opens into its whole conversation. */
+function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
   const { Box, Text, Button } = E
   const { p } = v
-  const look =
-    j.status === 'running'
-      ? { glyph: '◉', color: p.accent, word: 'running' }
-      : j.status === 'done'
-        ? { glyph: '◆', color: p.ok, word: 'done' }
-        : j.status === 'failed'
-          ? { glyph: '×', color: p.bad, word: 'failed' }
-          : { glyph: '■', color: p.dim, word: 'stopped' }
-  const when = j.status === 'running' ? ago(v.snap.now - j.started) : `${ago(v.snap.now - (j.ended ?? j.started))} ago`
+  const isOpen = t.name === v.crewSel
+  const last = t.turns[t.turns.length - 1]
+  const look = turnLook(v, t.status === 'running' ? 'running' : t.status === 'failed' ? 'failed' : 'done')
+  const tokens = last ? last.contextTokens + last.outputTokens : 0
   const w = Math.max(30, v.width - 4)
-  const border = j.status === 'running' ? p.accent : j.status === 'failed' ? p.bad : p.border
-
-  return (
-    <Box flexDirection="column" borderStyle="round" borderColor={border} paddingX={1}>
-      <Box flexDirection="row" justifyContent="space-between">
-        <Text>
-          <Text color={look.color}>{look.glyph} </Text>
-          <Text color={p.cyan} weight="bold">
-            {j.agent}
-          </Text>
-          <Text color={p.dim}> #{j.id} </Text>
-          <Text color={j.by === 'claude' ? p.violet : p.gold}>‹by {j.by === 'claude' ? 'Claude' : 'you'}›</Text>
-          <Text color={p.dim}> {modeLabel(j.agent, j.mode)}</Text>
-        </Text>
-        <Text>
-          <Text color={look.color}>{look.word}</Text>
-          <Text color={p.dim}> {when}</Text>
-        </Text>
-      </Box>
-      <Text wrap="truncate-end">
-        <Text color={p.dim}>task </Text>
-        <Text color={p.text}>{cut(j.task, w - 5)}</Text>
+  const head = (
+    <Button key={`th-${t.name}`} plain onPress={() => act.crewSelect(t.name)}>
+      <Text color={look.color}>{look.glyph} </Text>
+      <Text color={p.cyan} weight="bold">
+        {t.agent}
       </Text>
-      {j.tail.map(line => (
-        <Text wrap="truncate-end">
-          <Text color={p.border}>┊ </Text>
-          <Text color={p.dim}>{cut(line, w - 2)}</Text>
-        </Text>
-      ))}
-      <Box flexDirection="row" columnGap={3}>
-        {j.status === 'running' ? (
-          <Button key={`stop-${j.id}`} plain onPress={() => act.crewStop(j.id)}>
-            <Text color={p.bad}>■ stop</Text>
-          </Button>
-        ) : j.isHanded ? (
-          <Text color={p.violet}>↳ handed to Claude</Text>
-        ) : (
-          <Button key={`send-${j.id}`} plain onPress={() => act.crewSend(j.id)}>
-            <Text color={p.violet}>↳ send to Claude</Text>
-          </Button>
-        )}
-        {j.output || j.log ? (
-          <Button key={`copy-${j.id}`} plain onPress={() => act.copy(j.output || j.log, `job #${j.id} output`)}>
-            <Text color={p.dim}>◇ copy output</Text>
-          </Button>
+      <Text color={p.dim}> · </Text>
+      <Text color={p.text} weight="bold">
+        {t.name}
+      </Text>
+      <Text color={p.dim}>
+        {'  '}
+        {t.model !== 'default' ? `${t.model} · ` : ''}
+        {t.effort !== 'default' ? `${t.effort} · ` : ''}
+        {t.turns.length} msg{t.turns.length === 1 ? '' : 's'}
+        {tokens ? ` · ${tok(tokens)} tok` : ''}
+        {t.compactions ? ` · compacted ${t.compactions}×` : ''}
+      </Text>
+      <Text color={t.by === 'claude' ? p.violet : p.gold}> ‹{t.by === 'claude' ? 'Claude' : 'you'}›</Text>
+    </Button>
+  )
+  if (!isOpen) {
+    return (
+      <Box flexDirection="column">
+        {head}
+        {last ? (
+          <Text wrap="truncate-end">
+            <Text color={p.border}>{'  ┊ '}</Text>
+            <Text color={p.dim}>
+              {last.status === 'running' ? (last.log[last.log.length - 1] ?? 'working…') : summaryOf(last.answer) || last.status}
+            </Text>
+          </Text>
         ) : null}
       </Box>
+    )
+  }
+
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor={t.status === 'running' ? p.accent : p.violet} paddingX={1}>
+      {head}
+      <Text color={p.dim}>
+        {modeLabel(t.agent, t.mode)} · {t.cwd}
+        {t.session ? ` · session ${t.session.slice(0, 8)}` : ''}
+      </Text>
+      {t.brief ? (
+        <Text color={p.dim} wrap="truncate-end">
+          ◇ carried-over brief: {cut(t.brief.replace(/\s+/g, ' '), w - 24)}
+        </Text>
+      ) : null}
+      {t.turns.slice(-4).map(u => {
+        const tl = turnLook(v, u.status)
+        return (
+          <Box flexDirection="column" marginTop={1}>
+            <Text wrap="truncate-end">
+              <Text color={u.by === 'claude' ? p.violet : p.gold}>{u.by === 'claude' ? 'Claude' : 'you'} › </Text>
+              <Text color={p.text}>{cut(u.ask.replace(/\s+/g, ' '), w - 10)}</Text>
+            </Text>
+            {u.status === 'running'
+              ? u.log.slice(-3).map(l => (
+                  <Text wrap="truncate-end">
+                    <Text color={p.border}>┊ </Text>
+                    <Text color={p.dim}>{cut(l, w - 2)}</Text>
+                  </Text>
+                ))
+              : null}
+            {u.answer ? (
+              <Text wrap="wrap">
+                <Text color={tl.color}>{tl.glyph} </Text>
+                <Text color={p.text}>{summaryOf(u.answer)}</Text>
+              </Text>
+            ) : u.status !== 'running' ? (
+              <Text color={tl.color}>
+                {tl.glyph} {u.status}
+                {u.log.length ? `: ${cut(u.log[u.log.length - 1] ?? '', w - 12)}` : ''}
+              </Text>
+            ) : null}
+            <Box flexDirection="row" columnGap={3}>
+              {u.status === 'running' ? (
+                <Button key={`stop-${t.name}`} plain onPress={() => act.crewStop(t.name)}>
+                  <Text color={p.bad}>■ stop</Text>
+                </Button>
+              ) : u.isHanded ? (
+                <Text color={p.dim}>↳ Claude has it</Text>
+              ) : (
+                <Button key={`send-${t.name}-${u.n}`} plain onPress={() => act.crewSend(t.name, u.n)}>
+                  <Text color={p.violet}>↳ send to Claude</Text>
+                </Button>
+              )}
+              {u.answer ? (
+                <Button key={`copy-${t.name}-${u.n}`} plain onPress={() => act.copy(u.answer, `${t.name} answer`)}>
+                  <Text color={p.dim}>◇ copy full answer</Text>
+                </Button>
+              ) : null}
+              {u.contextTokens ? (
+                <Text color={p.dim}>
+                  {tok(u.contextTokens)} in · {tok(u.outputTokens)} out
+                </Text>
+              ) : null}
+            </Box>
+          </Box>
+        )
+      })}
+      {t.turns.length > 4 ? <Text color={p.dim}>+{t.turns.length - 4} earlier messages (crew_read turn n)</Text> : null}
     </Box>
   )
 }
@@ -496,35 +566,119 @@ function JobCard(E: Els, v: View, j: CrewJob, act: Acts) {
 function Crew(E: Els, v: View, act: Acts) {
   const { Box, Text, Button } = E
   const { p } = v
-  const jobs = [...v.crew].reverse()
+  const list = [...v.threads].sort((a, b) => b.updated - a.updated)
+  const target = v.threads.find(t => t.name === v.crewSel)
 
   return (
     <Box flexDirection="column">
-      <Text color={p.dim} wrap="wrap">
-        Codex and Antigravity work for Claude: it hands them jobs with crew_run and reviews what comes back. You can launch one too.
-      </Text>
-      <Box flexDirection="row" columnGap={2} marginTop={1}>
-        <Button key="crew-agent" plain hotkey="g" onPress={act.crewAgent}>
-          <Text color={p.dim}>g </Text>
-          <Text color={p.cyan} weight="bold">
-            ◆ {v.crewAgent}
-          </Text>
-        </Button>
-        <Button key="crew-mode" plain hotkey="m" onPress={act.crewMode}>
-          <Text color={p.dim}>m </Text>
-          <Text color={v.crewMode === 'edit' ? p.warn : p.ok}>◇ {modeLabel(v.crewAgent, v.crewMode)}</Text>
-        </Button>
+      <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+        {target ? (
+          <Button key="crew-new" plain hotkey="n" onPress={act.crewNew}>
+            <Text color={p.dim}>n </Text>
+            <Text color={p.accent}>◇ new thread instead</Text>
+          </Button>
+        ) : (
+          <Button key="crew-agent" plain hotkey="g" onPress={act.crewAgent}>
+            <Text color={p.dim}>g </Text>
+            <Text color={p.cyan} weight="bold">
+              ◆ {v.crewAgent}
+            </Text>
+          </Button>
+        )}
+        {target ? null : (
+          <Button key="crew-mode" plain hotkey="m" onPress={act.crewMode}>
+            <Text color={p.dim}>m </Text>
+            <Text color={v.crewMode === 'edit' ? p.warn : p.ok}>◇ {modeLabel(v.crewAgent, v.crewMode)}</Text>
+          </Button>
+        )}
       </Box>
-      {v.launcher ?? <Text color={p.dim}>(launching needs the terminal or desktop app)</Text>}
-      {jobs.length === 0 ? (
+      {v.launcher ?? <Text color={p.dim}>(the input box needs the terminal or the desktop app)</Text>}
+      {list.length === 0 ? (
         <Box flexDirection="column" marginTop={1}>
-          <Text color={p.dim}>No jobs yet. Try, in the box above:</Text>
-          <Text color={p.text}>  find every TODO in this repo and group them by file</Text>
-          <Text color={p.dim}>or ask Claude: "have codex double-check this diff while you write the tests"</Text>
+          <Text color={p.dim}>No threads yet. Type a task above, or ask Claude:</Text>
+          <Text color={p.text}> "open a codex thread 'auth-review' and have it audit the login flow"</Text>
+          <Text color={p.dim}>Threads remember everything; long ones compact themselves into a brief.</Text>
         </Box>
-      ) : null}
-      {jobs.slice(0, 6).map(j => JobCard(E, v, j, act))}
-      {jobs.length > 6 ? <Text color={p.dim}>+{jobs.length - 6} older jobs (Claude can list them with crew_result)</Text> : null}
+      ) : (
+        <Box flexDirection="column" marginTop={1}>
+          {list.slice(0, 8).map(t => ThreadView(E, v, t, act))}
+          {list.length > 8 ? <Text color={p.dim}>+{list.length - 8} older threads</Text> : null}
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+const GROUP_COLOR = (p: Palette, name: string): string =>
+  name === 'Claude Code'
+    ? p.accent
+    : name === 'MCP servers'
+      ? p.violet
+      : name === 'Codex'
+        ? p.cyan
+        : name === 'Antigravity'
+          ? p.ok
+          : name === 'FLEET'
+            ? p.gold
+            : p.dim
+
+function SystemView(E: Els, v: View) {
+  const { Box, Text } = E
+  const { p } = v
+  const sys = v.snap.sys
+  if (!sys) return <Text color={p.dim}>Measuring… (CPU needs two samples, about 2 s)</Text>
+  const memPct = sys.memTotalMb ? (sys.memUsedMb / sys.memTotalMb) * 100 : 0
+  const loadPct = (sys.load[0] ?? 0) / sys.cores * 100
+  const claudeCpu = sys.groups.reduce((n, g) => n + g.cpu, 0)
+  const claudeMem = sys.groups.reduce((n, g) => n + g.rssMb, 0)
+
+  return (
+    <Box flexDirection="column">
+      <Text>
+        <Text color={p.dim}>machine  mem </Text>
+        {Gauge(E, memPct, 12, p)}
+        <Text color={heat(memPct / 100, p)}> {Math.round(memPct)}%</Text>
+        <Text color={p.dim}>
+          {' '}
+          {(sys.memUsedMb / 1024).toFixed(1)}/{(sys.memTotalMb / 1024).toFixed(1)} GB
+        </Text>
+        {Sep(E, p)}
+        <Text color={p.dim}>load </Text>
+        <Text color={heat(Math.min(1, loadPct / 100), p)}>{(sys.load[0] ?? 0).toFixed(1)}</Text>
+        <Text color={p.dim}> on {sys.cores} cores</Text>
+      </Text>
+      <Text>
+        <Text color={p.dim}>claude stack  </Text>
+        <Text color={p.text}>{claudeCpu.toFixed(0)}% cpu</Text>
+        <Text color={p.dim}> (100% = one core)</Text>
+        {Sep(E, p)}
+        <Text color={p.text}>{(claudeMem / 1024).toFixed(2)} GB</Text>
+        <Text color={p.dim}> memory</Text>
+      </Text>
+      <Box flexDirection="column" marginTop={1}>
+        {sys.groups.map(g => (
+          <Text wrap="truncate-end">
+            <Text color={GROUP_COLOR(p, g.name)}>● {g.name.padEnd(15)}</Text>
+            <Text color={g.count ? p.text : p.dim}>{String(g.count).padStart(3)} </Text>
+            {Gauge(E, Math.min(100, g.cpu / sys.cores), 8, p)}
+            <Text color={heat(Math.min(1, g.cpu / 100 / sys.cores), p)}>{`${g.cpu.toFixed(0)}%`.padStart(6)}</Text>
+            <Text color={p.dim}>{`${g.rssMb} MB`.padStart(9)} </Text>
+            <Text color={GROUP_COLOR(p, g.name)}>{spark(g.history.length ? g.history : [0])}</Text>
+          </Text>
+        ))}
+      </Box>
+      <Box flexDirection="column" marginTop={1}>
+        <Text color={p.dim}>BUSIEST PROCESSES</Text>
+        {sys.top.map(t => (
+          <Text wrap="truncate-end">
+            <Text color={GROUP_COLOR(p, t.group)}>● </Text>
+            <Text color={p.text}>{`${t.cpu.toFixed(0)}%`.padStart(5)}</Text>
+            <Text color={p.dim}>{`${Math.round(t.rssMb)}MB`.padStart(8)} </Text>
+            <Text color={p.dim}>{t.cmd}</Text>
+          </Text>
+        ))}
+      </Box>
+      <Text color={p.dim}>groups: Claude Code windows · their MCP servers · tools and shells they started · Codex · Antigravity · FLEET</Text>
     </Box>
   )
 }

@@ -1,11 +1,26 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
-import type { CrewAgent, CrewJob, CrewMode, Session, Snapshot, Tab } from '../types'
+import type { CrewAgent, CrewMode, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
 import { isBusy, needsYou } from './fmt'
 import type { Mood } from './cat'
 import { catCells } from './cat'
-import { argvFor, absorb, listing, modeLabel, report } from './crew'
+import {
+  COMPACT_AT,
+  COMPACT_PROMPT,
+  EFFORTS,
+  argvFor,
+  brief,
+  capAnswer,
+  lines,
+  listing,
+  modeLabel,
+  parseLine,
+  report,
+  slug,
+  summaryOf,
+  threadLine,
+} from './crew'
 import { auroraCells, toBase64 } from './scenes'
 import { PALETTES, paletteOf } from './theme'
 import type { Palette } from './theme'
@@ -25,9 +40,13 @@ const selected = atom({ plugin: 'fleet', key: 'selected' } as const, null)
 const feedFilter = atom({ plugin: 'fleet', key: 'feedFilter' } as const, null)
 const theme = atom({ plugin: 'fleet', key: 'theme' } as const, 'nebula')
 const scene = atom({ plugin: 'fleet', key: 'scene' } as const, 'cat')
-const crew = atom({ plugin: 'fleet', key: 'crew' } as const, [], { shape: 'crew-1' })
+const threads = atom({ plugin: 'fleet', key: 'threads' } as const, [], { shape: 'threads-1' })
+const crewSel = atom({ plugin: 'fleet', key: 'crewSel' } as const, null)
 const crewAgent = atom({ plugin: 'fleet', key: 'crewAgent' } as const, 'codex')
 const crewMode = atom({ plugin: 'fleet', key: 'crewMode' } as const, 'read')
+const crewModel = atom({ plugin: 'fleet', key: 'crewModel' } as const, 'default')
+const crewEffort = atom({ plugin: 'fleet', key: 'crewEffort' } as const, 'default')
+const crewModels = atom({ plugin: 'fleet', key: 'crewModels' } as const, { codex: [], agy: [] })
 
 // Module variables start over on a reload; everything drawn lives in $.state.
 let self = ''
@@ -40,8 +59,8 @@ let palette: Palette = PALETTES[0]!
 let mood: Mood = 'sleep'
 let busyCount = 0
 let sessionCwd = ''
-// the children of running crew jobs; leaving a loop (return) kills its child
-const running = new Map<number, AsyncIterator<unknown, unknown>>()
+// the children of running crew turns, by thread; leaving a loop (return) kills its child
+const running = new Map<string, AsyncIterator<unknown, unknown>>()
 
 const now = (): number => Date.now() / 1000
 
@@ -150,121 +169,403 @@ async function openPath($: EngineInterface, path: string): Promise<void> {
 }
 
 
-// ── crew: jobs handed to Codex or Antigravity ────────────────────────────────
+// ── crew: named, ongoing conversations with Codex and Antigravity ────────────
 
-async function patchJob($: EngineInterface, id: number, fn: (j: CrewJob) => CrewJob): Promise<void> {
-  await update($, crew, list => list.map(j => (j.id === id ? fn(j) : j)))
+async function patchThread($: EngineInterface, name: string, fn: (t: CrewThread) => CrewThread): Promise<void> {
+  await update($, threads, list => list.map(t => (t.name === name ? fn(t) : t)))
 }
 
-async function startJob($: EngineInterface, agent: CrewAgent, mode: CrewMode, task: string, by: 'claude' | 'you'): Promise<CrewJob> {
-  const jobs = await read($, crew)
-  const job: CrewJob = {
-    id: jobs.reduce((m, j) => Math.max(m, j.id), 0) + 1,
-    agent,
-    mode,
-    by,
-    task,
+async function findThread($: EngineInterface, name: string): Promise<CrewThread | undefined> {
+  return (await read($, threads)).find(t => t.name === name)
+}
+
+/** Threads outlive the session (their helpers' own conversations do too), trimmed. */
+async function persist($: EngineInterface): Promise<void> {
+  const list = await read($, threads)
+  await $.store.set(
+    'threads',
+    list.map(t => ({
+      ...t,
+      turns: t.turns.slice(-12).map(u => ({ ...u, answer: u.answer.slice(0, 6000), log: u.log.slice(-6) })),
+    })),
+  )
+}
+
+type AskOpts = {
+  name: string
+  agent?: CrewAgent
+  model?: string
+  effort?: string
+  mode?: CrewMode
+  task: string
+  context: string
+  by: 'claude' | 'you'
+}
+
+/** Sends a message to a thread, opening it if it is new. Answers an error string, or the thread. */
+async function sendToThread($: EngineInterface, o: AskOpts): Promise<CrewThread | string> {
+  const name = slug(o.name)
+  const existing = await findThread($, name)
+  if (existing?.status === 'running') {
+    return `Thread "${name}" is still answering its last message. Wait for it (crew_read) or use another thread.`
+  }
+  if (existing && o.agent && existing.agent !== o.agent) {
+    return `Thread "${name}" talks to ${existing.agent}, not ${o.agent}. Pick another thread name for ${o.agent}.`
+  }
+  if (!existing && !o.agent) return `There is no thread "${name}" yet; say which agent opens it ("codex" or "agy").`
+  const base: CrewThread = existing ?? {
+    name,
+    agent: o.agent ?? 'codex',
+    model: 'default',
+    effort: 'default',
+    mode: 'read',
     cwd: sessionCwd,
+    by: o.by,
+    session: '',
+    status: 'idle',
+    turns: [],
+    compactions: 0,
+    brief: '',
+    created: now(),
+    updated: now(),
+  }
+  const thread: CrewThread = {
+    ...base,
+    model: o.model ?? base.model,
+    effort: o.effort ?? base.effort,
+    mode: o.mode ?? base.mode,
+    status: 'running',
+    updated: now(),
+  }
+  const turn: CrewTurn = {
+    n: (base.turns[base.turns.length - 1]?.n ?? 0) + 1,
+    by: o.by,
+    ask: o.task,
     status: 'running',
     started: now(),
-    output: '',
-    log: '',
-    tail: [],
+    answer: '',
+    log: [],
+    contextTokens: 0,
+    outputTokens: 0,
     isHanded: false,
   }
-  await update($, crew, list => [...list, job].slice(-30))
-  void runJob($, job)
-  return job
+  thread.turns = [...base.turns, turn].slice(-20)
+  await update($, threads, list => (existing ? list.map(t => (t.name === name ? thread : t)) : [...list, thread].slice(-16)))
+  void runTurn($, name, turn.n, o.task, o.context, o.by)
+  return thread
 }
 
-async function runJob($: EngineInterface, job: CrewJob): Promise<void> {
-  let cur = job
+async function runTurn(
+  $: EngineInterface,
+  name: string,
+  n: number,
+  task: string,
+  context: string,
+  by: 'claude' | 'you',
+): Promise<void> {
+  let t = await findThread($, name)
+  if (!t) return
+  // A long thread is compacted first: the helper writes a state brief, and a
+  // fresh conversation starts from it, so the thread keeps what matters.
+  let seed: string | undefined
+  const lastDone = [...t.turns].reverse().find(u => u.status === 'done')
+  if (t.session && (lastDone?.contextTokens ?? 0) > COMPACT_AT) {
+    const brief = await execTurn($, t, COMPACT_PROMPT, n, true)
+    if (brief.ok && brief.answer.trim()) {
+      seed = brief.answer.trim()
+      await patchThread($, name, x => ({ ...x, session: '', compactions: x.compactions + 1, brief: seed ?? '' }))
+      t = (await findThread($, name)) ?? t
+    }
+  }
+  const res = await execTurn($, t, brief(t, by, task, context, seed), n, false)
+  await patchThread($, name, x => ({
+    ...x,
+    status: res.ok ? 'idle' : 'failed',
+    updated: now(),
+    turns: x.turns.map(u =>
+      u.n !== n || u.status === 'stopped' ? u : { ...u, status: res.ok ? 'done' : 'failed', ended: now() },
+    ),
+  }))
+  const settled = (await findThread($, name))?.turns.find(u => u.n === n)
+  if (settled && settled.status !== 'stopped') {
+    if (by === 'claude') await handToClaude($, name, n)
+    else $.ui.toast(`Crew · ${name} answered (${settled.status})`)
+  }
+  await persist($)
+}
+
+const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*\u0007/g
+
+/** Runs one exchange with the helper, streaming its progress into the turn. */
+async function execTurn(
+  $: EngineInterface,
+  t: CrewThread,
+  prompt: string,
+  n: number,
+  isBrief: boolean,
+): Promise<{ ok: boolean; answer: string }> {
+  const argv = argvFor({
+    agent: t.agent,
+    mode: t.mode,
+    model: t.model,
+    effort: t.effort,
+    cwd: t.cwd,
+    prompt,
+    ...(t.session ? { session: t.session } : {}),
+  })
+  let answer = ''
+  let final: string | undefined
+  let session = t.session
+  let ctx = 0
+  let out = 0
+  let code: number | null = null
+  let fresh: string[] = []
   let pushed = 0
+  const buf = { stdout: '', stderr: '' }
+  const flush = async (force: boolean) => {
+    if (!force && now() - pushed < 0.4) return
+    pushed = now()
+    const text = final ?? answer
+    const add = fresh
+    fresh = []
+    await patchThread($, t.name, x => ({
+      ...x,
+      session: session || x.session,
+      turns: x.turns.map(u =>
+        u.n !== n
+          ? u
+          : {
+              ...u,
+              ...(isBrief ? {} : { answer: capAnswer(text) }),
+              log: [...u.log, ...add].slice(-40),
+              contextTokens: ctx || u.contextTokens,
+              outputTokens: out || u.outputTokens,
+            },
+      ),
+    }))
+  }
   try {
-    const stream = $.process.spawn({ argv: argvFor(job.agent, job.mode, job.task, job.cwd), cwd: job.cwd })
-    const it = stream[Symbol.asyncIterator]()
-    running.set(job.id, it as AsyncIterator<unknown, unknown>)
+    const it = $.process.spawn({ argv, cwd: t.cwd })[Symbol.asyncIterator]()
+    running.set(t.name, it as AsyncIterator<unknown, unknown>)
     for (;;) {
       const step = await it.next()
       if (step.done) {
-        const end = step.value as { code: number | null }
-        cur = { ...cur, status: end.code === 0 ? 'done' : 'failed', code: end.code, ended: now() }
+        code = (step.value as { code: number | null }).code
         break
       }
-      cur = absorb(cur, step.value.stream, step.value.text)
-      if (now() - pushed > 0.5) {
-        pushed = now()
-        const at = cur
-        await patchJob($, job.id, j => ({ ...at, status: j.status }))
+      const { stream, text } = step.value
+      const split = lines(buf[stream], text.replace(ANSI, ''))
+      buf[stream] = split.rest
+      for (const line of split.complete) {
+        const p = stream === 'stdout' ? parseLine(t.agent, line) : { log: line.trim() }
+        if (p.session) session = p.session
+        if (p.answer) answer += p.answer
+        if (p.final) final = p.final
+        if (p.contextTokens) ctx = p.contextTokens
+        if (p.outputTokens) out = p.outputTokens
+        if (p.log) fresh.push(isBrief ? `[state brief] ${p.log}` : p.log)
       }
+      await flush(false)
     }
   } catch (failure) {
-    cur = { ...absorb(cur, 'stderr', `\n${String(failure)}`), status: 'failed', ended: now() }
+    fresh.push(`! ${String(failure)}`)
   } finally {
-    running.delete(job.id)
+    running.delete(t.name)
   }
-  const last = cur
-  // a job you stopped stays 'stopped' whatever its child said on the way out
-  await patchJob($, job.id, j => ({ ...last, status: j.status === 'stopped' ? 'stopped' : last.status }))
-  const settled = (await read($, crew)).find(j => j.id === job.id)
-  if (settled && settled.by === 'claude' && settled.status !== 'stopped') await handToClaude($, job.id)
-  else $.ui.toast(`Crew job #${job.id} (${job.agent}) ${settled?.status ?? last.status}`)
+  await flush(true)
+  return { ok: code === 0, answer: final ?? answer }
 }
 
-async function stopJob($: EngineInterface, id: number): Promise<void> {
-  await patchJob($, id, j => (j.status === 'running' ? { ...j, status: 'stopped', ended: now() } : j))
-  await running.get(id)?.return?.(undefined)
+async function stopThread($: EngineInterface, name: string): Promise<void> {
+  await patchThread($, name, x => ({
+    ...x,
+    status: 'idle',
+    turns: x.turns.map(u => (u.status === 'running' ? { ...u, status: 'stopped', ended: now() } : u)),
+  }))
+  await running.get(name)?.return?.(undefined)
 }
 
-/** Wakes Claude to review a finished job: a prompt of its own once the session is idle. */
-async function handToClaude($: EngineInterface, id: number): Promise<void> {
-  const job = (await read($, crew)).find(j => j.id === id)
-  if (!job) return
-  await patchJob($, id, j => ({ ...j, isHanded: true }))
+/** Tells Claude a turn finished: the summary inline (no extra call), the rest on demand. */
+async function handToClaude($: EngineInterface, name: string, n: number): Promise<void> {
+  const t = await findThread($, name)
+  const turn = t?.turns.find(u => u.n === n)
+  if (!t || !turn) return
+  await patchThread($, name, x => ({ ...x, turns: x.turns.map(u => (u.n === n ? { ...u, isHanded: true } : u)) }))
   const text =
-    job.by === 'claude'
-      ? `[FLEET crew] Job #${job.id} (${job.agent}, ${modeLabel(job.agent, job.mode)}) ${job.status}: "${job.task}". ` +
-        `Read it with mcp__fleet__crew_result {"id": ${job.id}} and review it critically before relying on it.`
-      : `[FLEET crew] I ran this job myself; please review the result critically and tell me what you'd keep.\n\n${report(job, now())}`
+    turn.by === 'claude'
+      ? `[FLEET crew] Thread "${name}" (${t.agent}) answered your message (turn ${n}, ${turn.status}).\n` +
+        `SUMMARY: ${summaryOf(turn.answer) || '(no answer)'}\n` +
+        `Check it before relying on it. Full answer: crew_read {"thread": "${name}", "full": true}. ` +
+        `Continue the conversation with crew_ask {"thread": "${name}", ...}.`
+      : `[FLEET crew] I asked thread "${name}" (${t.agent}): ${turn.ask}\n\nIts answer:\n\n${capAnswer(turn.answer).slice(0, 8000)}\n\n` +
+        `Please review it critically and tell me what you'd keep. You can continue this thread with crew_ask {"thread": "${name}", ...}.`
   void $.prompt.submit({ text })
 }
 
 type Args = Record<string, unknown>
 type Answer = { result: string } | { deny: string }
+const optStr = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v.trim() : undefined)
 
-async function answerCrewRun($: EngineInterface, e: Args): Promise<Answer> {
-  const agent: CrewAgent | null = e.agent === 'agy' ? 'agy' : e.agent === 'codex' ? 'codex' : null
-  const task = typeof e.task === 'string' ? e.task.trim() : ''
-  if (agent === null || task === '') return { deny: 'crew_run needs agent ("codex" or "agy") and a non-empty task.' }
-  const mode: CrewMode = e.mode === 'edit' ? 'edit' : 'read'
-  const job = await startJob($, agent, mode, task, 'claude')
+async function answerCrewAsk($: EngineInterface, e: Args): Promise<Answer> {
+  const name = optStr(e.thread)
+  const task = optStr(e.task)
+  if (!name || !task) return { deny: 'crew_ask needs a thread name and a task.' }
+  const agent = e.agent === 'agy' || e.agent === 'codex' ? e.agent : undefined
+  const mode: CrewMode | undefined = e.mode === 'edit' ? 'edit' : e.mode === 'read' ? 'read' : undefined
+  const existing = await findThread($, slug(name))
+  if ((mode ?? existing?.mode) === 'edit' && existing?.mode !== 'edit') {
+    // Claude never gets to let a helper change files on its own say-so
+    const who = agent ?? existing?.agent ?? 'the helper'
+    const answer = await $.ui.ask(
+      `Claude wants ${who} to EDIT files in thread "${slug(name)}"${who === 'codex' ? ' (in its own git worktree)' : ' (in place)'}: ${task.slice(0, 160)}`,
+      { header: 'FLEET crew', options: ['Allow edits', 'Read-only instead', 'Cancel'] },
+    )
+    if (answer.startsWith('Cancel')) return { deny: 'The user cancelled this crew message.' }
+    if (answer.startsWith('Read-only')) return answerCrewAsk($, { ...e, mode: 'read' })
+  }
+  const res = await sendToThread($, {
+    name,
+    task,
+    context: optStr(e.context) ?? '',
+    by: 'claude',
+    ...(agent ? { agent } : {}),
+    ...(optStr(e.model) ? { model: optStr(e.model) } : {}),
+    ...(optStr(e.effort) ? { effort: optStr(e.effort) } : {}),
+    ...(mode ? { mode } : {}),
+  })
+  if (typeof res === 'string') return { deny: res }
+  const turn = res.turns[res.turns.length - 1]
   return {
     result:
-      `Started crew job #${job.id} on ${agent} (${modeLabel(agent, mode)}) in ${job.cwd}. ` +
-      `It runs in the background; you'll be prompted when it finishes. Read it with crew_result {"id": ${job.id}}.`,
+      `Sent to thread "${res.name}" (${res.agent}${res.model !== 'default' ? ` ${res.model}` : ''}, ${modeLabel(res.agent, res.mode)}), ` +
+      `turn ${turn?.n ?? 1}. It answers in the background; you'll get its SUMMARY when it finishes. ` +
+      `Meanwhile carry on with other work.`,
   }
 }
 
-async function answerCrewResult($: EngineInterface, e: Args): Promise<Answer> {
-  const jobs = await read($, crew)
-  if (typeof e.id !== 'number') return { result: listing(jobs) }
-  const job = jobs.find(j => j.id === e.id)
-  return job ? { result: report(job, now()) } : { deny: `No crew job #${String(e.id)}. ${listing(jobs)}` }
+async function answerCrewRead($: EngineInterface, e: Args): Promise<Answer> {
+  const list = await read($, threads)
+  const name = optStr(e.thread)
+  if (!name) return { result: listing(list) }
+  const t = list.find(x => x.name === slug(name))
+  if (!t) return { deny: `No thread "${slug(name)}". ${listing(list)}` }
+  const turn = typeof e.turn === 'number' ? t.turns.find(u => u.n === e.turn) : t.turns[t.turns.length - 1]
+  if (!turn) return { result: threadLine(t) }
+  return { result: report(t, turn, e.full === true) }
+}
+
+/** The models each helper offers: Codex's from its cache file, Antigravity's from `agy models`. */
+async function loadModels($: EngineInterface): Promise<void> {
+  const home = (await $.env.get('HOME')) ?? ''
+  const codex: string[] = []
+  try {
+    const raw = JSON.parse(await $.fs.read(`${home}/.codex/models_cache.json`)) as unknown
+    const list = Array.isArray(raw) ? raw : ((raw as { models?: unknown[] }).models ?? [])
+    for (const m of list) {
+      const slugOf = (m as { slug?: unknown; id?: unknown }).slug ?? (m as { id?: unknown }).id
+      if (typeof slugOf === 'string') codex.push(slugOf)
+    }
+  } catch {
+    // no Codex cache: the picker offers its default alone
+  }
+  const agy: string[] = []
+  try {
+    const run = await $.process.run(['agy', 'models'], { timeoutMs: 20_000 })
+    for (const line of run.stdout.split('\n')) {
+      const id = line.split('\t')[0]?.trim()
+      if (id && !id.includes(' ') && line.includes('\t')) agy.push(id)
+    }
+  } catch {
+    // agy missing or offline
+  }
+  const models = { codex, agy }
+  await update($, crewModels, () => models)
+  await $.store.set('models', models)
+}
+
+async function registerCrewTools($: EngineInterface): Promise<void> {
+  const models = await read($, crewModels)
+  await $.tool.register({
+    name: 'crew_ask',
+    description:
+      'Send a message to a crew thread: an ongoing conversation with another coding agent on this machine, "codex" ' +
+      '(OpenAI Codex CLI) or "agy" (Google Antigravity CLI). Name threads by topic ("auth-review") and keep reusing them: ' +
+      'the helper remembers the whole thread, and FLEET compacts long threads into a state brief by itself. It returns at ' +
+      'once; the helper works in the background and you get its SUMMARY when it is done. Helpers see only what you send ' +
+      'plus their thread, so make each task self-contained (goal, what you know, where to look, what you want back). ' +
+      'Read-only unless mode is "edit", which the user must approve. You are the lead: check what comes back.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        thread: { type: 'string', description: 'thread name by topic; an existing one continues, a new one opens' },
+        task: { type: 'string', description: 'the message: a complete, self-contained instruction or follow-up' },
+        agent: { type: 'string', enum: ['codex', 'agy'], description: 'which helper; required to open a new thread' },
+        context: { type: 'string', description: 'optional facts, snippets or file paths the helper should start from' },
+        model: {
+          type: 'string',
+          description:
+            `optional model. codex: ${models.codex.slice(0, 10).join(', ') || 'its default'}. ` +
+            `agy: ${models.agy.slice(0, 10).join(', ') || 'its default'}.`,
+        },
+        effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: 'optional reasoning effort' },
+        mode: { type: 'string', enum: ['read', 'edit'], description: 'read (default) or edit (asks the user first)' },
+      },
+      required: ['thread', 'task'],
+    },
+    isDeferred: false,
+  })
+  await $.tool.register({
+    name: 'crew_read',
+    description:
+      "Read a crew thread's latest answer: its SUMMARY by default (cheap), the whole answer with full: true. A turn number " +
+      'reads an earlier one. Without a thread, lists every thread with its status and last summary.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        thread: { type: 'string' },
+        turn: { type: 'integer' },
+        full: { type: 'boolean' },
+      },
+    },
+    isDeferred: false,
+  })
 }
 
 async function toggleCrewAgent($: EngineInterface): Promise<void> {
   await update($, crewAgent, a => (a === 'codex' ? 'agy' : 'codex'))
+  await update($, crewModel, () => 'default')
 }
 
 async function toggleCrewMode($: EngineInterface): Promise<void> {
   await update($, crewMode, m => (m === 'read' ? 'edit' : 'read'))
 }
 
+/** The launch box: continues the selected thread, or opens a new one named from the task. */
 async function launchFromPane($: EngineInterface, task: string): Promise<void> {
   const text = task.trim()
   if (!text) return
-  const job = await startJob($, await read($, crewAgent), await read($, crewMode), text, 'you')
-  $.ui.toast(`Crew job #${job.id} started on ${job.agent}`)
+  const sel = await read($, crewSel)
+  const current = sel ? await findThread($, sel) : undefined
+  const agent = await read($, crewAgent)
+  const base = slug(text.split(/\s+/).slice(0, 4).join(' '))
+  const taken = new Set((await read($, threads)).map(t => t.name))
+  let name = base
+  for (let i = 2; taken.has(name); i++) name = `${base}-${i}`
+  const res = await sendToThread($, {
+    name: current ? current.name : name,
+    task: text,
+    context: '',
+    by: 'you',
+    agent: current ? current.agent : agent,
+    model: await read($, crewModel),
+    effort: await read($, crewEffort),
+    mode: await read($, crewMode),
+  })
+  if (typeof res === 'string') $.ui.toast(res)
+  else {
+    await update($, crewSel, () => res.name)
+    $.ui.toast(`Crew · sent to ${res.name}`)
+  }
 }
 
 function acts($: EngineInterface): Acts {
@@ -281,8 +582,12 @@ function acts($: EngineInterface): Acts {
     crewAgent: () => void toggleCrewAgent($),
     crewMode: () => void toggleCrewMode($),
     crewLaunch: task => void launchFromPane($, task),
-    crewStop: id => void stopJob($, id),
-    crewSend: id => void handToClaude($, id),
+    crewStop: name => void stopThread($, name),
+    crewSend: (name, n) => void handToClaude($, name, n),
+    crewSelect: name => void update($, crewSel, cur => (cur === name ? null : name)),
+    crewNew: () => void update($, crewSel, () => null),
+    crewModel: value => void update($, crewModel, () => value),
+    crewEffort: value => void update($, crewEffort, () => value),
   }
 }
 
@@ -291,34 +596,25 @@ export const register: Register = on => {
     const started = await next(e)
     self = await $.session.id()
     sessionCwd = started.cwd
-    // jobs a previous copy of the module was running died with it
-    await update($, crew, list => list.map(j => (j.status === 'running' ? { ...j, status: 'stopped', ended: now() } : j)))
-    await $.tool.register({
-      name: 'crew_run',
-      description:
-        'Hand a task to another coding agent on this machine and get a job id back at once: "codex" (OpenAI Codex CLI) or ' +
-        '"agy" (Google Antigravity CLI). The job runs in the background in this project folder, read-only unless mode is ' +
-        '"edit" (Codex then edits in a separate git worktree; Antigravity edits in place). Use it to parallelise independent ' +
-        'investigation or to get a second opinion. You stay the lead: when the job finishes you are prompted, and you must ' +
-        'read its output with crew_result and check it before relying on it. The user watches jobs in the FLEET pane.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          agent: { type: 'string', enum: ['codex', 'agy'], description: 'which agent runs the job' },
-          task: { type: 'string', description: 'a complete, self-contained instruction; the agent has no other context' },
-          mode: { type: 'string', enum: ['read', 'edit'], description: 'read (default) or edit' },
-        },
-        required: ['agent', 'task'],
-      },
-      isDeferred: false,
-    })
-    await $.tool.register({
-      name: 'crew_result',
-      description:
-        "Read a crew job's status and output (its answer, or its progress log while it runs). Without an id, lists recent jobs.",
-      inputSchema: { type: 'object', properties: { id: { type: 'integer', description: 'the job id crew_run gave' } } },
-      isDeferred: false,
-    })
+    // threads come back from the store; a turn a previous copy was running died with it
+    const savedThreads = (await $.store.get('threads')) as CrewThread[] | undefined
+    const savedModels = (await $.store.get('models')) as { codex: string[]; agy: string[] } | undefined
+    if (Array.isArray(savedThreads) && (await read($, threads)).length === 0) await update($, threads, () => savedThreads)
+    if (savedModels?.codex && savedModels.agy) await update($, crewModels, () => savedModels)
+    await update($, threads, list =>
+      list.map(t =>
+        t.status !== 'running'
+          ? t
+          : {
+              ...t,
+              status: 'idle',
+              turns: t.turns.map(u => (u.status === 'running' ? { ...u, status: 'stopped', ended: now() } : u)),
+            },
+      ),
+    )
+    await registerCrewTools($)
+    // refresh the model lists in the background, then describe them to Claude
+    void loadModels($).then(() => registerCrewTools($))
     // the look you picked last time, kept across sessions
     const savedTheme = await $.store.get('theme')
     const savedScene = await $.store.get('scene')
@@ -340,8 +636,8 @@ export const register: Register = on => {
   // FLEET's own tools: the call's fields are its input
   on('tool.call', async ($, e, next) => {
     const name: string = e.tool
-    if (name === 'mcp__fleet__crew_run') return answerCrewRun($, e as unknown as Args)
-    if (name === 'mcp__fleet__crew_result') return answerCrewResult($, e as unknown as Args)
+    if (name === 'mcp__fleet__crew_ask') return answerCrewAsk($, e as unknown as Args)
+    if (name === 'mcp__fleet__crew_read') return answerCrewRead($, e as unknown as Args)
     return next(e)
   })
 
@@ -392,14 +688,48 @@ export const register: Register = on => {
       }
       const aurora = raster('aurora', { kind: 'aurora', cols: Math.max(10, width), rows: 1 })
       // the cat sits beside the session legend; any stored value but 'off' means the cat
-      const { Input } = E as Partial<Elements['terminal']>
+      // the Crew tab's pickers and input box: Input and Select, where the surface has them
+      const { Input, Select } = E as Partial<Elements['terminal']>
+      const cAgent = await read($, crewAgent)
+      const cModel = await read($, crewModel)
+      const cEffort = await read($, crewEffort)
+      const cSel = await read($, crewSel)
+      const cThreads = await read($, threads)
+      const target = cSel ? cThreads.find(t => t.name === cSel) : undefined
+      const modelList = ['default', ...(await read($, crewModels))[target?.agent ?? cAgent]]
+      const actions = acts($)
+      const pickers =
+        Select && !target ? (
+          <Box flexDirection="row" columnGap={2}>
+            <Select
+              key="crew-model"
+              label="model "
+              value={modelList.includes(cModel) ? cModel : 'default'}
+              options={modelList.map(m => ({ value: m, label: m }))}
+              onSelect={value => actions.crewModel(value)}
+            />
+            <Select
+              key="crew-effort"
+              label="effort "
+              value={cEffort}
+              options={EFFORTS.map(x => ({ value: x, label: x }))}
+              onSelect={value => actions.crewEffort(value)}
+            />
+          </Box>
+        ) : null
       const launcher = Input ? (
-        <Input
-          key="crew-task"
-          placeholder={`describe a job for ${await read($, crewAgent)}, then enter`}
-          submitLabel="run"
-          onSubmit={value => acts($).crewLaunch(value)}
-        />
+        <Box flexDirection="column">
+          {pickers}
+          <Box borderStyle="round" borderColor={palette.accent} paddingX={1}>
+            <Input
+              key="crew-task"
+              label={target ? `▸ ${target.name} ` : `▸ new ${cAgent} thread `}
+              placeholder={target ? 'follow up in this thread…' : 'describe a task, then enter…'}
+              submitLabel="send"
+              onSubmit={value => actions.crewLaunch(value)}
+            />
+          </Box>
+        </Box>
       ) : null
       const hero = currentTab === 'live' && sceneName !== 'off' ? raster('hero', { kind: 'cat', cols: 34, rows: 12 }) : null
       mounted = next
@@ -420,8 +750,9 @@ export const register: Register = on => {
               aurora,
               hero,
               frame: Math.floor(Date.now() / 140),
-              crew: await read($, crew),
-              crewAgent: await read($, crewAgent),
+              threads: cThreads,
+              crewSel: target ? target.name : null,
+              crewAgent: cAgent,
               crewMode: await read($, crewMode),
               launcher,
             },

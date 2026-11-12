@@ -28,12 +28,17 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
 ## Use
 
 - `/fleet` opens or closes the pane. The band above the prompt is always on.
-- `ctrl+x tab` gives the pane the keyboard: `1`–`5` switch tabs, `t` cycles the theme, `a` toggles the cat.
+- `ctrl+x tab` gives the pane the keyboard: `1`–`6` switch tabs, `t` cycles the theme, `a` toggles the cat.
 - **Live**: one calm row per session, needs-you on top; press a row to expand it.
 - **Feed**: every tool call across sessions, grouped, with a 10-minute summary.
-- **Crew**: jobs for Codex (`codex exec`) and Antigravity (`agy -p`), read-only unless edits are
-  switched on (Codex edits in its own git worktree). Claude delegates through the
-  `crew_run` / `crew_result` tools and reviews what comes back.
+- **Crew**: named, ongoing threads with Codex (`codex exec` / `exec resume`) and Antigravity
+  (`agy -p` / `--conversation`), each with its own model, effort and mode. Claude talks to them
+  through `crew_ask` / `crew_read`. Every message is wrapped in a brief that asks for a SUMMARY
+  first, so Claude reads summaries and pulls full answers on demand. Threads over ~120k tokens
+  of context compact themselves into a state brief and continue fresh. Read-only by default;
+  edits need your approval (Codex edits in its own git worktree).
+- **System**: CPU and memory of everything Claude-related (Claude windows, their MCP servers,
+  the tools they started, Codex, Antigravity, FLEET), with sparklines and the busiest processes.
 - **Cost** and **Actions**: estimated spend, and per-session actions (copy, open transcript, stop).
 
 ## How it reads the machine

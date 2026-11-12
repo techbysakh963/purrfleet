@@ -11,16 +11,19 @@ byte offset reached in each transcript, so each run parses only the lines that a
 """
 import json
 import os
+import stat
 import subprocess
+import tempfile
 import sys
 import time
 from datetime import datetime, timedelta
 
 HOME = os.path.expanduser("~")
 CLAUDE = os.path.join(HOME, ".claude")
-RT = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/claude-{os.getuid()}"
-HUD = os.path.join(RT, "claude-hud") if os.path.isdir(os.path.join(RT, "claude-hud")) else f"/tmp/claude-hud-{os.getuid()}"
-CACHE_DIR = os.path.join(RT, "claude-fleet")
+RT = os.environ.get("XDG_RUNTIME_DIR") or ""
+HUD = os.path.join(RT, "claude-hud") if RT and os.path.isdir(os.path.join(RT, "claude-hud")) else f"/tmp/claude-hud-{os.getuid()}"
+# the cache lives in a private per-user folder, never a shared temp folder
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "purrfleet")
 CACHE = os.path.join(CACHE_DIR, "cache.json")
 CACHE_VERSION = 3
 GIT_EVERY = 20  # seconds between `git diff --shortstat` runs per folder
@@ -171,6 +174,106 @@ def git_diff(cwd, cache, now):
     return add, rem
 
 
+# ── system: what everything Claude-related costs the machine ─────────────────
+
+CLK = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+HISTORY = 40
+
+
+def proc_table():
+    """pid → (ppid, ticks, rss bytes, argv) for this user's processes."""
+    uid = os.getuid()
+    out = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{d}").st_uid != uid:
+                continue
+            raw = read_text(f"/proc/{d}/stat")
+            rest = raw[raw.rindex(")") + 2:].split()  # fields after "(comm)"
+            ppid, ticks = int(rest[1]), int(rest[11]) + int(rest[12])
+            rss = int(read_text(f"/proc/{d}/statm").split()[1]) * PAGE
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+            out[int(d)] = (ppid, ticks, rss, argv)
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def classify(argv):
+    base = os.path.basename(argv[0]) if argv else ""
+    line = " ".join(argv[:3]).lower()
+    if base == "claude" or "/claude/versions/" in line or line.endswith("/bin/claude"):
+        return "Claude Code"
+    if base == "codex" or "/codex" in line:
+        return "Codex"
+    if base in ("agy", "jetski") or "antigravity" in line:
+        return "Antigravity"
+    return None
+
+
+def system(cache, now):
+    table = proc_table()
+    prev = cache.get("ticks", {})
+    roots = {pid for pid, (_, _, _, argv) in table.items() if classify(argv) == "Claude Code"}
+
+    def group_of(pid):
+        own = classify(table[pid][3])
+        if own:
+            return own
+        seen, p = 0, table[pid][0]
+        while p in table and seen < 40:
+            if p in roots:
+                line = " ".join(table[pid][3]).lower()
+                if "fleet_scan" in line:
+                    return "FLEET"
+                return "MCP servers" if "mcp" in line else "tools & shells"
+            p, seen = table[p][0], seen + 1
+        return None
+
+    groups, procs, ticks_now = {}, [], {}
+    for pid, (_ppid, ticks, rss, argv) in table.items():
+        g = group_of(pid)
+        if not g:
+            continue
+        ticks_now[str(pid)] = [ticks, now]
+        old = prev.get(str(pid))
+        cpu = 0.0
+        if old and now > old[1]:
+            cpu = max(0.0, (ticks - old[0]) / CLK / (now - old[1]) * 100)
+        agg = groups.setdefault(g, {"name": g, "count": 0, "cpu": 0.0, "rssMb": 0.0})
+        agg["count"] += 1
+        agg["cpu"] += cpu
+        agg["rssMb"] += rss / 1048576
+        procs.append({"pid": pid, "group": g, "cpu": round(cpu, 1), "rssMb": round(rss / 1048576, 1),
+                      "cmd": " ".join(os.path.basename(a) if i == 0 else a for i, a in enumerate(argv[:4]))[:90]})
+    cache["ticks"] = ticks_now
+    hist = cache.setdefault("hist", {})
+    order = ["Claude Code", "MCP servers", "tools & shells", "Codex", "Antigravity", "FLEET"]
+    out_groups = []
+    for name in order:
+        g = groups.get(name, {"name": name, "count": 0, "cpu": 0.0, "rssMb": 0.0})
+        h = (hist.get(name, []) + [round(g["cpu"], 1)])[-HISTORY:]
+        hist[name] = h
+        out_groups.append({**g, "cpu": round(g["cpu"], 1), "rssMb": round(g["rssMb"]), "history": h})
+    mem = {}
+    for line in read_text("/proc/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        mem[k] = int(v.split()[0]) if v.split() else 0
+    total = mem.get("MemTotal", 0) // 1024
+    return {
+        "groups": out_groups,
+        "top": sorted(procs, key=lambda x: (-x["cpu"], -x["rssMb"]))[:6],
+        "memTotalMb": total,
+        "memUsedMb": total - mem.get("MemAvailable", 0) // 1024,
+        "load": [float(x) for x in read_text("/proc/loadavg").split()[:3]],
+        "cores": os.cpu_count() or 1,
+    }
+
+
 def load_cache():
     try:
         c = json.loads(read_text(CACHE, "{}"))
@@ -181,12 +284,26 @@ def load_cache():
     return {"v": CACHE_VERSION, "files": {}, "feed": []}
 
 
+def private_dir(path):
+    """Creates the folder 0700 and refuses one that is a link or someone else's."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise PermissionError(f"{path} is not a private folder of this user")
+    if st.st_mode & 0o077:
+        os.chmod(path, 0o700)
+
+
 def save_cache(c):
-    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
-    tmp = CACHE + f".{os.getpid()}"
-    with open(tmp, "w") as f:
-        json.dump(c, f, separators=(",", ":"))
-    os.replace(tmp, CACHE)
+    private_dir(CACHE_DIR)
+    fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=".cache-")  # O_EXCL, 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(c, f, separators=(",", ":"))
+        os.replace(tmp, CACHE)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def scan_file(path, entry, budget, feed_sid, feed, names):
@@ -359,10 +476,12 @@ def main():
             "branch": branch, "added": added, "removed": removed,
         })
 
+    sysinfo = system(cache, now)
     save_cache(cache)
     total_in = tot["in"] + tot["cw"] + tot["cr"]
     json.dump({
         "now": int(now),
+        "sys": sysinfo,
         "sessions": out_sessions,
         "feed": feed[-40:],
         "cost": {
