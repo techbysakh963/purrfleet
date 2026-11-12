@@ -44,6 +44,10 @@ export type Acts = {
   openThread: (thread: string) => void
   /** jump to a project's notebook in the Crew tab */
   openNotebook: (folder: string) => void
+  /** rewrite a notebook fact (asks for the new text) */
+  noteEdit: (folder: string, id: number) => void
+  /** open a crew or notebook row in place on Live ("crew:<thread>", "notes:<folder>") */
+  openInline: (key: string) => void
   /** a Codex delivery: show its diff, apply it to your tree, or throw it away */
   deliveryView: (thread: string, turn: number) => void
   deliveryAccept: (thread: string, turn: number) => void
@@ -440,8 +444,42 @@ function Keys(E: Els, v: View, text: string) {
 
 const HEADS: Record<Group, string> = { need: 'NEEDS YOU', read: 'TO READ', work: 'WORKING', quiet: 'QUIET' }
 
-/** One row for a crew item in the inbox; pressing it opens it in the Crew tab. */
+/** One row for a crew item in the inbox; pressing it opens it in place, like a session. */
 function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Acts) {
+  const { Box } = E
+  const row = CrewLine(E, v, x, act)
+  const key = x.kind === 'notes' ? `notes:${x.folder}` : `crew:${x.t.name}`
+  if (v.selected !== key) return row
+  if (x.kind === 'notes') {
+    const { p } = v
+    const pending = (v.notebooks[x.folder] ?? []).filter(n => n.pending)
+    return (
+      <Box flexDirection="column">
+        {row}
+        {Rail(E, mark(v, 'read').color, [
+          ...pending.flatMap(n => [
+            Labeled(E, v, n.by, n.text, true),
+            ActionLine(E, v, [
+              { key: `live-ok-${n.id}`, label: 'keep', color: p.ok, press: () => act.noteApprove(x.folder, n.id) },
+              { key: `live-ed-${n.id}`, label: 'edit', press: () => act.noteEdit(x.folder, n.id) },
+              { key: `live-x-${n.id}`, label: 'reject', color: p.bad, press: () => act.noteRemove(x.folder, n.id) },
+            ]),
+          ]),
+          ActionLine(E, v, [{ key: `live-nb-${x.folder}`, label: 'open the notebook in Crew', color: p.dim, press: () => act.openNotebook(x.folder) }]),
+        ])}
+      </Box>
+    )
+  }
+  const m = x.kind === 'running' ? mark(v, 'work') : mark(v, x.u.status === 'failed' ? 'failed' : 'read')
+  return (
+    <Box flexDirection="column">
+      {row}
+      {ThreadDetail(E, v, x.t, m, act, true)}
+    </Box>
+  )
+}
+
+function CrewLine(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Acts) {
   const now = v.snap.now
   if (x.kind === 'notes') {
     return GridRow(E, v, {
@@ -449,7 +487,7 @@ function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Ac
       m: mark(v, 'read'),
       who: 'notebook',
       what: `${x.count} suggestion${x.count === 1 ? '' : 's'} to keep or reject · ${x.folder.replace(/^\/home\/[^/]+/, '~')}`,
-      press: () => act.openNotebook(x.folder),
+      press: () => act.openInline(`notes:${x.folder}`),
     })
   }
   const who = `${x.t.agent} › ${x.t.name}`
@@ -461,7 +499,7 @@ function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Ac
       who,
       what: u?.log[u.log.length - 1] ?? 'working…',
       age: u ? age(now - u.started) : '',
-      press: () => act.openThread(x.t.name),
+      press: () => act.openInline(`crew:${x.t.name}`),
     })
   }
   const failed = x.u.status === 'failed'
@@ -474,7 +512,7 @@ function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Ac
       ? `changes to review: ${deliveryLine(d)}`
       : failed ? `failed: ${x.u.log[x.u.log.length - 1] ?? (summaryOf(x.u.answer) || 'no answer')}` : summaryOf(x.u.answer) || 'answered',
     age: age(now - (x.u.ended ?? now)),
-    press: () => act.openThread(x.t.name),
+    press: () => act.openInline(`crew:${x.t.name}`),
   })
 }
 
@@ -748,6 +786,20 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
     press: () => act.crewSelect(t.name),
   })
   if (!isOpen || !last) return row
+  return (
+    <Box flexDirection="column">
+      {row}
+      {ThreadDetail(E, v, t, m, act)}
+    </Box>
+  )
+}
+
+/** A thread's latest turn on a rail, in the answer's own shape: used in Crew and, opened in place, on Live. */
+function ThreadDetail(E: Els, v: View, t: CrewThread, m: Mark, act: Acts, isOnLive = false) {
+  const { Text } = E
+  const { p } = v
+  const last = t.turns[t.turns.length - 1]
+  if (!last) return null
   const isFull = v.crewOpenTurn === `${t.name}#${last.n}`
   const sec = sections(last.answer)
   const meta = [
@@ -761,10 +813,7 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
     .filter(Boolean)
     .join(' · ')
   const earlier = v.crewAllTurns === t.name ? t.turns.slice(0, -1) : []
-  return (
-    <Box flexDirection="column">
-      {row}
-      {Rail(E, m.color, [
+  return Rail(E, m.color, [
           ...earlier.map(u => Labeled(E, v, `turn ${u.n}`, `${u.by === 'claude' ? 'Claude' : 'you'}: ${u.ask.replace(/\s+/g, ' ')} → ${plain(summaryOf(u.answer)) || u.status}`)),
           Labeled(E, v, last.by === 'claude' ? 'Claude asked' : 'you asked', last.ask.replace(/\s+/g, ' ')),
           ...(last.status === 'running'
@@ -806,11 +855,10 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
                   press: () => act.showAllTurns(t.name),
                 }
               : null,
+            isOnLive ? { key: `crew-tab-${t.name}`, label: 'open in Crew', color: p.dim, press: () => act.openThread(t.name) } : null,
           ]),
           last.isHanded && last.status !== 'running' ? <Text color={p.dim}>Claude has this answer</Text> : null,
-        ])}
-    </Box>
-  )
+        ])
 }
 
 /**
@@ -896,7 +944,7 @@ function Notebook(E: Els, v: View, act: Acts) {
     </Button>
   )
   if (!isOpen) return head
-  const narrow = { ...v, width: Math.max(30, v.width - 9) }
+  const narrow = { ...v, width: Math.max(30, v.width - 14) }
   return (
     <Box flexDirection="column">
       {head}
@@ -915,6 +963,7 @@ function Notebook(E: Els, v: View, act: Acts) {
           {Rail(E, mark(v, 'read').color, [
             ActionLine(E, v, [
               { key: `note-ok-${n.id}`, label: 'keep', color: p.ok, press: () => act.noteApprove(v.notebook.folder, n.id) },
+              { key: `note-ed-${n.id}`, label: 'edit', press: () => act.noteEdit(v.notebook.folder, n.id) },
               { key: `note-x-${n.id}`, label: 'reject', color: p.bad, press: () => act.noteRemove(v.notebook.folder, n.id) },
             ]),
           ])}
@@ -928,6 +977,9 @@ function Notebook(E: Els, v: View, act: Acts) {
       {kept.map(n => (
         <Box flexDirection="row">
           {GridRow(E, narrow, { key: `kept-${n.id}`, m: { glyph: ' ', color: p.dim }, who: n.by, what: n.text, age: age(v.snap.now - n.at) })}
+          <Button key={`note-ed-${n.id}`} plain onPress={() => act.noteEdit(v.notebook.folder, n.id)}>
+            <Text color={p.dim}> edit</Text>
+          </Button>
           <Button key={`note-del-${n.id}`} plain onPress={() => act.noteRemove(v.notebook.folder, n.id)}>
             <Text color={p.dim}> delete</Text>
           </Button>

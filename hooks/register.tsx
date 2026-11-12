@@ -233,8 +233,42 @@ async function openPath($: EngineInterface, path: string): Promise<void> {
 
 // ── Codex deliveries: edits wait in Codex's worktree until you accept them ────
 
+// Codex could write anything inside its worktree, including the `.git` pointer and
+// files git reads, while FLEET runs git there outside any sandbox. So git runs with
+// nothing in it that executes (no fsmonitor, hooks, external diff, textconv, system
+// config), and in the worktree only through the git dir the MAIN repo records for it.
+const SAFE_GIT = [
+  '-c', 'core.fsmonitor=false',
+  '-c', 'core.hooksPath=/dev/null',
+  '-c', 'core.untrackedCache=false',
+  '-c', 'diff.external=',
+  '-c', 'core.pager=cat',
+  '-c', 'protocol.allow=never',
+] as const
+
 const git = ($: EngineInterface, args: readonly string[], stdin?: string) =>
-  $.process.run(['git', ...args], { timeoutMs: 30_000, ...(stdin === undefined ? {} : { stdin }) })
+  $.process.run(['git', ...SAFE_GIT, ...args], {
+    timeoutMs: 30_000,
+    env: { GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' },
+    ...(stdin === undefined ? {} : { stdin }),
+  })
+
+/**
+ * The worktree's git dir as your repo (trusted) records it: the entry under
+ * <common dir>/worktrees whose `gitdir` file points at <path>/.git. Never the
+ * worktree's own `.git` pointer, which Codex could have rewritten.
+ */
+async function trustedGitDir($: EngineInterface, cwd: string, path: string): Promise<string | undefined> {
+  const r = await git($, ['-C', cwd, 'rev-parse', '--path-format=absolute', '--git-common-dir']).catch(() => undefined)
+  if (!r || r.exitCode !== 0) return undefined
+  const base = `${r.stdout.trim()}/worktrees`
+  for (const e of await $.fs.list(base).catch(() => [])) {
+    if (e.kind !== 'dir') continue
+    const pointer = (await $.fs.read(`${base}/${e.name}/gitdir`).catch(() => '')).trim()
+    if (pointer === `${path}/.git`) return `${base}/${e.name}`
+  }
+  return undefined
+}
 
 async function worktreesOf($: EngineInterface, cwd: string): Promise<string[]> {
   const r = await git($, ['-C', cwd, 'worktree', 'list', '--porcelain']).catch(() => undefined)
@@ -242,9 +276,12 @@ async function worktreesOf($: EngineInterface, cwd: string): Promise<string[]> {
 }
 
 /** Everything Codex changed in its worktree, staged there so new files count too. */
-async function stagedIn($: EngineInterface, path: string, what: 'numstat' | 'patch'): Promise<string | undefined> {
-  if ((await git($, ['-C', path, 'add', '-A'])).exitCode !== 0) return undefined
-  const r = await git($, ['-C', path, 'diff', '--cached', what === 'numstat' ? '--numstat' : '--binary'])
+async function stagedIn($: EngineInterface, cwd: string, path: string, what: 'numstat' | 'patch'): Promise<string | undefined> {
+  const gitDir = await trustedGitDir($, cwd, path)
+  if (!gitDir) return undefined
+  const at = ['--git-dir', gitDir, '--work-tree', path]
+  if ((await git($, [...at, 'add', '-A'])).exitCode !== 0) return undefined
+  const r = await git($, [...at, 'diff', '--cached', '--no-ext-diff', '--no-textconv', what === 'numstat' ? '--numstat' : '--binary'])
   return r.exitCode === 0 ? r.stdout : undefined
 }
 
@@ -252,7 +289,7 @@ async function deliveryOf($: EngineInterface, cwd: string, before: readonly stri
   const home = (await $.env.get('HOME')) ?? ''
   const path = newCodexWorktree(before, await worktreesOf($, cwd), home)
   if (!path) return undefined
-  const stat = await stagedIn($, path, 'numstat')
+  const stat = await stagedIn($, cwd, path, 'numstat')
   return { path, files: stat === undefined ? [] : parseNumstat(stat), state: 'pending' }
 }
 
@@ -276,7 +313,7 @@ async function viewDelivery($: EngineInterface, name: string, n: number): Promis
   if ((await read($, crewDiff))?.key === key) return void (await update($, crewDiff, () => null))
   const at = await deliveryAt($, name, n)
   if (!at) return
-  const patch = await stagedIn($, at.d.path, 'patch')
+  const patch = await stagedIn($, at.t.cwd, at.d.path, 'patch')
   const text = patch === undefined ? '(the worktree is gone or git failed to read it)' : patch.trim() || '(no changes)'
   await update($, crewDiff, () => ({ key, text: text.length > 60_000 ? `${text.slice(0, 60_000)}\n…(cut)` : text }))
 }
@@ -290,7 +327,7 @@ async function acceptDelivery($: EngineInterface, name: string, n: number): Prom
     options: ['Apply to my tree', 'Cancel'],
   })
   if (!answer.startsWith('Apply')) return
-  const patch = await stagedIn($, at.d.path, 'patch')
+  const patch = await stagedIn($, at.t.cwd, at.d.path, 'patch')
   if (patch === undefined) return setDelivery($, name, n, { note: "couldn't read the worktree; it may be gone" })
   if (!patch.trim()) return setDelivery($, name, n, { note: 'nothing to apply' })
   const check = await git($, ['-C', at.t.cwd, 'apply', '--check', '-'], patch)
@@ -1092,6 +1129,24 @@ async function resolveFolder($: EngineInterface, path: string, why: string): Pro
   return answer.startsWith('Allow') ? real : { deny: `The user did not allow ${real}.` }
 }
 
+/** You rewrite a fact in place (or keep or delete it); a rewritten suggestion counts as kept. */
+async function editNote($: EngineInterface, folder: string, id: number): Promise<void> {
+  const note = ((await read($, notebooks))[folder] ?? []).find(n => n.id === id)
+  if (!note) return
+  const answer = await $.ui.ask(`Rewrite this fact (type the new text under "Other"):\n${note.text}`, {
+    header: 'FLEET notebook',
+    options: ['Keep as is', 'Delete it'],
+  })
+  if (answer === 'Keep as is' || !answer.trim()) return
+  if (answer === 'Delete it') return removeNote($, folder, id)
+  const text = answer.replace(/\s+/g, ' ').trim().slice(0, 400)
+  await update($, notebooks, all => ({
+    ...all,
+    [folder]: (all[folder] ?? []).map(n => (n.id === id ? { ...n, text, by: 'you' as const, at: now(), pending: false } : n)),
+  }))
+  await saveNotebook($, folder)
+}
+
 async function removeNote($: EngineInterface, folder: string, id: number): Promise<void> {
   await update($, notebooks, all => ({ ...all, [folder]: (all[folder] ?? []).filter(n => n.id !== id) }))
   await saveNotebook($, folder)
@@ -1256,6 +1311,12 @@ function acts($: EngineInterface): Acts {
     showAllThreads: () => void update($, crewShowAll, x => !x),
     showAllTurns: name => void update($, crewAllTurns, cur => (cur === name ? null : name)),
     openNote: file => void openPath($, `obsidian://open?path=${encodeURIComponent(file)}`),
+    noteEdit: (folder, id) => void editNote($, folder, id),
+    // a crew or notebook row on Live opens in place, like a session's; opening an answer reads it
+    openInline: key => {
+      void update($, selected, cur => (cur === key ? '' : key))
+      if (key.startsWith('crew:')) void markRead($, key.slice(5))
+    },
     deliveryView: (name, n) => void viewDelivery($, name, n),
     deliveryAccept: (name, n) => void acceptDelivery($, name, n),
     deliveryDiscard: (name, n) => void discardDelivery($, name, n),
@@ -1480,7 +1541,7 @@ export const register: Register = on => {
               snap: s,
               tab: currentTab,
               // nothing starts expanded: you open the row you want
-              selected: sel && s.sessions.some(x => x.sid === sel) ? sel : null,
+              selected: sel && (s.sessions.some(x => x.sid === sel) || /^(crew|notes):/.test(sel)) ? sel : null,
               feedFilter: await read($, feedFilter),
               width,
               self,
