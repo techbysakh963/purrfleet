@@ -43,6 +43,9 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   panics with the fleet. The band and `fleet_read` show the same list. Nothing starts expanded.
 - One mark per state, everywhere: ▲ needs you · × failed · ◆ to read · ● working · ○ quiet.
   Buttons are plain words; the tab or filter you're on is bold and underlined.
+- Notices: threads Claude started that finish together reach Claude as one notice (it waits up to
+  3 minutes for a slow sibling). A failed crew turn sends a desktop notification whoever started it;
+  your own successful turns show a toast.
 - Several windows: FLEET windows share their crew threads (merged, never overwritten) and send each
   desktop notification once for the whole machine.
 - **Feed**: every tool call across sessions, grouped, with a 10-minute summary.

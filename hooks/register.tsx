@@ -9,6 +9,7 @@ import {
   COMPACT_PROMPT,
   EFFORTS,
   argvFor,
+  batchNotice,
   brief,
   capAnswer,
   lines,
@@ -431,12 +432,18 @@ async function runTurn(
       turns: x.turns.map(u => (u.n !== n ? u : { ...u, status: res.ok ? 'done' : 'failed', ended: now(), unread: true })),
     }
   })
-  const settled = (await findThread($, name))?.turns.find(u => u.n === n)
+  const settledThread = await findThread($, name)
+  const settled = settledThread?.turns.find(u => u.n === n)
+  if (isMine()) owner.delete(name)
   if (settled && settled.status !== 'stopped') {
-    if (by === 'claude') await handToClaude($, name, n)
+    // a failure reaches the desktop whoever started it; a success is a toast for
+    // your own turns, and a (batched) notice for Claude's
+    if (settled.status === 'failed') {
+      void $.ui.notify(`Crew · ${name} (${settledThread?.agent ?? 'helper'}) failed`, { title: 'FLEET', key: `fleet-crew-${name}` })
+    }
+    if (by === 'claude') await queueForClaude($, name, n)
     else $.ui.toast(`Crew · ${name} answered (${settled.status})`)
   }
-  if (isMine()) owner.delete(name)
   await persist($)
 }
 
@@ -545,6 +552,41 @@ async function stopThread($: EngineInterface, name: string): Promise<void> {
     turns: x.turns.map(u => (u.status === 'running' ? { ...u, status: 'stopped', ended: now() } : u)),
   }))
   await child?.return?.(undefined)
+}
+
+// Claude-started turns that finished while a sibling this window runs for Claude
+// was still working: Claude hears about them together, in one notice, instead of
+// being interrupted once per helper (and acting on the first before the rest land).
+const HAND_WAIT_MS = 180_000 // a slow sibling never holds the others back longer than this
+let handQueue: { name: string; n: number }[] = []
+let handGen = 0
+
+async function queueForClaude($: EngineInterface, name: string, n: number): Promise<void> {
+  handQueue.push({ name, n })
+  const siblings = (await read($, threads)).filter(
+    t => t.status === 'running' && owner.has(t.name) && t.turns[t.turns.length - 1]?.by === 'claude',
+  )
+  if (siblings.length === 0) return flushForClaude($)
+  const gen = ++handGen
+  void $.clock.sleep(HAND_WAIT_MS).then(() => (gen === handGen ? flushForClaude($) : undefined))
+}
+
+async function flushForClaude($: EngineInterface): Promise<void> {
+  const due = handQueue
+  handQueue = []
+  handGen++
+  if (due.length === 1) return handToClaude($, due[0]!.name, due[0]!.n)
+  if (due.length === 0) return
+  const text = batchNotice(due, await read($, threads))
+  if (!text) return
+  await $.prompt
+    .submit({ text })
+    .then(async () => {
+      for (const { name, n } of due) {
+        await patchThread($, name, x => ({ ...x, turns: x.turns.map(u => (u.n === n ? { ...u, isHanded: true } : u)) }))
+      }
+    })
+    .catch(() => undefined)
 }
 
 /** Tells Claude a turn finished: the summary inline (no extra call), the rest on demand. */

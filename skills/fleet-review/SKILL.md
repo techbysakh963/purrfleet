@@ -12,7 +12,7 @@ Run independent reviews on Codex and Antigravity, then act as the lead: verify, 
    - `mcp__fleet__crew_ask` with `agent: "codex"`, thread `review-<topic>`, task: correctness, edge cases, error handling, concurrency, tests that are missing.
    - `mcp__fleet__crew_ask` with `agent: "agy"`, thread `review-<topic>-design`, task: API and interface design, readability, naming, consistency with the surrounding code.
    - Make each task self-contained: the folder, the exact files or diff to read, the intent, and "cite path:line and a concrete failure scenario for every finding".
-3. **Keep working** while they run. Each sends a notice when its turn finishes.
+3. **Keep working** while they run. When both are done you get one notice naming both (a slow one never holds the other back more than 3 minutes).
 4. **Read summaries first** with `mcp__fleet__crew_read`; pull `full: true` only for findings worth acting on.
 5. **Verify every finding yourself** against the current code. Two reviewers agreeing is not verification. Drop anything you can't reproduce or point to in the code.
 6. **Report** one merged list, most severe first: finding, file:line, why it matters, your verification status (confirmed / plausible / rejected and why). Say which reviewer raised it.

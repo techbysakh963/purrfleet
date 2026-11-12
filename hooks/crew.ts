@@ -406,3 +406,25 @@ function seenIn(t: CrewThread, other: CrewThread): CrewThread {
   if (!t.turns.some(u => u.unread && read.has(`${u.n}:${u.started}`))) return t
   return { ...t, turns: t.turns.map(u => (u.unread && read.has(`${u.n}:${u.started}`) ? { ...u, unread: false } : u)) }
 }
+
+/**
+ * The one notice Claude gets when several threads it started finish together:
+ * fixed wording and thread names only (a helper's words reach Claude through
+ * crew_read, never through the prompt). Empty when none of them still exists.
+ */
+export function batchNotice(due: readonly { name: string; n: number }[], threads: readonly CrewThread[]): string {
+  const parts = due.flatMap(({ name, n }) => {
+    const t = threads.find(x => x.name === name)
+    const u = t?.turns.find(x => x.n === n)
+    return t && u ? [`"${name}" (${t.agent}, turn ${n}, ${u.status})`] : []
+  })
+  if (parts.length === 0) return ''
+  const stillRunning = threads
+    .filter(t => t.status === 'running' && t.turns[t.turns.length - 1]?.by === 'claude')
+    .map(t => `"${t.name}"`)
+  return (
+    `[FLEET crew] ${parts.length} thread${parts.length === 1 ? '' : 's'} you started finished: ${parts.join(', ')}. ` +
+    `Read each summary with crew_read {"thread": "<name>"} and check them before relying on them; weigh them together.` +
+    (stillRunning.length ? ` Still running: ${stillRunning.join(', ')} (you'll hear when it finishes).` : '')
+  )
+}
