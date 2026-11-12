@@ -832,15 +832,126 @@ function CostView(E: Els, v: View) {
   )
 }
 
-const TIPS: [string, string][] = [
-  ['/fleet', 'open or close this pane'],
-  ['/agents', 'manage your subagent types'],
+/** The guide: every command, key and idea in one place. Each line wraps; nothing is cut. */
+const GUIDE: { title: string; rows: [string, string][] }[] = [
+  {
+    title: 'OPEN AND MOVE',
+    rows: [
+      ['/fleet', 'open or close this pane · /fleet help jumps here'],
+      ['ctrl+x tab', 'give the pane the keyboard; tab walks the buttons, enter presses one'],
+      ['1 – 6', 'switch tabs: Live · Feed · Crew · Cost · System · Actions'],
+      ['t · a', 'cycle the colour theme · show or hide the cat'],
+      ['arrows', 'scroll the pane while it has the keyboard'],
+    ],
+  },
+  {
+    title: 'TABS',
+    rows: [
+      ['1 Live', 'every Claude window; whoever needs you is on top; press a row for its card'],
+      ['2 Feed', 'every tool call across sessions, grouped, with a 10-minute tally'],
+      ['3 Crew', 'conversations with Codex and Antigravity that Claude (or you) start'],
+      ['4 Cost', "today's and this week's estimated spend, by model and session"],
+      ['5 System', 'CPU and memory of Claude, its MCP servers and tools, Codex, Antigravity'],
+      ['6 Actions', 'actions for the selected session, and this guide'],
+    ],
+  },
+  {
+    title: 'CREW FROM CLAUDE\'S PROMPT (full editing and wrapping)',
+    rows: [
+      ['/crew <message>', 'send to the selected thread, or open a new one'],
+      ['/crew new codex …', 'open a new thread with Codex (or: /crew new agy …)'],
+      ['/crew @name …', 'send to a thread by name'],
+      ['/crew', 'list the threads and what each said last'],
+    ],
+  },
+  {
+    title: 'CREW TAB',
+    rows: [
+      ['g · m · n', 'helper codex/agy · read-only or edits · new thread instead of the selected one'],
+      ['pickers', 'model · folder (where it works) · effort, for a new thread'],
+      ['\\ + enter', 'a new line in the box; a long line shows a wrapped preview above it'],
+      ['press a thread', 'open its conversation: ▸ read full answer · ↳ send to Claude · ■ stop'],
+    ],
+  },
+  {
+    title: 'MEMORY',
+    rows: [
+      ['shared notebook', 'facts every helper message carries (about 1.5k tokens at most)'],
+      ['◆ approve', "a helper's suggested note stays pending until you or Claude approve it"],
+      ['Obsidian vault', '~/Desktop/purrfleet-memory: notebook.md (tick to approve) and saved findings'],
+    ],
+  },
+  {
+    title: 'ASK CLAUDE, IN PLAIN WORDS',
+    rows: [
+      ['delegate', '"have codex review the auth code in a thread called auth-review"'],
+      ['remember', '"pin a note: tests run with vitest" · "save this thread to the vault"'],
+      ['its tools', 'crew_ask · crew_read · crew_note · crew_save'],
+    ],
+  },
+  {
+    title: 'SAFETY',
+    rows: [
+      ['read-only', 'helpers only read, unless you allow edits (Claude must ask you first)'],
+      ['worktree', 'Codex edits happen in a separate git worktree, apart from your files'],
+      ['folders', 'helpers work only in projects you have open; any other folder asks you'],
+    ],
+  },
+]
+
+const COMMANDS: [string, string][] = [
+  ['/fleet', 'this pane'],
+  ['/crew', 'the crew'],
+  ['/reload-plugins', 'reload FLEET after an edit'],
   ['/context', "what fills this session's context"],
   ['/usage', 'plan limits and usage'],
   ['/compact', 'shrink a long conversation'],
   ['/resume', 'reopen an earlier session'],
-  ['/reload-plugins', 'reload FLEET after an edit'],
 ]
+
+function Guide(E: Els, v: View, act: Acts) {
+  const { Box, Text, Button } = E
+  const { p } = v
+  const keyWidth = Math.min(18, Math.max(10, Math.floor(v.width / 4)))
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      <Text>
+        <Text color={p.accent} weight="bold">
+          ◆ HOW TO USE FLEET
+        </Text>
+        <Text color={p.dim}> · /fleet help opens this</Text>
+      </Text>
+      {GUIDE.map(section => (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color={p.violet}>{section.title}</Text>
+          {section.rows.map(([key, what]) => (
+            <Box flexDirection="row">
+              <Box width={keyWidth} flexShrink={0}>
+                <Text color={p.cyan} wrap="wrap">
+                  {key}
+                </Text>
+              </Box>
+              <Box flexGrow={1} flexShrink={1}>
+                <Text color={p.text} wrap="wrap">
+                  {what}
+                </Text>
+              </Box>
+            </Box>
+          ))}
+        </Box>
+      ))}
+      <Box flexDirection="column" marginTop={1}>
+        <Text color={p.violet}>HANDY COMMANDS · press one to copy it</Text>
+        {COMMANDS.map(([cmd, what]) => (
+          <Button key={`tip-${cmd}`} plain onPress={() => act.copy(cmd, cmd)}>
+            <Text color={p.cyan}>{cmd.padEnd(keyWidth)}</Text>
+            <Text color={p.dim}>{what}</Text>
+          </Button>
+        ))}
+      </Box>
+    </Box>
+  )
+}
 
 function Actions(E: Els, v: View, act: Acts) {
   const { Box, Text, Button } = E
@@ -870,16 +981,7 @@ function Actions(E: Els, v: View, act: Acts) {
           <Text color={p.dim}>pick another session on the Live tab (1)</Text>
         </Box>
       ) : null}
-      <Box flexDirection="column" marginTop={1}>
-        <Text color={p.dim}>THINGS YOU CAN DO · press one to copy it</Text>
-        {TIPS.map(([cmd, what]) => (
-          <Button key={`tip-${cmd}`} plain onPress={() => act.copy(cmd, cmd)}>
-            <Text color={p.accent}>› </Text>
-            <Text color={p.cyan}>{cmd.padEnd(17)}</Text>
-            <Text color={p.dim}>{what}</Text>
-          </Button>
-        ))}
-      </Box>
+      {Guide(E, v, act)}
     </Box>
   )
 }

@@ -924,7 +924,8 @@ export const register: Register = on => {
     })
     await $.command.register({
       name: 'fleet',
-      description: 'Open or close FLEET, the live dashboard of all your Claude Code sessions',
+      description: 'Open or close FLEET, the live dashboard of all your Claude Code sessions; /fleet help shows the guide',
+      argumentHint: '[help]',
     })
     void poll($)
     $.clock.every(POLL_MS, () => void poll($))
@@ -946,7 +947,12 @@ export const register: Register = on => {
 
   on('command.run', { command: 'crew' }, async ($, e) => ({ text: await crewCommand($, e.args) }))
 
-  on('command.run', { command: 'fleet' }, async $ => {
+  on('command.run', { command: 'fleet' }, async ($, e) => {
+    if (/^\s*help\b/i.test(e.args)) {
+      await update($, tab, () => 'actions')
+      await $.ui.open({ id: PANE, title: 'FLEET', focus: true })
+      return { text: 'FLEET guide open (tab 6, Actions). Arrows scroll it once the pane has the keyboard.' }
+    }
     // close only what you can see; a pane opened unasked on a narrow window comes up instead
     if (await isPaneShown($)) {
       await $.ui.close({ id: PANE })
@@ -956,7 +962,7 @@ export const register: Register = on => {
     void poll($)
     return {
       text: opened.isPlaced
-        ? 'FLEET open. ctrl+x tab to focus it: 1–4 switch tabs, t the theme, a the cat.'
+        ? 'FLEET open. ctrl+x tab to focus it: 1–6 switch tabs, t the theme, a the cat. /fleet help: the guide.'
         : 'FLEET is open but this terminal is too narrow to place it; widen the window.',
     }
   })

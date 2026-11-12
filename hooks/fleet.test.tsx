@@ -347,3 +347,22 @@ test('/crew with nothing after it lists the threads and how to use it', async ($
   const r = await run({ command: 'crew', args: '' })
   expect(r.text ?? '').toContain('Usage: /crew')
 })
+
+test('the guide in Actions shows every section, wrapped rather than cut, even narrow', async ($, on) => {
+  on('state.get', (_, e, next) => {
+    if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: SNAP }, version: 1 } }
+    if (e.key === 'tab') return { value: { value: 'actions', version: 1 } }
+    return next(e)
+  })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 40 } })
+    expect(await ui.find({ type: 'Text', text: /HOW TO USE FLEET/ })).toBeDefined()
+    for (const title of ['OPEN AND MOVE', 'TABS', 'CREW TAB', 'MEMORY', 'SAFETY']) {
+      expect(await ui.find({ type: 'Text', text: new RegExp(title) })).toBeDefined()
+    }
+    // a long row arrives whole: wrapped by the surface, never cut short
+    const row = await ui.find({ type: 'Text', text: /every Claude window; whoever needs you is on top/ })
+    expect(row?.text).toBe('every Claude window; whoever needs you is on top; press a row for its card')
+    await ui.unmount()
+  }
+})
