@@ -29,6 +29,11 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
 
 - `/crew <message>` talks to the crew from Claude Code's own prompt (full editing, wrapping, paste):
   `/crew new codex|agy <message>` opens a thread, `/crew @thread <message>` picks one, `/crew` lists them.
+- Ask Claude **"catch me up"**: its `fleet_read` tool sees what the pane sees, and the
+  `fleet-brief` skill answers decisions first, then crew work finished since your last briefing.
+- Skills shipped with FLEET: `fleet-brief`, `fleet-review` (Codex and agy review in parallel; Claude
+  verifies every finding), `fleet-remember` (notebook or vault), `fleet-handoff` (checkpoint or
+  hand work to a helper).
 - `/fleet` opens or closes the pane. The band above the prompt is always on.
 - `ctrl+x tab` gives the pane the keyboard: `1`–`6` switch tabs, `t` cycles the theme, `a` toggles the cat.
 - **Live**: a one-line fleet status, then one calm row per session (needs-you on top; press one

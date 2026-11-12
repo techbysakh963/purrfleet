@@ -26,6 +26,7 @@ import {
 import { auroraCells, toBase64 } from './scenes'
 import { PALETTES, paletteOf } from './theme'
 import type { Palette } from './theme'
+import { fleetReport } from './brief'
 import { findingMarkdown, findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf } from './vault'
 import { Band, Pane, ordered } from './views'
 import type { Acts } from './views'
@@ -55,6 +56,8 @@ const crewOpenTurn = atom({ plugin: 'fleet', key: 'crewOpenTurn' } as const, nul
 const notebooks = atom({ plugin: 'fleet', key: 'notebooks' } as const, {})
 const crewDraft = atom({ plugin: 'fleet', key: 'crewDraft' } as const, '')
 // bumped after each send: a fresh, empty field (the field owns its text while you type)
+const crewOptions = atom({ plugin: 'fleet', key: 'crewOptions' } as const, false)
+const toured = atom({ plugin: 'fleet', key: 'toured' } as const, true)
 const crewShowAll = atom({ plugin: 'fleet', key: 'crewShowAll' } as const, false)
 const crewAllTurns = atom({ plugin: 'fleet', key: 'crewAllTurns' } as const, null)
 const crewInputGen = atom({ plugin: 'fleet', key: 'crewInputGen' } as const, 0)
@@ -72,6 +75,7 @@ let busyCount = 0
 let sessionCwd = ''
 // the Obsidian vault for long-term memory, and when FLEET last wrote each notebook note
 let vaultDir = ''
+let answersDir = '' // full helper answers, kept apart from the trimmed thread state
 const lastWritten = new Map<string, string>() // what FLEET last wrote to each notebook note
 const lastSeen = new Map<string, number>() // the mtime FLEET last looked at
 let pollCount = 0
@@ -88,13 +92,17 @@ const now = (): number => Date.now() / 1000
 function frameOf(m: Mounted): string {
   return toBase64(
     m.kind === 'aurora'
-      ? auroraCells(now(), m.cols, palette, busyCount)
+      ? auroraCells(now(), m.cols, palette, busyCount, Math.max(0, 1 - (Date.now() - dockedAt) / 2500))
       : catCells(now(), m.cols, m.rows, mood, palette),
   )
 }
 
 function remember(s: Snapshot): void {
   mood = s.sessions.some(needsYou) ? 'alarm' : s.sessions.some(isBusy) ? 'work' : 'sleep'
+  // the fleet docks when the last working session goes quiet: one gentle pulse
+  const isWorking = mood !== 'sleep'
+  if (wasWorking && !isWorking) dockedAt = Date.now()
+  wasWorking = isWorking
   busyCount = s.sessions.filter(isBusy).length
 }
 
@@ -146,6 +154,9 @@ async function watchdog($: EngineInterface): Promise<void> {
 }
 
 let isPainting = false
+let tick = 0
+let dockedAt = 0 // when the last work finished: the header pulses once
+let wasWorking = false
 
 async function paint($: EngineInterface): Promise<void> {
   if (isPainting) return // a slow frame is dropped, never stacked
@@ -158,6 +169,9 @@ async function paint($: EngineInterface): Promise<void> {
 }
 
 async function paintOnce($: EngineInterface): Promise<void> {
+  // a sleeping fleet barely moves: about 2 frames a second instead of 14
+  const isCalm = mood === 'sleep' && Date.now() - dockedAt > 3000
+  if (isCalm && ++tick % 7 !== 0) return
   for (const [key, m] of [...mounted]) {
     const r = await $.ui.blit({ requestId: PANE, key, cells: frameOf(m) })
     if (r.deny !== undefined) mounted.delete(key)
@@ -369,6 +383,7 @@ async function runTurn(
   if (await isStopped()) return
   const res = await execTurn($, t, brief(t, by, task, context, seed, nb.text, nb.isDelta), n, false, isMine)
   if (!isMine()) return
+  await archiveAnswer($, name, n, res.answer)
   // the helper has these notes only once the turn really went through
   if (res.ok) await patchThread($, name, x => ({ ...x, sentNotes: nb.sent }))
   // what the helper offered for the shared notebook goes in, signed by it
@@ -580,7 +595,7 @@ async function answerCrewRead($: EngineInterface, e: Args): Promise<Answer> {
   if (!t) return { deny: `No thread "${slug(name)}". ${listing(list)}` }
   const turn = typeof e.turn === 'number' ? t.turns.find(u => u.n === e.turn) : t.turns[t.turns.length - 1]
   if (!turn) return { result: threadLine(t) }
-  return { result: report(t, turn, e.full === true) }
+  return { result: report(t, e.full === true ? await fullTurn($, t.name, turn) : turn, e.full === true) }
 }
 
 /** The models each helper offers: Codex's from its cache file, Antigravity's from `agy models`. */
@@ -671,6 +686,23 @@ async function registerCrewTools($: EngineInterface): Promise<void> {
     isDeferred: false,
   })
   await $.tool.register({
+    name: 'fleet_read',
+    description:
+      "See the user's whole fleet, as the FLEET pane shows it: every Claude Code session on this machine (who needs the " +
+      'user and why, what each is doing), crew threads with Codex and Antigravity (running, failed, and turns finished ' +
+      'since the last briefing with their summaries), estimated cost today, data freshness, and pending notebook ' +
+      'suggestions. Use it for "catch me up", "what needs me", a standup, or before deciding what to work on. It moves ' +
+      'the "since last briefing" marker on; pass mark: false to peek without moving it, since_last: false for all history.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since_last: { type: 'boolean', description: 'report crew turns finished since the last briefing (default true)' },
+        mark: { type: 'boolean', description: 'move the last-briefing marker to now (default true)' },
+      },
+    },
+    isDeferred: false,
+  })
+  await $.tool.register({
     name: 'crew_save',
     description:
       "Save something worth keeping to the crew's long-term memory, an Obsidian vault the user browses: a finding, a " +
@@ -745,6 +777,7 @@ async function syncFromVault($: EngineInterface): Promise<void> {
 async function openVault($: EngineInterface): Promise<void> {
   const saved = await $.store.get('vault')
   const home = (await $.env.get('HOME')) ?? ''
+  answersDir = `${home}/.cache/purrfleet/answers`
   vaultDir = typeof saved === 'string' && saved ? saved : `${home}/Desktop/purrfleet-memory`
   if (!(await $.fs.exists(`${vaultDir}/.obsidian`))) {
     await $.fs.write(`${vaultDir}/.obsidian/app.json`, '{}\n')
@@ -776,15 +809,53 @@ async function vaultNotes($: EngineInterface, paths: unknown): Promise<string | 
   return parts.join('\n')
 }
 
+const answerPath = (thread: string, n: number): string => `${answersDir}/${slug(thread)}/${n}.md`
+
+/** Every full answer goes to disk, so trimming a thread's state never loses one. */
+async function archiveAnswer($: EngineInterface, thread: string, n: number, answer: string): Promise<void> {
+  if (!answersDir || !answer.trim()) return
+  await $.fs.write(answerPath(thread, n), answer).catch(() => undefined)
+}
+
+/** A turn with its whole answer: from the archive when the kept copy was trimmed. */
+async function fullTurn($: EngineInterface, thread: string, turn: CrewTurn): Promise<CrewTurn> {
+  if (!answersDir) return turn
+  const archived = await $.fs.read(answerPath(thread, turn.n)).catch(() => '')
+  return archived.length > turn.answer.length ? { ...turn, answer: archived } : turn
+}
+
+async function finishTour($: EngineInterface): Promise<void> {
+  await update($, toured, () => true)
+  await $.store.set('toured', true)
+}
+
+async function answerFleetRead($: EngineInterface, e: Args): Promise<Answer> {
+  const saved = await $.store.get('briefAt')
+  const since = e.since_last === false ? 0 : typeof saved === 'number' ? saved : 0
+  const all = await read($, notebooks)
+  const text = fleetReport({
+    snap: await read($, snap),
+    threads: await read($, threads),
+    since,
+    now: now(),
+    pendingNotes: Object.values(all).reduce((n, list) => n + list.filter(x => x.pending).length, 0),
+    self,
+  })
+  // a briefing moves the "since" marker on, unless asked not to
+  if (e.mark !== false) await $.store.set('briefAt', now())
+  return { result: text }
+}
+
 async function answerCrewSave($: EngineInterface, e: Args): Promise<Answer> {
   if (!vaultDir) return { deny: 'No vault is open.' }
   const threadName = optStr(e.thread)
   const t = threadName ? await findThread($, slug(threadName)) : undefined
   if (threadName && !t) return { deny: `No thread "${slug(threadName)}".` }
+  const turns = t ? await Promise.all(t.turns.map(u => fullTurn($, t.name, u))) : []
   const text =
     optStr(e.text) ??
     (t
-      ? t.turns
+      ? turns
           .map(u => `## Turn ${u.n} · ${u.by === 'claude' ? 'Claude' : 'you'} asked\n\n${u.ask}\n\n### ${t.agent} answered\n\n${u.answer.trim()}`)
           .join('\n\n')
       : '')
@@ -983,6 +1054,8 @@ function acts($: EngineInterface): Acts {
     crewOpen: key => void update($, crewOpenTurn, cur => (cur === key ? null : key)),
     noteRemove: (folder, id) => void removeNote($, folder, id),
     noteApprove: (folder, id) => void approveNote($, folder, id),
+    toggleOptions: () => void update($, crewOptions, x => !x),
+    finishTour: () => void finishTour($),
     showAllThreads: () => void update($, crewShowAll, x => !x),
     showAllTurns: name => void update($, crewAllTurns, cur => (cur === name ? null : name)),
     openNote: file => void openPath($, `obsidian://open?path=${encodeURIComponent(file)}`),
@@ -999,6 +1072,9 @@ export const register: Register = on => {
     const savedModels = (await $.store.get('models')) as { codex: string[]; agy: string[] } | undefined
     if (Array.isArray(savedThreads) && (await read($, threads)).length === 0) await update($, threads, () => savedThreads)
     if (savedModels?.codex && savedModels.agy) await update($, crewModels, () => savedModels)
+    // the first-run tour shows until it is dismissed once
+    await update($, toured, () => false)
+    if ((await $.store.get('toured')) === true) await update($, toured, () => true)
     const savedNotes = (await $.store.get('notebooks')) as Record<string, CrewNote[]> | undefined
     if (savedNotes && typeof savedNotes === 'object') await update($, notebooks, () => savedNotes)
     await openVault($).catch(() => undefined)
@@ -1050,7 +1126,13 @@ export const register: Register = on => {
     if (name === 'mcp__fleet__crew_read') return answerCrewRead($, e as unknown as Args)
     if (name === 'mcp__fleet__crew_note') return answerCrewNote($, e as unknown as Args)
     if (name === 'mcp__fleet__crew_save') return answerCrewSave($, e as unknown as Args)
+    if (name === 'mcp__fleet__fleet_read') return answerFleetRead($, e as unknown as Args)
     return next(e)
+  }).catch(($, e, next) => {
+    // fail safe: FLEET's own tool reports the failure; every other tool goes on untouched
+    const name: string = e.tool
+    if (next.called) return next(e)
+    return name.startsWith('mcp__fleet__') ? { deny: 'FLEET could not answer this tool call; try again.' } : next(e)
   })
 
   on('command.run', { command: 'crew' }, async ($, e) => ({ text: await crewCommand($, e.args) }))
@@ -1124,7 +1206,7 @@ export const register: Register = on => {
       const cFolder = (await read($, crewFolder)) ?? sessionCwd
       const shortPath = (f: string) => f.replace(/^\/home\/[^/]+/, '~')
       const pickers =
-        Select && !target ? (
+        Select && !target && (await read($, crewOptions)) ? (
           <Box flexDirection="row" columnGap={2} flexWrap="wrap">
             <Select
               key="crew-model"
@@ -1215,6 +1297,9 @@ export const register: Register = on => {
               launcher,
               crewOpenTurn: await read($, crewOpenTurn),
               crewShowAll: await read($, crewShowAll),
+              crewOptions: await read($, crewOptions),
+              crewSummary: `${cModel} · ${cEffort} effort · ${shortPath(cFolder)}`,
+              toured: await read($, toured),
               crewAllTurns: await read($, crewAllTurns),
               notebook: {
                 file: vaultDir ? notebookPath(vaultDir, target?.cwd ?? cFolder) : '',

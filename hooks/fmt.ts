@@ -72,3 +72,15 @@ export const clock = (epoch: number): string => {
     .map(n => String(n).padStart(2, '0'))
     .join(':')
 }
+
+/** What a session is up to, in a few words. */
+export function activity(s: Session): string {
+  const tool = s.tools[s.tools.length - 1]
+  if (s.phase === 'error') return 'last turn ended on an API error'
+  if (needsYou(s)) return tool ? `${tool.tool}: ${tool.detail}` : 'waiting for your permission'
+  if (tool) return `› ${tool.tool} ${tool.detail}`
+  if (s.phase === 'thinking') return 'thinking…'
+  if (s.phase === 'compacting') return 'compacting its context…'
+  return s.phase === 'ready' ? 'ready' : 'idle'
+}
+

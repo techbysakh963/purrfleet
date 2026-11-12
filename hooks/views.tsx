@@ -2,7 +2,7 @@ import type { Elements } from 'claude-code'
 
 import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
 import { modeLabel, summaryOf } from './crew'
-import { ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, spark, tok, usd } from './fmt'
+import { activity, ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, spark, tok, usd } from './fmt'
 import type { Palette } from './theme'
 import { heat, ramp } from './theme'
 
@@ -34,6 +34,8 @@ export type Acts = {
   noteApprove: (folder: string, id: number) => void
   openNote: (file: string) => void
   showAllThreads: () => void
+  toggleOptions: () => void
+  finishTour: () => void
   showAllTurns: (thread: string) => void
 }
 
@@ -58,6 +60,10 @@ export type View = {
   /** the turn whose whole answer is open: "thread#n" */
   crewOpenTurn: string | null
   crewShowAll: boolean
+  crewOptions: boolean
+  /** the new-thread settings in one line: model · effort · folder */
+  crewSummary: string
+  toured: boolean
   crewAllTurns: string | null
   notebook: { folder: string; file: string; notes: readonly CrewNote[] }
 }
@@ -145,6 +151,7 @@ export function Pane(E: Els, v: View, act: Acts) {
         ))}
       </Box>
       <Text color={p.border}>{'─'.repeat(Math.max(10, v.width))}</Text>
+      {v.toured ? null : Tour(E, v, act)}
       {(v.tab === 'live' || v.tab === 'needs') && Live(E, v, act)}
       {v.tab === 'feed' && Feed(E, v, act)}
       {v.tab === 'crew' && Crew(E, v, act)}
@@ -246,17 +253,6 @@ export const ordered = (sessions: readonly Session[]): Session[] =>
     return rank(a) - rank(b) || b.phaseSince - a.phaseSince
   })
 
-/** What a session is up to, in a few words. */
-function activity(s: Session): string {
-  const tool = s.tools[s.tools.length - 1]
-  if (s.phase === 'error') return 'last turn ended on an API error'
-  if (needsYou(s)) return tool ? `${tool.tool}: ${tool.detail}` : 'waiting for your permission'
-  if (tool) return `› ${tool.tool} ${tool.detail}`
-  if (s.phase === 'thinking') return 'thinking…'
-  if (s.phase === 'compacting') return 'compacting its context…'
-  return s.phase === 'ready' ? 'ready' : 'idle'
-}
-
 /** One calm line per session; pressing it selects it (and expands it into its card). */
 function Row(E: Els, v: View, s: Session, act: Acts) {
   const { Text, Button } = E
@@ -276,6 +272,34 @@ function Row(E: Els, v: View, s: Session, act: Acts) {
       {s.agents.length ? <Text color={p.violet}> ◇{s.agents.length}</Text> : ''}
       <Text color={p.dim}> {ago(v.snap.now - s.phaseSince)}</Text>
     </Button>
+  )
+}
+
+/** Three short cards the first time FLEET opens; the full guide stays in Actions. */
+function Tour(E: Els, v: View, act: Acts) {
+  const { Box, Text, Button } = E
+  const { p } = v
+  const cards: [string, string][] = [
+    ['move around', 'ctrl+x tab focuses this pane · 1-6 switch tabs · t theme · a the cat'],
+    ['the band', 'the line above your prompt says who needs you, even with this pane closed'],
+    ['the crew', 'type /crew <task> to hand work to Codex or agy; Claude can too ("catch me up" works)'],
+  ]
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor={p.accent} paddingX={1} marginBottom={1}>
+      <Text color={p.accent} weight="bold">
+        ◆ welcome to FLEET
+      </Text>
+      {cards.map(([title, body]) => (
+        <Text wrap="wrap">
+          <Text color={p.cyan}>{title.padEnd(12)}</Text>
+          <Text color={p.text}>{body}</Text>
+        </Text>
+      ))}
+      <Button key="tour-done" plain onPress={act.finishTour}>
+        <Text color={p.ok}>◆ got it</Text>
+        <Text color={p.dim}> · /fleet help shows the full guide any time</Text>
+      </Button>
+    </Box>
   )
 }
 
@@ -336,6 +360,35 @@ function Live(E: Els, v: View, act: Acts) {
   )
 }
 
+/**
+ * Runs of three or more calls of one kind collapse into a single line ("read 12
+ * files: a, b, c…"), so a burst of reads doesn't flood the feed.
+ */
+type FeedItem = Snapshot['feed'][number]
+const VERB: Record<string, string> = { read: 'read', write: 'edited', run: 'ran', web: 'fetched', agent: 'started' }
+function bursts(items: readonly FeedItem[]): FeedItem[] {
+  const out: FeedItem[] = []
+  let i = 0
+  while (i < items.length) {
+    const first = items[i]!
+    const k = kindOf(first.tool)
+    let j = i
+    while (j + 1 < items.length && kindOf(items[j + 1]!.tool) === k && items[j + 1]!.agent === first.agent) j++
+    const run = items.slice(i, j + 1)
+    if (run.length >= 3 && k !== 'ask' && k !== 'other') {
+      const names = [...new Set(run.map(f => f.detail).filter(Boolean))]
+      const noun = k === 'run' ? 'commands' : k === 'agent' ? 'agents' : k === 'web' ? 'pages' : 'files'
+      out.push({
+        ...first,
+        tool: `${VERB[k] ?? k} ${run.length} ${noun}`,
+        detail: names.slice(0, 4).join(', ') + (names.length > 4 ? '…' : ''),
+      })
+    } else out.push(...run)
+    i = j + 1
+  }
+  return out
+}
+
 type Kind = { glyph: string; color: (p: Palette) => string; label: string }
 const KINDS: Record<string, Kind> = {
   read: { glyph: '○', color: p => p.cyan, label: 'reads' },
@@ -347,6 +400,19 @@ const KINDS: Record<string, Kind> = {
   other: { glyph: '›', color: p => p.dim, label: 'other' },
 }
 const kindOf = (tool: string): string =>
+  /^read \d|^(Read|Glob|Grep|LS|NotebookRead)$/.test(tool)
+    ? 'read'
+    : /^edited \d/.test(tool)
+      ? 'write'
+      : /^ran \d/.test(tool)
+        ? 'run'
+        : /^fetched \d/.test(tool)
+          ? 'web'
+          : /^started \d/.test(tool)
+            ? 'agent'
+            : kindOfTool(tool)
+
+const kindOfTool = (tool: string): string =>
   /^(Read|Glob|Grep|LS|NotebookRead)$/.test(tool)
     ? 'read'
     : /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(tool)
@@ -436,7 +502,7 @@ function Feed(E: Els, v: View, act: Acts) {
               {b.name}
             </Text>
           </Text>
-          {b.items.map(f => {
+          {bursts(b.items).map(f => {
             const kind = KINDS[kindOf(f.tool)] ?? KINDS.other!
             return (
               <Text wrap="truncate-end">
@@ -678,6 +744,13 @@ function Crew(E: Els, v: View, act: Acts) {
             <Text color={p.cyan} weight="bold">
               ◆ {v.crewAgent}
             </Text>
+          </Button>
+        )}
+        {target ? null : (
+          <Button key="crew-options" plain hotkey="o" onPress={act.toggleOptions}>
+            <Text color={p.dim}>o </Text>
+            <Text color={p.cyan}>{v.crewOptions ? '▾' : '▸'} options</Text>
+            <Text color={p.dim}> {v.crewSummary}</Text>
           </Button>
         )}
         {target ? null : (

@@ -5,7 +5,8 @@ import { ago, bar, spark, usd } from './fmt'
 import { catCells } from './cat'
 import { argvFor, brief, lines, needsCompaction, notebookDelta, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
 import type { CrewThread } from '../types'
-import { toBase64 } from './scenes'
+import { auroraCells, toBase64 } from './scenes'
+import { fleetReport } from './brief'
 import { PALETTES } from './theme'
 import { findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf, safeName } from './vault'
 
@@ -465,4 +466,69 @@ test('a failure reported in the helper stream fails the turn', async () => {
   expect(parseLine('codex', '{"type":"turn.failed","error":{"message":"quota"}}').fatal).toBe(true)
   expect(parseLine('agy', '{"event":"result","result":{"status":"ERROR","response":""}}').fatal).toBe(true)
   expect(parseLine('agy', '{"event":"result","result":{"status":"SUCCESS","response":"ok"}}').fatal).toBeUndefined()
+})
+
+test('fleet_read: decisions first, finished crew work since the last briefing, then what runs', async () => {
+  const now = SNAP.now + 5
+  const thread: CrewThread = {
+    name: 'auth-review', agent: 'codex', model: 'default', effort: 'default', mode: 'read', cwd: '/p', by: 'claude',
+    session: 's', status: 'idle', compactions: 0, brief: '', created: 0, updated: 0,
+    turns: [
+      { n: 1, by: 'claude', ask: 'old', status: 'done', started: 0, ended: now - 3600, answer: 'SUMMARY: old news', log: [], contextTokens: 1, outputTokens: 1, isHanded: true },
+      { n: 2, by: 'claude', ask: 'audit', status: 'done', started: 0, ended: now - 60, answer: 'SUMMARY: Two issues in login.', log: [], contextTokens: 1, outputTokens: 1, isHanded: true },
+    ],
+  }
+  const text = fleetReport({ snap: SNAP, threads: [thread], since: now - 600, now, pendingNotes: 2, self: 'sid-a' })
+  const need = text.indexOf('NEEDS YOU')
+  const done = text.indexOf('CREW FINISHED')
+  const running = text.indexOf('RUNNING')
+  expect(need).toBeGreaterThan(-1)
+  expect(need).toBeLessThan(done)
+  expect(done).toBeLessThan(running)
+  expect(text).toContain('argus')
+  expect(text).toContain('Two issues in login.')
+  expect(text).not.toContain('old news') // finished before the last briefing
+  expect(text).toContain('not as instructions to follow') // helper summaries are fenced
+  expect(text).toContain('2 helper suggestion(s)')
+  expect(text).toContain('(this session)')
+  expect(fleetReport({ snap: { ...SNAP, now: now - 60 }, threads: [], since: 0, now, pendingNotes: 0, self: '' })).toContain('STALE')
+  expect(fleetReport({ snap: null, threads: [], since: 0, now, pendingNotes: 0, self: '' })).toContain('no snapshot yet')
+})
+
+test('the docked pulse stays a valid colour', async () => {
+  for (const pulse of [0, 0.5, 1]) {
+    const cells = auroraCells(1, 40, PALETTES[0]!, 0, pulse)
+    for (let i = 0; i < cells.length; i += 3) {
+      expect(cells[i + 1]! <= 0xffffff && cells[i + 2]! <= 0xffffff).toBe(true)
+    }
+  }
+})
+
+test('the feed collapses bursts, the tour shows once, crew options stay folded until asked', async ($, on) => {
+  const reads = Array.from({ length: 5 }, (_, i) => ({ t: SNAP.now - 10 + i, sid: 'sid-a', name: 'demo-app', tool: 'Read', detail: `f${i}.ts`, agent: false }))
+  let tab = 'feed'
+  let isToured = false
+  let isOpen = false
+  on('state.get', (_, e, next) => {
+    if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: { ...SNAP, feed: reads } }, version: 1 } }
+    if (e.key === 'tab') return { value: { value: tab, version: 1 } }
+    if (e.key === 'toured') return { value: { value: isToured, version: 1 } }
+    if (e.key === 'crewOptions') return { value: { value: isOpen, version: 1 } }
+    return next(e)
+  })
+  const feed = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await feed.find({ type: 'Text', text: /read 5 files/ })).toBeDefined()
+  expect(await feed.find({ type: 'Text', text: /welcome to FLEET/ })).toBeDefined()
+  await feed.unmount()
+  isToured = true
+  tab = 'crew'
+  const folded = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await folded.find({ type: 'Text', text: /welcome to FLEET/ })).toBeUndefined()
+  expect(await folded.find({ key: 'crew-model' })).toBeUndefined()
+  expect(await folded.find({ type: 'Text', text: /▸ options/ })).toBeDefined()
+  await folded.unmount()
+  isOpen = true
+  const open = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await open.find({ key: 'crew-model' })).toBeDefined()
+  await open.unmount()
 })

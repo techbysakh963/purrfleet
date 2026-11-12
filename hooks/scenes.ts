@@ -31,7 +31,7 @@ function fill(px: Px, f: (x: number, y: number) => [number, number, number]): vo
 }
 
 /** One 1-row-tall aurora ribbon for the pane's header; always gently moving. */
-function aurora(px: Px, t: number, p: Palette, busy: number): void {
+function aurora(px: Px, t: number, p: Palette, busy: number, pulse = 0): void {
   const [vr, vg, vb] = rgb(p.void)
   const [ar, ag, ab] = rgb(p.glowA)
   const [br, bg, bb] = rgb(p.glowB)
@@ -39,7 +39,9 @@ function aurora(px: Px, t: number, p: Palette, busy: number): void {
   fill(px, (x, y) => {
     const u = x / px.w
     const wave = (Math.sin(u * 9 - t * speed * 2) + Math.sin(u * 23 + t * speed * 1.3) * 0.5 + 1.5) / 3
-    const k = Math.max(0, wave - (y === 0 ? 0.15 : 0)) * 0.95
+    // the docked pulse: a bright sweep across the ribbon that fades out
+    const sweep = pulse > 0 ? Math.max(0, 1 - Math.abs(u - (1 - pulse)) * 6) * pulse : 0
+    const k = Math.min(1.4, Math.max(0, wave - (y === 0 ? 0.15 : 0)) * 0.95 + sweep * 0.9)
     const m = (Math.sin(u * 4 + t * 0.4) + 1) / 2
     return [
       vr + (ar + (br - ar) * m - vr) * k,
@@ -75,9 +77,9 @@ function toCells(px: Px): Uint32Array {
   return out
 }
 
-export function auroraCells(t: number, cols: number, p: Palette, busy: number): Uint32Array {
+export function auroraCells(t: number, cols: number, p: Palette, busy: number, pulse = 0): Uint32Array {
   const px = newPx(cols, 2)
-  aurora(px, t, p, busy)
+  aurora(px, t, p, busy, pulse)
   return toCells(px)
 }
 

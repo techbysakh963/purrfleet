@@ -168,6 +168,8 @@ declare module 'claude-code' {
       crewDraft: string
       crewInputGen: number
       crewShowAll: boolean
+      crewOptions: boolean
+      toured: boolean
       crewAllTurns: string | null
       notebooks: Record<string, CrewNote[]>
     }
