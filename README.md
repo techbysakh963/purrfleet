@@ -52,5 +52,10 @@ by `bin/fleet_scan.py`. Cost is an estimate at API list prices (`PRICES` in that
 
 ## Develop
 
-`dev/preview-cat.sh` renders the cat's moods to `dev/out/cat.png` from the real module.
-`claude plugin validate .`, `claude plugin test .`.
+This folder is both the repository and the installed plugin's source (marketplace `purrfleet`,
+installed as `fleet@purrfleet`): edit here, then `/reload-plugins` in Claude Code.
+
+- `claude plugin validate .` and `claude plugin test .`
+- type-check: `tsc -p .dev/tsconfig.json` (`.dev/` is ignored by git and holds the engine's type
+  files copied out of a loaded session)
+- `dev/preview-cat.sh` renders the cat's moods to `dev/out/cat.png` from the real module

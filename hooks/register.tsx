@@ -52,6 +52,7 @@ const crewModels = atom({ plugin: 'fleet', key: 'crewModels' } as const, { codex
 const crewFolder = atom({ plugin: 'fleet', key: 'crewFolder' } as const, null)
 const crewOpenTurn = atom({ plugin: 'fleet', key: 'crewOpenTurn' } as const, null)
 const notebooks = atom({ plugin: 'fleet', key: 'notebooks' } as const, {})
+const crewDraft = atom({ plugin: 'fleet', key: 'crewDraft' } as const, '')
 
 // Module variables start over on a reload; everything drawn lives in $.state.
 let self = ''
@@ -667,6 +668,7 @@ async function toggleCrewMode($: EngineInterface): Promise<void> {
 async function launchFromPane($: EngineInterface, task: string): Promise<void> {
   const text = task.trim()
   if (!text) return
+  await update($, crewDraft, () => '')
   const sel = await read($, crewSel)
   const current = sel ? await findThread($, sel) : undefined
   const agent = await read($, crewAgent)
@@ -860,6 +862,13 @@ export const register: Register = on => {
             />
           </Box>
         ) : null
+      // the box grows with what you type, 1 to 8 rows, then scrolls within
+      const draft = await read($, crewDraft)
+      const boxWidth = Math.max(10, width - 6 - (target ? target.name.length + 4 : 18))
+      const draftRows = Math.max(
+        1,
+        Math.min(8, draft.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / boxWidth)), 0)),
+      )
       const launcher = Input ? (
         <Box flexDirection="column">
           {pickers}
@@ -869,7 +878,9 @@ export const register: Register = on => {
               label={target ? `▸ ${target.name} ` : `▸ new ${cAgent} thread `}
               placeholder={target ? 'follow up in this thread…' : 'describe a task, then enter…'}
               submitLabel="send"
-              rows={4}
+              value={draft}
+              rows={draftRows}
+              onInput={value => void update($, crewDraft, () => value)}
               onSubmit={value => actions.crewLaunch(value)}
             />
           </Box>

@@ -159,6 +159,7 @@ declare module 'claude-code' {
       crewModels: { codex: string[]; agy: string[] }
       crewFolder: string | null
       crewOpenTurn: string | null
+      crewDraft: string
       notebooks: Record<string, CrewNote[]>
     }
   }

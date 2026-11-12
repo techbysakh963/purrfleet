@@ -2,3 +2,4 @@ dev/.build/
 dev/out/
 .claude-plugin/types/
 __pycache__/
+.dev/
