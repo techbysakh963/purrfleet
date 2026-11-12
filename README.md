@@ -41,6 +41,11 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   WORKING (busy sessions, running crew threads), QUIET. Rows hold still inside a group. Press a
   session to expand it, a crew row to open it in Crew. A small cat beside them naps, works or
   panics with the fleet. The band and `fleet_read` show the same list. Nothing starts expanded.
+- Every list is one grid: mark · who · what · age. Press a row and its detail opens beneath it
+  behind a rail (a session's model, context, cost, folder, recent calls, agents, then copy id ·
+  copy folder · open transcript · stop). A crew thread opens to its last answer as SUMMARY,
+  KEY POINTS and CONFIDENCE. The band reads like the Live headline and spells out the first thing
+  that needs you.
 - One mark per state, everywhere: ▲ needs you · × failed · ◆ to read · ● working · ○ quiet.
   Buttons are plain words; the tab or filter you're on is bold and underlined.
 - Notices: threads Claude started that finish together reach Claude as one notice (it waits up to

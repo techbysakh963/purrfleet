@@ -1389,7 +1389,7 @@ export const register: Register = on => {
               crewOpenTurn: await read($, crewOpenTurn),
               crewShowAll: await read($, crewShowAll),
               crewOptions: await read($, crewOptions),
-              crewSummary: `${cModel} · ${cEffort} effort · ${shortPath(cFolder)}`,
+              crewSummary: [shortPath(cFolder), cModel !== 'default' ? cModel : '', cEffort !== 'default' ? `${cEffort} effort` : ''].filter(Boolean).join(' · '),
               toured: await read($, toured),
               crewAllTurns: await read($, crewAllTurns),
               notebook: {
@@ -1434,12 +1434,7 @@ export const register: Register = on => {
     const list = await read($, threads)
     // the same inbox the Live tab draws: a failure stays on the band until someone looks
     const items = inbox(s.sessions, list, await read($, notebooks))
-    const crewNow = {
-      running: list.filter(t => t.status === 'running').length,
-      failed: items.filter(x => x.kind === 'turn' && x.group === 'need').length,
-      toRead: items.filter(x => x.group === 'read').length,
-    }
     const age = Math.max(0, Math.round(Date.now() / 1000 - s.now))
-    return Band($.ui.resolve(e), s, paletteOf(await read($, theme)), { age, isStale: age > 6 || (await read($, error)) !== null, crew: crewNow })
+    return Band($.ui.resolve(e), s, paletteOf(await read($, theme)), { age, isStale: age > 6 || (await read($, error)) !== null, items })
   })
 }

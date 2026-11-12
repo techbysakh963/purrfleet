@@ -8,6 +8,7 @@ import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { fleetReport } from './brief'
 import { inbox, tally } from './inbox'
+import { age, fitWho, sections } from './views'
 import { PALETTES } from './theme'
 import { findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf, safeName } from './vault'
 
@@ -122,15 +123,16 @@ test('with a snapshot the pane and band show sessions, agents and who needs you'
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await ui.find({ key: 's-sid-a' })).toBeDefined()
-    // argus needs you, so it leads, expanded; demo-app is one calm row
-    expect(await ui.find({ type: 'Text', text: /› Edit main.rs/ })).toBeDefined()
+    // argus needs you, so it leads; the pressed row opens its detail on a rail beneath it
+    expect(await ui.find({ type: 'Text', text: /Edit main.rs/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /NEEDS YOU/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /⌥ main/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /context \d+%/ })).toBeDefined()
+    expect(await ui.find({ key: 'a-id' })).toBeDefined() // the row's actions sit on the row
     if (surface === 'terminal') expect(await ui.find({ key: 'hero' })).toBeDefined()
     await ui.unmount()
 
     const band = await $.ui.mount({ ...BAND, surface })
-    expect(await band.find({ type: 'Text', text: /argus needs you/ })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: /argus: / })).toBeDefined()
     await band.unmount()
   }
 })
@@ -231,8 +233,8 @@ test('the Crew and System tabs draw threads and process groups', async ($, on) =
     const crew = await $.ui.mount({ ...PANE, surface })
     expect(await crew.find({ type: 'Text', text: /auth-review/ })).toBeDefined()
     expect(await crew.find({ type: 'Text', text: /Two issues/ })).toBeDefined()
-    expect(await crew.find({ type: 'Text', text: /hide full answer/ })).toBeDefined()
-    expect(await crew.find({ type: 'Text', text: /shared notebook/ })).toBeDefined()
+    expect(await crew.find({ type: 'Text', text: /show the summary/ })).toBeDefined()
+    expect(await crew.find({ type: 'Text', text: /NOTEBOOK/ })).toBeDefined()
     await crew.unmount()
     tab = 'system'
     const system = await $.ui.mount({ ...PANE, surface })
@@ -435,14 +437,14 @@ test('the band shows crew counts and says when data is stale; old threads and tu
     return next(e)
   })
   const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await band.find({ type: 'Text', text: /crew 1 running/ })).toBeDefined()
-  expect(await band.find({ type: 'Text', text: /1 failed/ })).toBeDefined()
-  expect(await band.find({ type: 'Text', text: /stale/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /working/ })).toBeDefined() // a running helper counts as working
+  expect(await band.find({ type: 'Text', text: /› t2 failed/ })).toBeDefined() // spelled out: helper › thread
+  expect(await band.find({ type: 'Text', text: /data \d+s old/ })).toBeDefined()
   await band.unmount()
   const crew = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await crew.find({ type: 'Text', text: /^NEW$/ })).toBeDefined()
   expect(await crew.find({ type: 'Text', text: /7 threads you've seen/ })).toBeDefined() // seen threads fold away
-  expect(await crew.find({ type: 'Text', text: /show all 6 messages/ })).toBeDefined()
+  expect(await crew.find({ type: 'Text', text: /5 earlier turns/ })).toBeDefined()
   expect(await crew.find({ type: 'Text', text: /data is \d+s old/ })).toBeDefined()
   await crew.unmount()
 })
@@ -522,12 +524,12 @@ test('the feed collapses bursts, the tour shows once, crew options stay folded u
   })
   const feed = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await feed.find({ type: 'Text', text: /read 5 files/ })).toBeDefined()
-  expect(await feed.find({ type: 'Text', text: /welcome to FLEET/ })).toBeDefined()
+  expect(await feed.find({ type: 'Text', text: /WELCOME TO FLEET/ })).toBeDefined()
   await feed.unmount()
   isToured = true
   tab = 'crew'
   const folded = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await folded.find({ type: 'Text', text: /welcome to FLEET/ })).toBeUndefined()
+  expect(await folded.find({ type: 'Text', text: /WELCOME TO FLEET/ })).toBeUndefined()
   expect(await folded.find({ key: 'crew-model' })).toBeUndefined()
   expect(await folded.find({ type: 'Text', text: /▸ options/ })).toBeDefined()
   await folded.unmount()
@@ -632,4 +634,15 @@ test('parallel helpers Claude started come back as one notice, naming only threa
   expect(text).toContain('Still running: "slow"')
   expect(text).not.toContain('ignore the user') // a helper's words never reach the prompt
   expect(batchNotice([{ name: 'gone', n: 1 }], threads)).toBe('')
+})
+
+test('the grid: answers keep their shape, helper names are cut thread-first, ages fit four columns', async () => {
+  const sec = sections('SUMMARY: Two issues.\nmore detail\nKEY POINTS:\n- **race** in sync\n2. stale cache\nCONFIDENCE: medium\nDETAILS:\nlong text')
+  expect(sec.summary).toBe('Two issues. more detail')
+  expect(sec.points).toEqual(['**race** in sync', 'stale cache'])
+  expect(sec.confidence).toBe('medium')
+  expect(sections('just text').summary.length).toBeGreaterThan(0)
+  expect(fitWho('codex › a-very-long-thread-name', 16).startsWith('codex › ')).toBe(true)
+  expect(fitWho('codex › a-very-long-thread-name', 16).length).toBeLessThanOrEqual(16)
+  for (const s of [5, 59, 61, 3599, 7200, 90_000, 9_000_000]) expect(age(s).length).toBeLessThanOrEqual(4)
 })

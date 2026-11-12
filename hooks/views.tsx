@@ -1,7 +1,7 @@
 import type { Elements } from 'claude-code'
 
 import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
-import { modeLabel, summaryOf } from './crew'
+import { NOTEBOOK_CAP, modeLabel, summaryOf } from './crew'
 import { activity, ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, spark, tok, usd } from './fmt'
 import type { Group, Item } from './inbox'
 import { inbox, tally } from './inbox'
@@ -164,6 +164,7 @@ export function Pane(E: Els, v: View, act: Acts) {
                 <Text color={p.dim}>{t.label}</Text>
               )}
               {t.tab === 'live' && count.need > 0 ? <Text color={need.color}> {need.glyph}{count.need}</Text> : ''}
+              {t.tab === 'live' && count.read > 0 ? <Text color={read.color}> {read.glyph}{count.read}</Text> : ''}
               {t.tab === 'crew' && crewBusy > 0 ? <Text color={work.color}> {work.glyph}{crewBusy}</Text> : ''}
               {t.tab === 'crew' && unread > 0 ? <Text color={read.color}> {read.glyph}{unread}</Text> : ''}
             </Button>
@@ -190,76 +191,158 @@ export function Pane(E: Els, v: View, act: Acts) {
   )
 }
 
-function Card(E: Els, v: View, s: Session, act: Acts) {
+// ── the grid: every list in FLEET is rows of mark · who · what · age ──────────
+
+type Mark = { glyph: string; color: string }
+
+/** The `who` column: 22 wide where there is room, 16 below. One rule for every row. */
+const whoWidth = (width: number): number => (width >= 84 ? 22 : 16)
+
+/** A helper is "agent › thread"; when it must be cut, the thread name goes first, never the agent. */
+export function fitWho(who: string, max: number): string {
+  if (who.length <= max) return who
+  const i = who.indexOf(' › ')
+  if (i > 0 && i + 4 < max) return `${who.slice(0, i + 3)}${cut(who.slice(i + 3), max - i - 3)}`
+  return cut(who, max)
+}
+
+/** One row of the grid. Colour lives in the mark alone; `what` is plain text (dim when quiet). */
+function GridRow(
+  E: Els,
+  v: View,
+  o: { key: string; m: Mark; who: string; what: string; age?: string; quiet?: boolean; press?: () => void },
+) {
+  const { Text, Button } = E
+  const { p } = v
+  const ww = whoWidth(v.width)
+  const age = o.age ?? ''
+  const room = Math.max(8, v.width - 2 - ww - 5)
+  const body = [
+    <Text color={o.m.color}>{o.m.glyph} </Text>,
+    <Text color={o.quiet ? p.dim : p.text}>{fitWho(o.who, ww - 1).padEnd(ww)}</Text>,
+    <Text color={o.quiet ? p.dim : p.text}>{cut(o.what.replace(/\s+/g, ' '), room).padEnd(room)}</Text>,
+    <Text color={p.dim}> {age.padStart(4)}</Text>,
+  ]
+  return o.press ? (
+    <Button key={o.key} plain onPress={o.press}>
+      {body}
+    </Button>
+  ) : (
+    <Text wrap="truncate-end">{body}</Text>
+  )
+}
+
+/** Detail hangs under its row behind a rail in the row's colour: no boxes, so nothing moves. */
+function Rail(E: Els, color: string, lines: readonly (Node | null)[]) {
+  const { Box, Text } = E
+  return (
+    <Box flexDirection="column">
+      {lines
+        .filter(x => x !== null)
+        .map(line => (
+          <Box flexDirection="row">
+            <Text color={color}>{'  │ '}</Text>
+            <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+              {line}
+            </Box>
+          </Box>
+        ))}
+    </Box>
+  )
+}
+
+/** A short age for the right edge: 12s, 4m, 3h, 2d. Never wider than four columns. */
+export const age = (seconds: number): string => {
+  const s = Math.max(0, Math.round(seconds))
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86_400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86_400)}d`
+}
+
+/** Helper answers are markdown; on the grid, bold markers are noise. */
+const plain = (text: string): string => text.replace(/\*\*(.+?)\*\*/g, '$1').replace(/__(.+?)__/g, '$1')
+
+/** A labelled rail line: "session   opus · context 62% · …". */
+function Labeled(E: Els, v: View, label: string, value: Node | string, wrap = false) {
+  const { Text } = E
+  const { p } = v
+  return (
+    <Text wrap={wrap ? 'wrap' : 'truncate-end'}>
+      <Text color={p.dim}>{label.padEnd(14)}</Text>
+      {typeof value === 'string' ? <Text color={p.text}>{value}</Text> : value}
+    </Text>
+  )
+}
+
+/** Plain-word actions on one line: the last line of whatever they act on. */
+function ActionLine(E: Els, v: View, items: ({ key: string; label: string; color?: string; hotkey?: string; press: () => void } | null)[]) {
   const { Box, Text, Button } = E
   const { p } = v
-  const look = phaseLook(s.phase, p)
-  const pct = ctxPct(s)
-  const tool = s.tools[s.tools.length - 1]
-  const isSel = s.sid === v.selected
-  const w = Math.max(30, v.width - 4)
-  const m = sessionMark(v, s)
-  const border = needsYou(s) ? m.color : isBusy(s) ? p.accent : p.border
-
+  const list = items.filter(x => x !== null)
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={border} paddingX={1}>
-      <Box flexDirection="row" justifyContent="space-between">
-        <Button key={`s-${s.sid}`} plain onPress={() => act.select(s.sid)}>
-          <Text color={m.color}>{m.glyph} </Text>
-          <Text color={p.text} weight="bold">
-            {cut(s.name, Math.max(10, w - 24))}
-          </Text>
-          {s.sid === v.self ? <Text color={p.dim}> · here</Text> : ''}
-        </Button>
-        <Text>
-          <Text color={look.color} weight="bold">
-            {look.label}
-          </Text>
-          <Text color={p.dim}> {ago(v.snap.now - s.phaseSince)}</Text>
-        </Text>
-      </Box>
-      <Text wrap="truncate-end">
-        <Text color={p.dim}>[ </Text>
-        <Text color={p.cyan}>{s.model}</Text>
-        <Text color={p.dim}> ] </Text>
-        {Gauge(E, pct, 10, p)}
-        <Text color={heat(pct / 100, p)}> {pct}%</Text>
-        <Text color={p.dim}> ctx</Text>
-        {Sep(E, p)}
-        <Text color={p.gold}>{usd(s.cost)}</Text>
-        {Sep(E, p)}
-        <Text color={p.dim}>{hms(v.snap.now - s.startedAt)}</Text>
-        {s.branch ? Sep(E, p) : ''}
-        {s.branch ? <Text color={p.violet}>⌥ {cut(s.branch, 18)}</Text> : ''}
-        {s.added || s.removed ? Sep(E, p) : ''}
-        {s.added ? <Text color={p.ok}>+{s.added} </Text> : ''}
-        {s.removed ? <Text color={p.bad}>−{s.removed}</Text> : ''}
-      </Text>
-      {needsYou(s) ? (
-        <Text color={look.color} wrap="wrap">
-          {look.glyph} {activity(s)}
-        </Text>
-      ) : null}
-      {tool && !needsYou(s) ? (
-        <Text wrap="truncate-end">
-          <Text color={p.accent}>› </Text>
-          <Text color={p.cyan} weight="bold">
-            {tool.tool}
-          </Text>
-          <Text color={p.dim}> {cut(tool.detail, w - tool.tool.length - 4)}</Text>
-        </Text>
-      ) : null}
-      {s.agents.map((a, i) => (
-        <Text wrap="truncate-end">
-          <Text color={p.border}>{i === s.agents.length - 1 ? '└─' : '├─'}</Text>
-          <Text color={p.violet}>{a.type}</Text>
-          <Text color={p.dim}>
-            {' '}
-            {ago(v.snap.now - a.since)}
-            {a.tokens ? ` · ${tok(a.tokens)}` : ''} · {cut(a.task, Math.max(8, w - a.type.length - 20))}
-          </Text>
-        </Text>
-      ))}
+    <Box flexDirection="row" flexWrap="wrap">
+      {list.flatMap((x, i) => [
+        i ? <Text color={p.dim}> · </Text> : null,
+        <Button key={x.key} plain {...(x.hotkey ? { hotkey: x.hotkey } : {})} onPress={x.press}>
+          <Text color={x.color ?? p.text}>{x.label}</Text>
+        </Button>,
+      ])}
+    </Box>
+  )
+}
+
+const sessionWhat = (s: Session): string =>
+  activity(s) + (s.agents.length ? ` · ${s.agents.length} agent${s.agents.length === 1 ? '' : 's'}` : '')
+
+/** A session's row; opened, its detail and actions hang under it. */
+function SessionRow(E: Els, v: View, s: Session, act: Acts) {
+  const { Box, Text } = E
+  const { p } = v
+  const m = sessionMark(v, s)
+  const row = GridRow(E, v, {
+    key: `s-${s.sid}`,
+    m,
+    who: s.name + (s.sid === v.self ? ' (here)' : ''),
+    what: sessionWhat(s),
+    age: age(v.snap.now - s.phaseSince),
+    quiet: !needsYou(s) && !isBusy(s),
+    press: () => act.select(s.sid),
+  })
+  if (s.sid !== v.selected) return row
+  const pct = ctxPct(s)
+  const recent = v.snap.feed
+    .filter(f => f.sid === s.sid)
+    .slice(-3)
+    .reverse()
+    .map(f => `${f.tool} ${f.detail}`.trim())
+  const session = (
+    <Text>
+      <Text color={p.text}>{s.model} · context </Text>
+      <Text color={pct >= 80 ? heat(pct / 100, p) : p.text}>{pct}%</Text>
+      <Text color={p.text}> · </Text>
+      <Text color={p.gold}>{usd(s.cost)}</Text>
+      <Text color={p.text}> · up {hms(v.snap.now - s.startedAt)}</Text>
+      {s.branch ? <Text color={p.text}> · {cut(s.branch, 24)}</Text> : ''}
+      {s.added ? <Text color={p.ok}> · +{s.added}</Text> : ''}
+      {s.removed ? <Text color={p.bad}> −{s.removed}</Text> : ''}
+    </Text>
+  )
+  return (
+    <Box flexDirection="column">
+      {row}
+      {Rail(E, m.color, [
+          needsYou(s) ? Labeled(E, v, s.phase === 'error' ? 'error' : 'waiting', activity(s), true) : null,
+          Labeled(E, v, 'session', session),
+          Labeled(E, v, 'folder', s.cwd.replace(/^\/home\/[^/]+/, '~')),
+          recent.length ? Labeled(E, v, 'recent', recent.join(' · ')) : null,
+          ...s.agents.map((a, i) =>
+            Labeled(E, v, i === 0 ? 'agents' : '', `${a.type} · ${age(v.snap.now - a.since)}${a.tokens ? ` · ${tok(a.tokens)} tokens` : ''}${a.task ? ` · ${a.task}` : ''}`),
+          ),
+          ActionLine(E, v, [
+            { key: 'a-id', label: 'copy id', hotkey: 'c', press: () => act.copy(s.sid, 'session id') },
+            { key: 'a-dir', label: 'copy folder', hotkey: 'f', press: () => act.copy(s.cwd, 'folder') },
+            { key: 'a-open', label: 'open transcript', hotkey: 'o', press: () => act.open(s.transcript) },
+            s.sid === v.self ? null : { key: 'a-stop', label: 'stop…', color: p.bad, hotkey: 'x', press: () => act.stop(s) },
+          ]),
+        ])}
     </Box>
   )
 }
@@ -274,45 +357,23 @@ export const ordered = (sessions: readonly Session[]): Session[] =>
     return rank(a) - rank(b) || a.startedAt - b.startedAt || a.sid.localeCompare(b.sid)
   })
 
-/** One calm line per session; pressing it selects it (and expands it into its card). */
-function Row(E: Els, v: View, s: Session, act: Acts) {
-  const { Text, Button } = E
-  const { p } = v
-  const m = sessionMark(v, s)
-  const quiet = !needsYou(s) && !isBusy(s)
-  const tail = `${s.agents.length ? ` +${s.agents.length} agent${s.agents.length === 1 ? '' : 's'}` : ''} ${ago(v.snap.now - s.phaseSince)}`
-  const room = Math.max(8, v.width - 16 - tail.length - 2)
-
-  return (
-    <Button key={`s-${s.sid}`} plain onPress={() => act.select(s.sid)}>
-      <Text color={m.color}>{m.glyph} </Text>
-      <Text color={quiet ? p.dim : p.text}>{cut(s.name, 13).padEnd(14)}</Text>
-      <Text color={s.phase === 'error' ? p.bad : needsYou(s) ? p.warn : quiet ? p.dim : p.cyan}>
-        {cut(activity(s), room).padEnd(room)}
-      </Text>
-      {s.agents.length ? <Text color={p.dim}> +{s.agents.length} agent{s.agents.length === 1 ? '' : 's'}</Text> : ''}
-      <Text color={p.dim}> {ago(v.snap.now - s.phaseSince)}</Text>
-    </Button>
-  )
-}
-
 /** Three short cards the first time FLEET opens; the full guide stays in Actions. */
 function Tour(E: Els, v: View, act: Acts) {
   const { Box, Text, Button } = E
   const { p } = v
   const cards: [string, string][] = [
     ['move around', 'ctrl+x tab focuses this pane · 1-6 switch tabs · t theme · a the cat'],
-    ['the band', 'the line above your prompt says who needs you, even with this pane closed'],
+    ['the marks', '▲ needs you · × failed · ◆ to read · ● working · ○ quiet, the same everywhere'],
     ['the crew', 'type /crew <task> to hand work to Codex or agy; Claude can too ("catch me up" works)'],
   ]
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={p.accent} paddingX={1} marginBottom={1}>
-      <Text color={p.accent} weight="bold">
-        welcome to FLEET
+    <Box flexDirection="column" marginBottom={1}>
+      <Text color={p.text} weight="bold">
+        WELCOME TO FLEET
       </Text>
       {cards.map(([title, body]) => (
         <Text wrap="wrap">
-          <Text color={p.cyan}>{title.padEnd(12)}</Text>
+          <Text color={p.dim}>{title.padEnd(12)}</Text>
           <Text color={p.text}>{body}</Text>
         </Text>
       ))}
@@ -324,68 +385,87 @@ function Tour(E: Els, v: View, act: Acts) {
   )
 }
 
-/** What the whole fleet wants from you, in one line: the inbox's counts. */
-function FleetStatus(E: Els, v: View, count: Record<Group, number>) {
-  const { Text } = E
+/** The headline: what the whole fleet wants from you. The band says the same words. */
+export function headline(items: readonly Item[]): { state: Parameters<typeof mark>[1]; text: string }[] {
+  const count = tally(items)
+  const out: { state: Parameters<typeof mark>[1]; text: string }[] = []
+  if (count.need) out.push({ state: 'need', text: `${count.need} need${count.need === 1 ? 's' : ''} you` })
+  if (count.read) out.push({ state: 'read', text: `${count.read} to read` })
+  if (count.work) out.push({ state: 'work', text: `${count.work} working` })
+  if (out.length === 0) out.push({ state: 'quiet', text: 'all quiet · the cat is napping' })
+  else if (count.quiet) out.push({ state: 'quiet', text: `${count.quiet} quiet` })
+  return out
+}
+
+function Headline(E: Els, v: View, items: readonly Item[], right: Node) {
+  const { Box, Text } = E
   const { p } = v
-  const parts: Node[] = []
-  const add = (state: Parameters<typeof mark>[1], text: string, bold = false) => {
-    const m = mark(v, state)
-    parts.push(
-      <Text color={m.color} weight={bold ? 'bold' : 'regular'}>
-        {m.glyph} {text}
-      </Text>,
-    )
-  }
-  if (count.need) add('need', `${count.need} need${count.need === 1 ? 's' : ''} you`, true)
-  if (count.read) add('read', `${count.read} to read`)
-  if (count.work) add('work', `${count.work} working`)
-  if (!count.need && !count.read && !count.work) add('quiet', 'all quiet · the cat is napping')
-  else if (count.quiet) add('quiet', `${count.quiet} quiet`)
-  parts.push(<Text color={p.gold}>{usd(v.snap.cost.today)} today</Text>)
+  const parts = headline(items)
   return (
-    <Text wrap="truncate-end">
-      {parts.flatMap((x, i) => (i ? [<Text color={p.dim}> · </Text>, x] : [x]))}
-    </Text>
+    <Box flexDirection="row" justifyContent="space-between">
+      <Text wrap="truncate-end">
+        {parts.flatMap((x, i) => {
+          const m = mark(v, x.state)
+          const seg = (
+            <Text color={m.color} weight={x.state === 'need' ? 'bold' : 'regular'}>
+              {m.glyph} {x.text}
+            </Text>
+          )
+          return i ? [<Text color={p.dim}> · </Text>, seg] : [seg]
+        })}
+      </Text>
+      {right}
+    </Box>
+  )
+}
+
+/** The keys, always the pane's last line. */
+function Keys(E: Els, v: View, text: string) {
+  const { Box, Text } = E
+  return (
+    <Box marginTop={1}>
+      <Text color={v.p.dim} wrap="truncate-end">
+        {text}
+      </Text>
+    </Box>
   )
 }
 
 const HEADS: Record<Group, string> = { need: 'NEEDS YOU', read: 'TO READ', work: 'WORKING', quiet: 'QUIET' }
 
-/** One line for a crew item in the inbox; pressing it opens it in the Crew tab. */
+/** One row for a crew item in the inbox; pressing it opens it in the Crew tab. */
 function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Acts) {
-  const { Text, Button } = E
-  const { p } = v
   const now = v.snap.now
-  const line = (key: string, glyph: string, color: string, name: string, text: string, textColor: string, when: string, press: () => void) => {
-    const room = Math.max(8, v.width - 16 - when.length - 2)
-    return (
-      <Button key={key} plain onPress={press}>
-        <Text color={color}>{glyph} </Text>
-        <Text color={p.text}>{cut(name, 13).padEnd(14)}</Text>
-        <Text color={textColor}>{cut(text.replace(/\s+/g, ' '), room).padEnd(room)}</Text>
-        <Text color={p.dim}> {when}</Text>
-      </Button>
-    )
-  }
   if (x.kind === 'notes') {
-    return line(`inbox-${x.key}`, mark(v, 'read').glyph, mark(v, 'read').color, 'notebook', `${x.count} helper suggestion${x.count === 1 ? '' : 's'} to approve · ${x.folder.replace(/^\/home\/[^/]+/, '~')}`, p.text, '', () =>
-      act.openNotebook(x.folder),
-    )
+    return GridRow(E, v, {
+      key: `inbox-${x.key}`,
+      m: mark(v, 'read'),
+      who: 'notebook',
+      what: `${x.count} suggestion${x.count === 1 ? '' : 's'} to keep or reject · ${x.folder.replace(/^\/home\/[^/]+/, '~')}`,
+      press: () => act.openNotebook(x.folder),
+    })
   }
-  const who = `${x.t.agent}·${x.t.name}`
+  const who = `${x.t.agent} › ${x.t.name}`
   if (x.kind === 'running') {
     const u = x.u
-    return line(`inbox-${x.key}`, mark(v, 'work').glyph, mark(v, 'work').color, who, u?.log[u.log.length - 1] ?? 'working…', p.cyan, u ? ago(now - u.started) : '', () =>
-      act.openThread(x.t.name),
-    )
+    return GridRow(E, v, {
+      key: `inbox-${x.key}`,
+      m: mark(v, 'work'),
+      who,
+      what: u?.log[u.log.length - 1] ?? 'working…',
+      age: u ? age(now - u.started) : '',
+      press: () => act.openThread(x.t.name),
+    })
   }
   const failed = x.u.status === 'failed'
-  const text = failed ? `failed: ${x.u.log[x.u.log.length - 1] ?? summaryOf(x.u.answer) ?? ''}` : summaryOf(x.u.answer) || 'answered'
-  const m = mark(v, failed ? 'failed' : 'read')
-  return line(`inbox-${x.key}`, m.glyph, m.color, who, text, failed ? p.bad : p.text, ago(now - (x.u.ended ?? now)), () =>
-    act.openThread(x.t.name),
-  )
+  return GridRow(E, v, {
+    key: `inbox-${x.key}`,
+    m: mark(v, failed ? 'failed' : 'read'),
+    who,
+    what: failed ? `failed: ${x.u.log[x.u.log.length - 1] ?? (summaryOf(x.u.answer) || 'no answer')}` : summaryOf(x.u.answer) || 'answered',
+    age: age(now - (x.u.ended ?? now)),
+    press: () => act.openThread(x.t.name),
+  })
 }
 
 const CAT_COLS = 26 // the compact cat beside the rows (Raster columns)
@@ -397,10 +477,12 @@ function Live(E: Els, v: View, act: Acts) {
   const isBeside = v.hero !== null && v.width >= 90 // narrower, the rows need the room
   const rowsView = isBeside ? { ...v, width: v.width - CAT_COLS - 2 } : v
   const items = inbox(v.snap.sessions, v.threads, v.notebooks)
-  const count = tally(items)
   // group headings only when there is more than one kind of thing to look at
   const isGrouped = new Set(items.map(x => x.group)).size > 1
-  const rows: Node[] = []
+  const rows: Node[] = [
+    Headline(E, rowsView, items, <Text color={p.gold}>{usd(v.snap.cost.today)} today</Text>),
+    <Text> </Text>,
+  ]
   let last: Group | null = null
   for (const x of items) {
     if (isGrouped && x.group !== last) {
@@ -412,18 +494,11 @@ function Live(E: Els, v: View, act: Acts) {
       )
       last = x.group
     }
-    rows.push(
-      x.kind === 'session'
-        ? x.s.sid === v.selected
-          ? Card(E, rowsView, x.s, act)
-          : Row(E, rowsView, x.s, act)
-        : CrewRow(E, rowsView, x, act),
-    )
+    rows.push(x.kind === 'session' ? SessionRow(E, rowsView, x.s, act) : CrewRow(E, rowsView, x, act))
   }
 
   return (
     <Box flexDirection="column">
-      {FleetStatus(E, v, count)}
       {isBeside ? (
         <Box flexDirection="row">
           <Box flexDirection="column" flexGrow={1} flexShrink={1}>
@@ -439,7 +514,7 @@ function Live(E: Els, v: View, act: Acts) {
           {v.hero ? <Box marginTop={1}>{v.hero}</Box> : null}
         </Box>
       )}
-      <Text color={p.dim}>press a row to open it · ctrl+x tab focuses the pane · 6 for the guide</Text>
+      {Keys(E, v, 'tab move · enter open · 1-6 tabs · t theme · a cat · /fleet close')}
     </Box>
   )
 }
@@ -605,209 +680,206 @@ function Feed(E: Els, v: View, act: Acts) {
 }
 
 
-function turnLook(v: View, status: CrewTurn['status']) {
-  const { p } = v
-  return status === 'running'
-    ? mark(v, 'work')
-    : status === 'failed'
-      ? mark(v, 'failed')
-      : { glyph: '·', color: p.dim }
+/** An answer's own shape: its SUMMARY, KEY POINTS and CONFIDENCE sections, when it has them. */
+export function sections(answer: string): { summary: string; points: string[]; confidence: string } {
+  const out = { summary: '', points: [] as string[], confidence: '' }
+  let at: 'summary' | 'points' | 'confidence' | 'other' | null = null
+  for (const raw of answer.split('\n')) {
+    const line = raw.trim()
+    const head = line.match(/^\**(SUMMARY|KEY POINTS|CONFIDENCE|DETAILS|NOTES?)\**:\s*(.*)$/i)
+    if (head) {
+      const name = (head[1] ?? '').toUpperCase()
+      at = name === 'SUMMARY' ? 'summary' : name === 'KEY POINTS' ? 'points' : name === 'CONFIDENCE' ? 'confidence' : 'other'
+      const rest = head[2] ?? ''
+      if (rest && at === 'summary') out.summary = rest
+      if (rest && at === 'confidence') out.confidence = rest
+      if (rest && at === 'points') out.points.push(rest)
+      continue
+    }
+    if (!line) continue
+    if (at === 'summary') out.summary = `${out.summary} ${line}`.trim()
+    else if (at === 'points') out.points.push(line.replace(/^[-*•]\s*|^\d+[.)]\s*/, ''))
+    else if (at === 'confidence') out.confidence = `${out.confidence} ${line}`.trim()
+  }
+  if (!out.summary) out.summary = summaryOf(answer)
+  return out
 }
 
-/** One thread as a row; the selected one opens into its whole conversation. */
+const threadMark = (v: View, t: CrewThread): Mark =>
+  t.status === 'running'
+    ? mark(v, 'work')
+    : t.turns.some(u => u.unread && u.status === 'failed')
+      ? mark(v, 'failed')
+      : t.turns.some(u => u.unread)
+        ? mark(v, 'read')
+        : mark(v, 'quiet')
+
+/** One thread on the grid; the open one shows its latest turn in the answer's own shape. */
 function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
-  const { Box, Text, Button } = E
+  const { Box, Text } = E
   const { p } = v
   const isOpen = t.name === v.crewSel
   const last = t.turns[t.turns.length - 1]
-  const fresh = t.turns.some(u => u.unread)
-  const look =
-    t.status === 'running'
-      ? mark(v, 'work')
-      : fresh
-        ? mark(v, t.turns.some(u => u.unread && u.status === 'failed') ? 'failed' : 'read')
-        : mark(v, 'quiet')
-  const tokens = last ? last.contextTokens + last.outputTokens : 0
-  const w = Math.max(30, v.width - 4)
-  const head = (
-    <Button key={`th-${t.name}`} plain onPress={() => act.crewSelect(t.name)}>
-      <Text color={look.color}>{look.glyph} </Text>
-      <Text color={p.cyan} weight="bold">
-        {t.agent}
-      </Text>
-      <Text color={p.dim}> · </Text>
-      <Text color={p.text} weight="bold">
-        {t.name}
-      </Text>
-      <Text color={p.dim}>
-        {'  '}
-        {t.model !== 'default' ? `${t.model} · ` : ''}
-        {t.effort !== 'default' ? `${t.effort} · ` : ''}
-        {t.turns.length} msg{t.turns.length === 1 ? '' : 's'}
-        {tokens ? ` · ${tok(tokens)} processed` : ''}
-        {t.compactions ? ` · compacted ${t.compactions}×` : ''}
-      </Text>
-      <Text color={t.by === 'claude' ? p.violet : p.gold}> · started by {t.by === 'claude' ? 'Claude' : 'you'}</Text>
-    </Button>
-  )
-  if (!isOpen) {
-    return (
-      <Box flexDirection="column">
-        {head}
-        {last ? (
-          <Text wrap="truncate-end">
-            <Text color={p.border}>{'  ┊ '}</Text>
-            <Text color={p.dim}>
-              {last.status === 'running' ? (last.log[last.log.length - 1] ?? 'working…') : summaryOf(last.answer) || last.status}
-            </Text>
-          </Text>
-        ) : null}
-      </Box>
-    )
-  }
-
+  const m = threadMark(v, t)
+  const what = !last
+    ? 'no messages yet'
+    : last.status === 'running'
+      ? (last.log[last.log.length - 1] ?? 'working…')
+      : last.status === 'failed'
+        ? `failed: ${last.log[last.log.length - 1] ?? 'no answer'}`
+        : summaryOf(last.answer) || last.status
+  const row = GridRow(E, v, {
+    key: `th-${t.name}`,
+    m,
+    who: `${t.agent} › ${t.name}`,
+    what,
+    age: last ? age(v.snap.now - (last.ended ?? last.started)) : '',
+    quiet: m.glyph === mark(v, 'quiet').glyph,
+    press: () => act.crewSelect(t.name),
+  })
+  if (!isOpen || !last) return row
+  const isFull = v.crewOpenTurn === `${t.name}#${last.n}`
+  const sec = sections(last.answer)
+  const meta = [
+    `turn ${last.n} of ${t.turns.length}`,
+    modeLabel(t.agent, t.mode),
+    t.model !== 'default' ? t.model : '',
+    t.effort !== 'default' ? `${t.effort} effort` : '',
+    last.contextTokens ? `${tok(last.contextTokens)} processed · ${tok(last.outputTokens)} written` : '',
+    t.compactions ? `compacted ${t.compactions}×` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  const earlier = v.crewAllTurns === t.name ? t.turns.slice(0, -1) : []
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={t.status === 'running' ? p.accent : p.violet} paddingX={1}>
-      {head}
-      <Text color={p.dim}>
-        {modeLabel(t.agent, t.mode)} · {t.cwd}
-        {t.session ? ` · session ${t.session.slice(0, 8)}` : ''}
-      </Text>
-      {t.brief ? (
-        <Text color={p.dim} wrap="truncate-end">
-          carried-over brief: {cut(t.brief.replace(/\s+/g, ' '), w - 24)}
-        </Text>
-      ) : null}
-      {t.turns.length > 4 ? (
-        <Button key={`turns-${t.name}`} plain onPress={() => act.showAllTurns(t.name)}>
-          <Text color={p.cyan}>
-            {v.crewAllTurns === t.name ? '▾ show only the last 4 messages' : `▸ show all ${t.turns.length} messages`}
-          </Text>
-        </Button>
-      ) : null}
-      {(v.crewAllTurns === t.name ? t.turns : t.turns.slice(-4)).map(u => {
-        const tl = turnLook(v, u.status)
-        return (
-          <Box flexDirection="column" marginTop={1}>
-            <Text wrap="truncate-end">
-              <Text color={u.by === 'claude' ? p.violet : p.gold}>{u.by === 'claude' ? 'Claude' : 'you'} › </Text>
-              <Text color={p.text}>{cut(u.ask.replace(/\s+/g, ' '), w - 10)}</Text>
-            </Text>
-            {u.status === 'running'
-              ? u.log.slice(-3).map(l => (
-                  <Text wrap="truncate-end">
-                    <Text color={p.border}>┊ </Text>
-                    <Text color={p.dim}>{cut(l, w - 2)}</Text>
+    <Box flexDirection="column">
+      {row}
+      {Rail(E, m.color, [
+          ...earlier.map(u => Labeled(E, v, `turn ${u.n}`, `${u.by === 'claude' ? 'Claude' : 'you'}: ${u.ask.replace(/\s+/g, ' ')} → ${plain(summaryOf(u.answer)) || u.status}`)),
+          Labeled(E, v, last.by === 'claude' ? 'Claude asked' : 'you asked', last.ask.replace(/\s+/g, ' ')),
+          ...(last.status === 'running'
+            ? last.log.slice(-3).map((l, i) => Labeled(E, v, i === 0 ? 'doing' : '', l))
+            : last.status === 'failed' || last.status === 'stopped'
+              ? [Labeled(E, v, last.status, last.log[last.log.length - 1] ?? 'no answer', true)]
+              : []),
+          last.answer && !isFull ? Labeled(E, v, 'SUMMARY', plain(sec.summary), true) : null,
+          ...(last.answer && !isFull ? sec.points.slice(0, 5).map((pt, i) => Labeled(E, v, i === 0 ? 'KEY POINTS' : '', `${i + 1}  ${plain(pt)}`)) : []),
+          last.answer && !isFull && sec.confidence ? Labeled(E, v, 'CONFIDENCE', plain(sec.confidence)) : null,
+          ...(isFull
+            ? last.answer
+                .trim()
+                .split('\n')
+                .map(line => (
+                  <Text wrap="wrap" color={/^(SUMMARY|KEY POINTS|CONFIDENCE|DETAILS|NOTE):/i.test(line) ? p.dim : p.text}>
+                    {line || ' '}
                   </Text>
                 ))
-              : null}
-            {u.answer && v.crewOpenTurn === `${t.name}#${u.n}` ? (
-              <Box flexDirection="column" borderStyle="single" borderColor={p.border} paddingX={1}>
-                {u.answer
-                  .trim()
-                  .split('\n')
-                  .map(line => (
-                    <Text wrap="wrap" color={/^(SUMMARY|KEY POINTS|CONFIDENCE|DETAILS|NOTE):/i.test(line) ? p.accent : p.text}>
-                      {line || ' '}
-                    </Text>
-                  ))}
-              </Box>
-            ) : u.answer ? (
-              <Text wrap="wrap">
-                <Text color={tl.color}>{tl.glyph} </Text>
-                <Text color={p.text}>{summaryOf(u.answer)}</Text>
-              </Text>
-            ) : u.status !== 'running' ? (
-              <Text color={tl.color}>
-                {tl.glyph} {u.status}
-                {u.log.length ? `: ${cut(u.log[u.log.length - 1] ?? '', w - 12)}` : ''}
-              </Text>
-            ) : null}
-            <Box flexDirection="row" columnGap={3}>
-              {u.status === 'running' ? (
-                <Button key={`stop-${t.name}`} plain onPress={() => act.crewStop(t.name)}>
-                  <Text color={p.bad}>■ stop</Text>
-                </Button>
-              ) : u.isHanded ? (
-                <Text color={p.dim}>↳ Claude has it</Text>
-              ) : (
-                <Button key={`send-${t.name}-${u.n}`} plain onPress={() => act.crewSend(t.name, u.n)}>
-                  <Text color={p.violet}>↳ send to Claude</Text>
-                </Button>
-              )}
-              {u.answer ? (
-                <Button key={`open-${t.name}-${u.n}`} plain onPress={() => act.crewOpen(`${t.name}#${u.n}`)}>
-                  <Text color={p.cyan}>{v.crewOpenTurn === `${t.name}#${u.n}` ? '▾ hide full answer' : '▸ read full answer'}</Text>
-                </Button>
-              ) : null}
-              {u.answer ? (
-                <Button key={`copy-${t.name}-${u.n}`} plain onPress={() => act.copy(u.answer, `${t.name} answer`)}>
-                  <Text color={p.dim}>copy</Text>
-                </Button>
-              ) : null}
-              {u.contextTokens ? (
-                <Text color={p.dim}>
-                  {tok(u.contextTokens)} processed · {tok(u.outputTokens)} written
-                </Text>
-              ) : null}
-            </Box>
-          </Box>
-        )
-      })}
+            : []),
+          <Text color={p.dim} wrap="truncate-end">
+            {meta}
+          </Text>,
+          ActionLine(E, v, [
+            last.status === 'running' ? { key: `stop-${t.name}`, label: 'stop', color: p.bad, press: () => act.crewStop(t.name) } : null,
+            last.answer
+              ? { key: `open-${t.name}-${last.n}`, label: isFull ? 'show the summary' : 'read full answer', press: () => act.crewOpen(`${t.name}#${last.n}`) }
+              : null,
+            last.status !== 'running' && !last.isHanded
+              ? { key: `send-${t.name}-${last.n}`, label: 'send to Claude', press: () => act.crewSend(t.name, last.n) }
+              : null,
+            last.answer ? { key: `copy-${t.name}-${last.n}`, label: 'copy', color: p.dim, press: () => act.copy(last.answer, `${t.name} answer`) } : null,
+            t.turns.length > 1
+              ? {
+                  key: `turns-${t.name}`,
+                  label: v.crewAllTurns === t.name ? 'hide earlier turns' : `${t.turns.length - 1} earlier turn${t.turns.length === 2 ? '' : 's'}`,
+                  color: p.dim,
+                  press: () => act.showAllTurns(t.name),
+                }
+              : null,
+          ]),
+          last.isHanded && last.status !== 'running' ? <Text color={p.dim}>Claude has this answer</Text> : null,
+        ])}
     </Box>
   )
 }
 
-/** The crew's shared memory for the project in view: what every helper message carries. */
+/** The crew's two memory layers for the project in view: the notebook, then the vault. */
 function Notebook(E: Els, v: View, act: Acts) {
   const { Box, Text, Button } = E
   const { p } = v
   const notes = v.notebook.notes
+  const pending = notes.filter(n => n.pending)
+  const kept = notes.filter(n => !n.pending).sort((a, b) => b.at - a.at)
   const isOpen = v.crewOpenTurn === 'notebook'
-  const w = Math.max(30, v.width - 8)
+  const used = kept.reduce((n, x) => n + x.text.length + 3, 0)
+  const folder = v.notebook.folder.replace(/^\/home\/[^/]+/, '~')
+  const head = (
+    <Button key="notebook" plain onPress={() => act.crewOpen('notebook')}>
+      <Text color={p.dim}>{isOpen ? '▾ ' : '▸ '}</Text>
+      <Text color={p.dim} weight="bold">
+        NOTEBOOK
+      </Text>
+      <Text color={p.dim}>
+        {' '}
+        · {kept.length} fact{kept.length === 1 ? '' : 's'}
+      </Text>
+      {pending.length ? <Text color={mark(v, 'read').color}> · ◆ {pending.length} suggestion{pending.length === 1 ? '' : 's'}</Text> : ''}
+      <Text color={p.dim}> · {folder}</Text>
+    </Button>
+  )
+  if (!isOpen) return head
+  const narrow = { ...v, width: Math.max(30, v.width - 9) }
   return (
     <Box flexDirection="column">
-      <Button key="notebook" plain onPress={() => act.crewOpen('notebook')}>
-        <Text color={p.violet}>{isOpen ? '▾' : '▸'} shared notebook </Text>
-        <Text color={p.dim}>
-          {notes.length} note{notes.length === 1 ? '' : 's'}
-          {notes.some(n => n.pending) ? ` (${notes.filter(n => n.pending).length} pending)` : ''} · {v.notebook.folder.replace(/^\/home\/[^/]+/, '~')} · every helper gets it
-        </Text>
-      </Button>
-      {isOpen && v.notebook.file ? (
-        <Button key="notebook-obsidian" plain onPress={() => act.openNote(v.notebook.file)}>
-          <Text color={p.violet}>  open in Obsidian </Text>
-          <Text color={p.dim}>{v.notebook.file.replace(/^\/home\/[^/]+/, '~')} · tick to approve, edit freely</Text>
-        </Button>
-      ) : null}
-      {isOpen ? (
-        <Text color={p.dim} wrap="wrap">
-          {'  '}Short facts sent with every message to Codex and agy. Helpers suggest them; a suggestion waits until you
-          approve it. Keep only facts that stay true; delete anything outdated.
-        </Text>
-      ) : null}
-      {isOpen && notes.length === 0 ? (
-        <Text color={p.dim}>  empty: helpers add NOTE: lines, and Claude pins facts with crew_note</Text>
-      ) : null}
-      {isOpen
-        ? notes.map(n => (
-            <Box flexDirection="row" columnGap={1}>
-              {n.pending ? (
-                <Button key={`note-ok-${n.id}`} plain onPress={() => act.noteApprove(v.notebook.folder, n.id)}>
-                  <Text color={p.ok}>keep</Text>
-                </Button>
-              ) : null}
-              <Button key={`note-x-${n.id}`} plain onPress={() => act.noteRemove(v.notebook.folder, n.id)}>
-                <Text color={p.bad}>{n.pending ? '× reject' : '× delete'}</Text>
-              </Button>
-              <Text wrap="wrap">
-                <Text color={n.by === 'claude' ? p.violet : n.by === 'you' ? p.gold : p.cyan}>{n.by} </Text>
-                {n.pending ? <Text color={p.warn}>suggests </Text> : <Text color={p.dim}>· </Text>}
-                <Text color={p.text}>{cut(n.text, w * 3)}</Text>
-              </Text>
-            </Box>
-          ))
-        : null}
+      {head}
+      <Text color={used > NOTEBOOK_CAP * 0.8 ? p.warn : p.dim}>
+        {'  '}
+        {used.toLocaleString('en-US')} of {NOTEBOOK_CAP.toLocaleString('en-US')} characters · sent with every helper message
+      </Text>
+      <Text> </Text>
+      <Text color={p.dim} weight="bold">
+        SUGGESTED <Text weight="regular">· not sent to anyone until you keep it</Text>
+      </Text>
+      {pending.length === 0 ? <Text color={p.dim}>  nothing waiting</Text> : null}
+      {pending.map(n => (
+        <Box flexDirection="column">
+          {GridRow(E, v, { key: `note-${n.id}`, m: mark(v, 'read'), who: n.by, what: n.text, age: age(v.snap.now - n.at) })}
+          {Rail(E, mark(v, 'read').color, [
+            ActionLine(E, v, [
+              { key: `note-ok-${n.id}`, label: 'keep', color: p.ok, press: () => act.noteApprove(v.notebook.folder, n.id) },
+              { key: `note-x-${n.id}`, label: 'reject', color: p.bad, press: () => act.noteRemove(v.notebook.folder, n.id) },
+            ]),
+          ])}
+        </Box>
+      ))}
+      <Text> </Text>
+      <Text color={p.dim} weight="bold">
+        KEPT <Text weight="regular">· newest first</Text>
+      </Text>
+      {kept.length === 0 ? <Text color={p.dim}>  empty: helpers suggest NOTE: lines, and Claude pins facts with crew_note</Text> : null}
+      {kept.map(n => (
+        <Box flexDirection="row">
+          {GridRow(E, narrow, { key: `kept-${n.id}`, m: { glyph: ' ', color: p.dim }, who: n.by, what: n.text, age: age(v.snap.now - n.at) })}
+          <Button key={`note-del-${n.id}`} plain onPress={() => act.noteRemove(v.notebook.folder, n.id)}>
+            <Text color={p.dim}> delete</Text>
+          </Button>
+        </Box>
+      ))}
+      <Text> </Text>
+      <Text color={p.dim} weight="bold">
+        VAULT <Text weight="regular">· never sent whole · attach a note to one message</Text>
+      </Text>
+      {v.notebook.file ? (
+        <Box flexDirection="column">
+          <Text color={p.dim} wrap="truncate-end">
+            {'  '}
+            {v.notebook.file.replace(/^\/home\/[^/]+/, '~').replace(/\/notebook\.md$/, '')}
+          </Text>
+          <Text color={p.dim}>  notebook.md mirrors this list both ways; tick a line in Obsidian to keep it</Text>
+          {Rail(E, p.dim, [ActionLine(E, v, [{ key: 'notebook-obsidian', label: 'open in Obsidian', press: () => act.openNote(v.notebook.file) }])])}
+        </Box>
+      ) : (
+        <Text color={p.dim}>  no vault set up</Text>
+      )}
     </Box>
   )
 }
@@ -821,40 +893,70 @@ function Crew(E: Els, v: View, act: Acts) {
   const isFresh = (t: CrewThread) => t.status === 'running' || t.turns.some(u => u.unread) || t.name === v.crewSel
   const fresh = list.filter(isFresh)
   const earlier = list.filter(t => !isFresh(t))
+  const running = list.filter(t => t.status === 'running').length
+  const toRead = list.filter(t => t.turns.some(u => u.unread && u.status !== 'failed')).length
+  const failed = list.filter(t => t.turns.some(u => u.unread && u.status === 'failed')).length
+  const kept = v.notebook.notes.filter(n => !n.pending).length
+  const pending = v.notebook.notes.length - kept
+  const parts: Node[] = []
+  const seg = (state: Parameters<typeof mark>[1], text: string) => {
+    const m = mark(v, state)
+    parts.push(
+      <Text color={m.color}>
+        {m.glyph} {text}
+      </Text>,
+    )
+  }
+  if (running) seg('work', `${running} running`)
+  if (toRead) seg('read', `${toRead} to read`)
+  if (failed) seg('failed', `${failed} failed`)
+  if (earlier.length) parts.push(<Text color={p.dim}>{earlier.length} earlier</Text>)
+  if (parts.length === 0) parts.push(<Text color={p.dim}>no threads yet</Text>)
+  const where = target
+    ? `to ${target.agent} › ${target.name} · ${modeLabel(target.agent, target.mode)}`
+    : `to ${v.crewAgent} · ${modeLabel(v.crewAgent, v.crewMode)} · ${v.crewSummary} · new thread`
 
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row" columnGap={2} flexWrap="wrap">
-        {target ? (
-          <Button key="crew-new" plain hotkey="n" onPress={act.crewNew}>
-            <Text color={p.dim}>n </Text>
-            <Text color={p.accent}>new thread instead</Text>
-          </Button>
-        ) : (
-          <Button key="crew-agent" plain hotkey="g" onPress={act.crewAgent}>
-            <Text color={p.dim}>g </Text>
-            <Text color={p.cyan} weight="bold">
-              {v.crewAgent}
-            </Text>
-          </Button>
-        )}
-        {target ? null : (
-          <Button key="crew-options" plain hotkey="o" onPress={act.toggleOptions}>
-            <Text color={p.dim}>o </Text>
-            <Text color={p.cyan}>{v.crewOptions ? '▾' : '▸'} options</Text>
-            <Text color={p.dim}> {v.crewSummary}</Text>
-          </Button>
-        )}
-        {target ? null : (
-          <Button key="crew-mode" plain hotkey="m" onPress={act.crewMode}>
-            <Text color={p.dim}>m </Text>
-            <Text color={v.crewMode === 'edit' ? p.warn : p.ok}>{modeLabel(v.crewAgent, v.crewMode)}</Text>
-          </Button>
-        )}
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text wrap="truncate-end">{parts.flatMap((x, i) => (i ? [<Text color={p.dim}> · </Text>, x] : [x]))}</Text>
+        <Text color={p.dim}>
+          notebook: {kept} fact{kept === 1 ? '' : 's'}
+          {pending ? <Text color={mark(v, 'read').color}> · ◆ {pending} suggestion{pending === 1 ? '' : 's'}</Text> : ''}
+        </Text>
       </Box>
-      {v.launcher ?? <Text color={p.dim}>(the input box needs the terminal or the desktop app)</Text>}
-      <Text color={p.dim}>or type in Claude's prompt: /crew your message · /crew new agy … · /crew @thread …</Text>
-      {Notebook(E, v, act)}
+      <Text> </Text>
+      <Text color={p.dim} weight="bold">
+        ASK
+      </Text>
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text wrap="truncate-end">
+          <Text color={p.dim}>{'  '}</Text>
+          <Text color={(target ?? { mode: v.crewMode }).mode === 'edit' ? p.warn : p.text}>{where}</Text>
+        </Text>
+        <Box flexDirection="row" columnGap={2}>
+          {target ? (
+            <Button key="crew-new" plain hotkey="n" onPress={act.crewNew}>
+              <Text color={p.dim}>n new thread</Text>
+            </Button>
+          ) : (
+            <Button key="crew-agent" plain hotkey="g" onPress={act.crewAgent}>
+              <Text color={p.dim}>g helper</Text>
+            </Button>
+          )}
+          {target ? null : (
+            <Button key="crew-mode" plain hotkey="m" onPress={act.crewMode}>
+              <Text color={p.dim}>m mode</Text>
+            </Button>
+          )}
+          {target ? null : (
+            <Button key="crew-options" plain hotkey="o" onPress={act.toggleOptions}>
+              <Text color={p.dim}>o {v.crewOptions ? '▾' : '▸'} options</Text>
+            </Button>
+          )}
+        </Box>
+      </Box>
+      {v.launcher ?? <Text color={p.dim}>  (the input box needs the terminal or the desktop app)</Text>}
       {list.length === 0 ? (
         <Box flexDirection="column" marginTop={1}>
           <Text color={p.dim}>No threads yet. Type a task above, or ask Claude:</Text>
@@ -864,23 +966,27 @@ function Crew(E: Els, v: View, act: Acts) {
       ) : (
         <Box flexDirection="column" marginTop={1}>
           {fresh.length ? (
-            <Text color={p.text} weight="bold">
+            <Text color={p.dim} weight="bold">
               NEW
             </Text>
           ) : null}
           {fresh.map(t => ThreadView(E, v, t, act))}
           {earlier.length ? (
-            <Button key="threads-all" plain onPress={act.showAllThreads}>
-              <Text color={p.dim}>{v.crewShowAll ? '▾ ' : '▸ '}</Text>
-              <Text color={p.dim} weight="bold">
-                EARLIER
-              </Text>
-              <Text color={p.dim}> · {earlier.length} thread{earlier.length === 1 ? '' : 's'} you've seen</Text>
-            </Button>
+            <Box marginTop={fresh.length ? 1 : 0}>
+              <Button key="threads-all" plain onPress={act.showAllThreads}>
+                <Text color={p.dim}>{v.crewShowAll ? '▾ ' : '▸ '}</Text>
+                <Text color={p.dim} weight="bold">
+                  EARLIER
+                </Text>
+                <Text color={p.dim}> · {earlier.length} thread{earlier.length === 1 ? '' : 's'} you've seen</Text>
+              </Button>
+            </Box>
           ) : null}
           {v.crewShowAll ? earlier.map(t => ThreadView(E, v, t, act)) : null}
         </Box>
       )}
+      {Notebook(E, v, act)}
+      {Keys(E, v, 'tab move · enter open · n new thread · g helper · m mode · o options · or /crew <message> at Claude\'s prompt')}
     </Box>
   )
 }
@@ -1037,6 +1143,14 @@ function CostView(E: Els, v: View) {
 /** The guide: every command, key and idea in one place. Each line wraps; nothing is cut. */
 const GUIDE: { title: string; rows: [string, string][] }[] = [
   {
+    title: 'READ THE PANE',
+    rows: [
+      ['▲ × ◆ ● ○', 'needs you · failed · to read · working · quiet. The same five marks everywhere.'],
+      ['rows', 'mark · who · what · age, on every tab; press one to open its detail and actions beneath it'],
+      ['the band', 'the Live headline, above your prompt, even with this pane closed'],
+    ],
+  },
+  {
     title: 'OPEN AND MOVE',
     rows: [
       ['/fleet', 'open or close this pane · /fleet help jumps here'],
@@ -1054,7 +1168,7 @@ const GUIDE: { title: string; rows: [string, string][] }[] = [
       ['3 Crew', 'conversations with Codex and Antigravity that Claude (or you) start'],
       ['4 Cost', "today's and this week's estimated spend, by model and session"],
       ['5 System', 'CPU and memory of Claude, its MCP servers and tools, Codex, Antigravity'],
-      ['6 Actions', 'actions for the selected session, and this guide'],
+      ['6 Actions', 'settings and this guide; session actions are on their rows in Live'],
     ],
   },
   {
@@ -1158,92 +1272,70 @@ function Guide(E: Els, v: View, act: Acts) {
 function Actions(E: Els, v: View, act: Acts) {
   const { Box, Text, Button } = E
   const { p } = v
-  const s = v.snap.sessions.find(x => x.sid === v.selected) ?? v.snap.sessions[0]
-  const btn = (key: string, hotkey: string, label: string, color: string, onPress: () => void) => (
-    <Button key={key} plain hotkey={hotkey} onPress={onPress}>
-      <Text color={p.dim}>{hotkey} </Text>
-      <Text color={color}>{label}</Text>
+  const setting = (key: string, label: string, choices: string, now: string, press: () => void) => (
+    <Button key={key} plain onPress={press}>
+      <Text color={p.text}>{('  ' + label).padEnd(22)}</Text>
+      <Text color={p.dim}>{choices.padEnd(36)}</Text>
+      <Text color={p.text}>now: {now}</Text>
     </Button>
   )
-
   return (
     <Box flexDirection="column">
-      {s ? Card(E, v, s, act) : <Text color={p.dim}>No live sessions.</Text>}
-      {s ? (
-        <Box flexDirection="column" paddingX={1}>
-          <Text color={p.dim} wrap="truncate-middle">
-            {s.cwd} · pid {s.pid}
-          </Text>
-          <Box flexDirection="row" flexWrap="wrap" columnGap={3} marginTop={1}>
-            {btn('a-id', 'c', 'copy id', p.cyan, () => act.copy(s.sid, 'session id'))}
-            {btn('a-dir', 'f', 'copy folder', p.cyan, () => act.copy(s.cwd, 'folder'))}
-            {btn('a-open', 'o', 'open transcript', p.violet, () => act.open(s.transcript))}
-            {s.sid === v.self ? null : btn('a-stop', 'x', '■ stop…', p.bad, () => act.stop(s))}
-          </Box>
-          <Text color={p.dim}>pick another session on the Live tab (1)</Text>
-        </Box>
-      ) : null}
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text color={p.text}>Settings and the guide.</Text>
+        <Text color={p.dim}>session and thread actions are on their rows</Text>
+      </Box>
+      <Text> </Text>
+      <Text color={p.dim} weight="bold">
+        SETTINGS
+      </Text>
+      {setting('set-theme', 't  theme', 'nebula · ember · synthwave', p.name, act.theme)}
+      {setting('set-cat', 'a  cat', 'on · off', v.scene === 'off' ? 'off' : 'on', act.scene)}
       {Guide(E, v, act)}
     </Box>
   )
 }
 
-export type BandInfo = { age: number; isStale: boolean; crew: { running: number; failed: number; toRead?: number } }
+export type BandInfo = { age: number; isStale: boolean; items?: readonly Item[] }
 
-export function Band(E: Els, snap: Snapshot, p: Palette, info: BandInfo = { age: 0, isStale: false, crew: { running: 0, failed: 0 } }) {
+/** The line above the prompt: the Live headline, with the first thing that needs you spelled out. */
+export function Band(E: Els, snap: Snapshot, p: Palette, info: BandInfo = { age: 0, isStale: false }) {
   const { Box, Text } = E
-  const busy = snap.sessions.filter(isBusy).length
-  const agents = snap.sessions.reduce((n, s) => n + s.agents.length, 0)
-  const need = snap.sessions.filter(needsYou)
-
+  const v = { p }
+  const items = info.items ?? inbox(snap.sessions, [], {})
+  const parts: Node[] = []
+  const seg = (state: Parameters<typeof mark>[1], text: string, bold = false) => {
+    const m = mark(v, state)
+    parts.push(
+      <Text color={m.color} weight={bold ? 'bold' : 'regular'}>
+        {m.glyph} {text}
+      </Text>,
+    )
+  }
+  const sessions = items.flatMap(x => (x.kind === 'session' && x.group === 'need' ? [x.s] : []))
+  const failed = items.flatMap(x => (x.kind === 'turn' && x.group === 'need' ? [x] : []))
+  // the reason to look at the band comes first, before it can be cut off
+  if (sessions.length === 1) {
+    const s = sessions[0]!
+    seg(s.phase === 'error' ? 'error' : 'need', `${s.name}: ${activity(s)}`, true)
+  } else if (sessions.length > 1) {
+    seg('need', `${sessions.length} need you: ${sessions.map(s => s.name).join(', ')}`, true)
+  }
+  if (failed.length === 1) seg('failed', `${failed[0]!.t.agent} › ${failed[0]!.t.name} failed`)
+  else if (failed.length > 1) seg('failed', `${failed.length} crew failed`)
+  const count = tally(items)
+  if (count.read) seg('read', `${count.read} to read`)
+  if (count.work) seg('work', `${count.work} working`)
+  const isUrgent = sessions.length + failed.length > 0
+  if (!isUrgent && !count.read && count.quiet) seg('quiet', `${count.quiet} quiet`)
+  if (info.isStale) parts.push(<Text color={p.warn}>data {info.age}s old</Text>)
+  else parts.push(<Text color={p.gold}>{usd(snap.cost.today)}{isUrgent ? '' : ' today'}</Text>)
   return (
     <Box flexDirection="row">
       {Grad(E, 'FLEET', p.accent, p.cyan, true)}
-      {need.length > 0 ? (
-        // the reason to look at the band comes first, before it can be cut off
-        <Text color={need.some(s => s.phase === 'error') ? p.bad : p.warn} weight="bold">
-          {'  '}▲ {need.map(s => s.name).join(', ')} {need.length === 1 ? 'needs' : 'need'} you
-        </Text>
-      ) : null}
-      <Text>
+      <Text wrap="truncate-end">
         {'  '}
-        {snap.sessions.map(s => (
-          <Text color={sessionColor(s, p)}>●</Text>
-        ))}
-        <Text color={p.dim}> {snap.sessions.length} live</Text>
-        {Sep(E, p)}
-        <Text color={p.accent}>● {busy}</Text>
-        <Text color={p.dim}> busy</Text>
-        {Sep(E, p)}
-        <Text color={p.violet}>+{agents}</Text>
-        <Text color={p.dim}> agents</Text>
-        {Sep(E, p)}
-        <Text color={p.gold}>{usd(snap.cost.today)}</Text>
-        <Text color={p.dim}> today</Text>
-        {info.crew.running ? (
-          <Text>
-            {Sep(E, p)}
-            <Text color={p.accent}>● crew {info.crew.running} running</Text>
-          </Text>
-        ) : null}
-        {info.crew.failed ? (
-          <Text>
-            {Sep(E, p)}
-            <Text color={p.bad}>× {info.crew.failed} failed</Text>
-          </Text>
-        ) : null}
-        {info.crew.toRead ? (
-          <Text>
-            {Sep(E, p)}
-            <Text color={p.cyan}>◆ {info.crew.toRead} to read</Text>
-          </Text>
-        ) : null}
-        {info.isStale ? (
-          <Text>
-            {Sep(E, p)}
-            <Text color={p.warn}>◌ stale {info.age}s</Text>
-          </Text>
-        ) : null}
+        {parts.flatMap((x, i) => (i ? [<Text color={p.dim}> · </Text>, x] : [x]))}
       </Text>
     </Box>
   )
