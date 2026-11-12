@@ -46,6 +46,10 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   copy folder · open transcript · stop). A crew thread opens to its last answer as SUMMARY,
   KEY POINTS and CONFIDENCE. The band reads like the Live headline and spells out the first thing
   that needs you.
+- Crew and notebook rows open in place on Live too: a thread's latest answer (and any Codex
+  changes card), or a notebook's suggestions with keep · edit · reject.
+- **Cost** is one table on the same grid: this week, today by session and by model (one-colour
+  bars), crew usage (not priced), and three machine lines plus a `hot` row when a process runs hot.
 - One mark per state, everywhere: ▲ needs you · × failed · ◆ to read · ● working · ○ quiet.
   Buttons are plain words; the tab or filter you're on is bold and underlined.
 - Notices: threads Claude started that finish together reach Claude as one notice (it waits up to

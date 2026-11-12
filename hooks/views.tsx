@@ -1186,77 +1186,151 @@ function SystemView(E: Els, v: View) {
   )
 }
 
-const BARS = ' ▁▂▃▄▅▆▇█'
 
+/** A one-colour horizontal bar on the grid: filled to `frac`, the rest dim. */
+function HBar(E: Els, v: View, frac: number, cells: number, bold = false) {
+  const { Text } = E
+  const { p } = v
+  const full = Math.round(Math.max(0, Math.min(1, frac)) * cells)
+  return (
+    <Text>
+      <Text color={p.accent} weight={bold ? 'bold' : 'regular'}>
+        {'█'.repeat(full)}
+      </Text>
+      <Text color={p.border}>{'░'.repeat(cells - full)}</Text>
+    </Text>
+  )
+}
+
+/** Cost as one table: every row is label · bar · amount · note, on the same grid as Live. */
 function CostView(E: Els, v: View) {
   const { Box, Text } = E
   const { p } = v
   const c = v.snap.cost
-  const days = c.days.map(d => d.usd)
-  const max = Math.max(...days, 0.01)
-  const week = days.reduce((a, b) => a + b, 0)
-  const models = Object.entries(c.models)
-  const today = c.today || 1
-  const H = 4
-  // a 4-row bar chart: each day a 3-wide column, shaded by how heavy the day was
-  const level = (usdOf: number) => (usdOf / max) * H * 8
+  const ww = whoWidth(v.width)
+  const cells = Math.max(10, Math.min(40, v.width - 2 - ww - 10 - 26))
+  const week = c.days.reduce((n, d) => n + d.usd, 0)
+  const peak = Math.max(...c.days.map(d => d.usd), 0.01)
+  const live = [...v.snap.sessions].sort((a, b) => b.cost - a.cost)
+  const closed = Math.max(0, c.today - live.reduce((n, s) => n + s.cost, 0))
+  const top = Math.max(...live.map(s => s.cost), closed, 0.01)
+  const models = Object.entries(c.models).sort((a, b) => b[1] - a[1])
+  const topModel = Math.max(...models.map(([, n]) => n), 0.01)
+  const row = (mk: Node, label: string, frac: number, amount: number, note = '', bold = false, quiet = false) => (
+    <Text wrap="truncate-end">
+      {mk}
+      <Text color={quiet ? p.dim : p.text}>{cut(label, ww - 1).padEnd(ww)}</Text>
+      {HBar(E, v, frac, cells, bold)}
+      <Text color={p.gold}> {usd(amount).padStart(8)}</Text>
+      <Text color={p.dim}>{note ? `   ${note}` : ''}</Text>
+    </Text>
+  )
+  const blank = <Text>{'  '}</Text>
+  const head = (title: string, note = '') => (
+    <Text>
+      <Text color={p.dim} weight="bold">
+        {title}
+      </Text>
+      <Text color={p.dim}>{note ? ` · ${note}` : ''}</Text>
+    </Text>
+  )
+  // crew helpers aren't priced (they run on your Codex and Antigravity plans); their use still counts
+  const dayStart = (() => {
+    const d = new Date(v.snap.now * 1000)
+    d.setHours(0, 0, 0, 0)
+    return d.getTime() / 1000
+  })()
+  const crew = (['codex', 'agy'] as const).map(agent => {
+    const turns = v.threads.filter(t => t.agent === agent).flatMap(t => t.turns.filter(u => (u.ended ?? u.started) >= dayStart))
+    return { agent, turns: turns.length, inTok: turns.reduce((n, u) => n + u.contextTokens, 0), outTok: turns.reduce((n, u) => n + u.outputTokens, 0) }
+  })
+  const sys = v.snap.sys
+  const hot = sys?.top.find(x => x.cpu >= 80)
+  const memPct = sys && sys.memTotalMb ? Math.round((sys.memUsedMb / sys.memTotalMb) * 100) : 0
+  const stackCpu = sys ? Math.round(sys.groups.reduce((n, g) => n + g.cpu, 0)) : 0
+  const stackMem = sys ? sys.groups.reduce((n, g) => n + g.rssMb, 0) / 1024 : 0
 
   return (
     <Box flexDirection="column">
-      <Text>
-        <Text color={p.dim}>TODAY </Text>
-        <Text color={p.gold} weight="bold">
-          {usd(c.today)}
-        </Text>
-        {Sep(E, p)}
-        <Text color={p.text}>{tok(c.tokens)}</Text>
-        <Text color={p.dim}> tokens</Text>
-        {Sep(E, p)}
-        <Text color={p.dim}>cache </Text>
-        <Text color={p.ok}>{Math.round(c.cacheHit * 100)}%</Text>
-      </Text>
-      <Box flexDirection="column" marginTop={1}>
-        {Array.from({ length: H }, (_, row) => (
-          <Text>
-            {days.map(d => {
-              const fill = Math.max(0, Math.min(8, Math.round(level(d) - (H - 1 - row) * 8)))
-              return <Text color={heat(d / max, p)}>{` ${BARS[fill]!.repeat(3)}`}</Text>
-            })}
-          </Text>
-        ))}
-        <Text color={p.dim}>
-          {c.days.map(d => ` ${'SMTWTFS'[new Date(`${d.date}T12:00:00`).getDay()]}  `).join('')}
-        </Text>
+      <Box flexDirection="row" justifyContent="space-between">
         <Text>
-          <Text color={p.dim}>7 days </Text>
-          <Text color={p.gold}>{usd(week)}</Text>
-          <Text color={p.dim}> · peak {usd(max)}</Text>
+          <Text color={p.gold} weight="bold">
+            {usd(c.today)} today
+          </Text>
+          <Text color={p.dim}> · </Text>
+          <Text color={p.gold}>{usd(week)} this week</Text>
+          <Text color={p.dim}> · cache hit {Math.round(c.cacheHit * 100)}%</Text>
         </Text>
+        <Text color={p.dim}>an estimate at API list prices</Text>
       </Box>
-      <Box flexDirection="column" marginTop={1}>
-        <Text color={p.dim}>MODELS TODAY</Text>
-        {models.length === 0 ? <Text color={p.dim}>none yet</Text> : null}
-        {models.map(([m, n]) => (
-          <Text>
-            <Text color={p.cyan}>{cut(m, 12).padEnd(12)} </Text>
-            {Gauge(E, (n / today) * 100, 14, { ...p, ok: p.accent, warn: p.violet, bad: p.cyan })}
-            <Text color={p.gold}> {usd(n)}</Text>
-          </Text>
-        ))}
-      </Box>
-      <Box flexDirection="column" marginTop={1}>
-        <Text color={p.dim}>LIVE SESSIONS</Text>
-        {v.snap.sessions.map(s => (
+      {blank}
+      {head('THIS WEEK')}
+      {c.days.map((d, i) => {
+        const isToday = i === c.days.length - 1
+        const day = 'Sun Mon Tue Wed Thu Fri Sat'.split(' ')[new Date(`${d.date}T12:00:00`).getDay()] ?? d.date
+        return row(<Text>{'  '}</Text>, `${day}${isToday ? ' today' : ''}`, d.usd / peak, d.usd, d.usd === peak && peak > 0.01 ? 'peak' : '', isToday)
+      })}
+      {blank}
+      {head('TODAY BY SESSION')}
+      {live.map(s => {
+        const m = sessionMark(v, s)
+        return row(<Text color={m.color}>{m.glyph} </Text>, s.name, s.cost / top, s.cost, `${s.model} · ${tok(s.tokens)} tokens`, false, !needsYou(s) && !isBusy(s))
+      })}
+      {closed > 0.005 ? row(<Text>{'  '}</Text>, 'closed sessions', closed / top, closed, '', false, true) : null}
+      {blank}
+      {head('TODAY BY MODEL')}
+      {models.length === 0 ? <Text color={p.dim}>  none yet</Text> : null}
+      {models.map(([m, n]) => row(<Text>{'  '}</Text>, m, n / topModel, n))}
+      {blank}
+      {head('CREW', 'not priced: helpers run on your Codex and Antigravity plans')}
+      {crew.map(x => (
+        <Text color={x.turns ? p.text : p.dim} wrap="truncate-end">
+          {'  '}
+          {x.agent.padEnd(ww)}
+          {x.turns ? `${x.turns} turn${x.turns === 1 ? '' : 's'} today · ${tok(x.inTok)} processed · ${tok(x.outTok)} written` : 'no turns today'}
+        </Text>
+      ))}
+      {blank}
+      {head('MACHINE', 'tab 5 has the detail')}
+      {sys ? (
+        <Box flexDirection="column">
           <Text wrap="truncate-end">
-            <Text color={sessionColor(s, p)}>● </Text>
-            <Text color={p.text}>{cut(s.name, 22).padEnd(22)} </Text>
-            <Text color={p.gold}>{usd(s.cost).padStart(7)}</Text>
-            <Text color={p.dim}> · {tok(s.tokens)} tok</Text>
+            {'  '}
+            <Text color={p.text}>{'memory'.padEnd(ww)}</Text>
+            <Text color={memPct >= 85 ? p.warn : p.text}>{memPct}%</Text>
+            <Text color={p.dim}>
+              {' '}
+              · {(sys.memUsedMb / 1024).toFixed(1)} of {(sys.memTotalMb / 1024).toFixed(1)} GB
+            </Text>
           </Text>
-        ))}
-      </Box>
+          <Text wrap="truncate-end">
+            {'  '}
+            <Text color={p.text}>{'load'.padEnd(ww)}</Text>
+            <Text color={p.text}>{(sys.load[0] ?? 0).toFixed(1)}</Text>
+            <Text color={p.dim}> on {sys.cores} cores</Text>
+          </Text>
+          <Text wrap="truncate-end">
+            {'  '}
+            <Text color={p.text}>{'Claude stack'.padEnd(ww)}</Text>
+            <Text color={p.text}>{stackCpu}% cpu</Text>
+            <Text color={p.dim}> (100% = one core) · {stackMem.toFixed(1)} GB</Text>
+          </Text>
+          {hot ? (
+            <Text wrap="truncate-end">
+              <Text color={mark(v, 'need').color}>{mark(v, 'need').glyph} </Text>
+              <Text color={p.text}>{'hot'.padEnd(ww)}</Text>
+              <Text color={p.text}>
+                {cut(hot.cmd, 40)} · {Math.round(hot.cpu)}% cpu · {(hot.rssMb / 1024).toFixed(1)} GB
+              </Text>
+              <Text color={p.dim}> · {hot.group}</Text>
+            </Text>
+          ) : null}
+        </Box>
+      ) : (
+        <Text color={p.dim}>  measuring… (CPU needs two samples)</Text>
+      )}
       {c.pendingBytes > 0 ? <Text color={p.dim}>reading history… {tok(c.pendingBytes)}B to go</Text> : null}
-      <Text color={p.dim}>≈ API list prices · a subscription bills differently</Text>
+      {Keys(E, v, 'tab move · 1-6 tabs · t theme · a cat · /fleet close · a subscription bills differently')}
     </Box>
   )
 }
@@ -1287,7 +1361,7 @@ const GUIDE: { title: string; rows: [string, string][] }[] = [
       ['1 Live', 'everything that wants you: NEEDS YOU · TO READ · WORKING · QUIET; press a row to open it'],
       ['2 Feed', 'every tool call across sessions, grouped, with a 10-minute tally'],
       ['3 Crew', 'conversations with Codex and Antigravity that Claude (or you) start'],
-      ['4 Cost', "today's and this week's estimated spend, by model and session"],
+      ['4 Cost', 'estimated spend this week and today, crew usage, and the machine in three lines'],
       ['5 System', 'CPU and memory of Claude, its MCP servers and tools, Codex, Antigravity'],
       ['6 Actions', 'settings and this guide; session actions are on their rows in Live'],
     ],
