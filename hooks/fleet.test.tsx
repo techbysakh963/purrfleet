@@ -146,6 +146,11 @@ test('crew prompts can never be read as flags, and edits are opt-in', async () =
   expect(codexRead.indexOf('--')).toBe(codexRead.length - 2) // the prompt sits after `--`
   const codexEdit = argvFor({ ...LAUNCH, agent: 'codex', mode: 'edit', prompt: 'fix' })
   expect(codexEdit).toContain('--worktree')
+  // an edit turn never resumes: a resumed session can't re-enter its worktree
+  const editResume = argvFor({ ...LAUNCH, agent: 'codex', mode: 'edit', prompt: 'fix', session: 'abc' })
+  expect(editResume).not.toContain('resume')
+  expect(editResume).toContain('--worktree')
+  expect(editResume).not.toContain('abc')
   const resumed = argvFor({ ...LAUNCH, agent: 'codex', mode: 'read', prompt: 'more', session: 'abc' })
   expect(resumed.slice(0, 3)).toEqual(['codex', 'exec', 'resume'])
   expect(resumed).toContain('sandbox_mode="read-only"')
@@ -186,6 +191,7 @@ test('answers are read summary-first', async () => {
   const short = report(thread, thread.turns[0]!, false)
   expect(short).toContain('SUMMARY: Dates are parsed in two places.')
   expect(short).not.toContain('DETAILS')
+  expect(short.startsWith('Below is output from a helper agent')).toBe(true)
   expect(report(thread, thread.turns[0]!, true)).toContain('DETAILS')
   const first = brief({ ...thread, turns: [] }, 'claude', 'look', '')
   expect(first).toContain('read-only')

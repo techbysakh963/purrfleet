@@ -269,13 +269,19 @@ async function runTurn(
   // fresh conversation starts from it, so the thread keeps what matters.
   let seed: string | undefined
   const lastDone = [...t.turns].reverse().find(u => u.status === 'done')
-  if (t.session && (lastDone?.contextTokens ?? 0) > COMPACT_AT) {
-    const brief = await execTurn($, t, COMPACT_PROMPT, n, true)
-    if (brief.ok && brief.answer.trim()) {
-      seed = brief.answer.trim()
-      await patchThread($, name, x => ({ ...x, session: '', compactions: x.compactions + 1, brief: seed ?? '' }))
-      t = (await findThread($, name)) ?? t
+  // A Codex edit turn always starts a fresh worktree session (a resumed one would
+  // edit your real tree), so it carries the thread over as a state brief too.
+  const isCodexEdit = t.agent === 'codex' && t.mode === 'edit'
+  if (t.session && ((lastDone?.contextTokens ?? 0) > COMPACT_AT || isCodexEdit)) {
+    const briefRun = await execTurn($, { ...t, mode: 'read' }, COMPACT_PROMPT, n, true)
+    if (briefRun.ok && briefRun.answer.trim()) {
+      seed = briefRun.answer.trim()
+      if (!isCodexEdit) await patchThread($, name, x => ({ ...x, compactions: x.compactions + 1 }))
+      await patchThread($, name, x => ({ ...x, brief: seed ?? '' }))
     }
+    await patchThread($, name, x => ({ ...x, session: '' }))
+    t = (await findThread($, name)) ?? t
+    t = { ...t, session: '' }
   }
   const res = await execTurn($, t, brief(t, by, task, context, seed), n, false)
   await patchThread($, name, x => ({
@@ -391,14 +397,14 @@ async function handToClaude($: EngineInterface, name: string, n: number): Promis
   const turn = t?.turns.find(u => u.n === n)
   if (!t || !turn) return
   await patchThread($, name, x => ({ ...x, turns: x.turns.map(u => (u.n === n ? { ...u, isHanded: true } : u)) }))
+  // Only a fixed notice goes into the prompt: the helper's words reach Claude as
+  // crew_read's tool output, never as text that reads like the user's own.
   const text =
     turn.by === 'claude'
-      ? `[FLEET crew] Thread "${name}" (${t.agent}) answered your message (turn ${n}, ${turn.status}).\n` +
-        `SUMMARY: ${summaryOf(turn.answer) || '(no answer)'}\n` +
-        `Check it before relying on it. Full answer: crew_read {"thread": "${name}", "full": true}. ` +
-        `Continue the conversation with crew_ask {"thread": "${name}", ...}.`
-      : `[FLEET crew] I asked thread "${name}" (${t.agent}): ${turn.ask}\n\nIts answer:\n\n${capAnswer(turn.answer).slice(0, 8000)}\n\n` +
-        `Please review it critically and tell me what you'd keep. You can continue this thread with crew_ask {"thread": "${name}", ...}.`
+      ? `[FLEET crew] Thread "${name}" (${t.agent}) finished turn ${n} (${turn.status}). ` +
+        `Read its summary with crew_read {"thread": "${name}"} and check it before relying on it.`
+      : `[FLEET crew] The user sent you turn ${n} of thread "${name}" (${t.agent}) to review. ` +
+        `Read it with crew_read {"thread": "${name}", "turn": ${n}, "full": true}, then say what you'd keep.`
   void $.prompt.submit({ text })
 }
 
@@ -417,7 +423,9 @@ async function answerCrewAsk($: EngineInterface, e: Args): Promise<Answer> {
     // Claude never gets to let a helper change files on its own say-so
     const who = agent ?? existing?.agent ?? 'the helper'
     const answer = await $.ui.ask(
-      `Claude wants ${who} to EDIT files in thread "${slug(name)}"${who === 'codex' ? ' (in its own git worktree)' : ' (in place)'}: ${task.slice(0, 160)}`,
+      `Claude wants ${who} to EDIT files in thread "${slug(name)}"` +
+        (who === 'codex' ? ' (each edit turn runs in a NEW git worktree, apart from your tree)' : ' (directly in your project folder)') +
+        `: ${task.slice(0, 160)}`,
       { header: 'FLEET crew', options: ['Allow edits', 'Read-only instead', 'Cancel'] },
     )
     if (answer.startsWith('Cancel')) return { deny: 'The user cancelled this crew message.' }
