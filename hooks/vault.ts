@@ -16,9 +16,26 @@ export const safeName = (text: string): string =>
     .trim()
     .slice(0, 80) || 'untitled'
 
-/** The vault folder for a project: its folder's own name. */
+/** A short fingerprint of a full path (FNV-1a), so two projects named alike never share a folder. */
+export function pathTag(path: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < path.length; i++) {
+    h ^= path.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0').slice(0, 6)
+}
+
+/** The vault folder for a project: its folder's name plus a fingerprint of its full path. */
 export const projectDir = (vault: string, cwd: string): string =>
-  `${vault}/${safeName(cwd.split('/').filter(Boolean).pop() ?? 'project')}`
+  `${vault}/${safeName(cwd.split('/').filter(Boolean).pop() ?? 'project')}-${pathTag(cwd)}`
+
+/** The project a vault note says it belongs to (its `project:` front matter). */
+export function projectOf(markdown: string): string | undefined {
+  const fm = markdown.match(/^---\n([\s\S]*?)\n---/)
+  const line = fm?.[1]?.match(/^project:\s*"?(.*?)"?\s*$/m)
+  return line?.[1]
+}
 
 export const notebookPath = (vault: string, cwd: string): string => `${projectDir(vault, cwd)}/notebook.md`
 

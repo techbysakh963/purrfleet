@@ -8,7 +8,7 @@ import { argvFor, brief, lines, needsCompaction, notebookText, notesIn, parseLin
 import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { PALETTES } from './theme'
-import { findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, safeName } from './vault'
+import { findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf, safeName } from './vault'
 
 const NOW = 1_794_434_000
 
@@ -328,8 +328,11 @@ test('the notebook round-trips through Obsidian markdown, and your edits come ba
 test('vault paths stay inside the vault', async () => {
   expect(safeName('../../etc/passwd')).not.toContain('/')
   expect(safeName('a/b')).toBe('a b')
-  expect(notebookPath('/v', '/home/u/demo-app')).toBe('/v/demo-app/notebook.md')
-  expect(findingPath('/v', '/home/u/demo-app', '../escape', 0)).toMatch(/^\/v\/demo-app\/1970-01-01 \. escape\.md$|^\/v\/demo-app\/1970-01-01 [^/]+\.md$/)
+  expect(notebookPath('/v', '/home/u/demo-app')).toMatch(/^\/v\/demo-app-[0-9a-f]{6}\/notebook\.md$/)
+  // two projects with the same folder name never share a notebook
+  expect(notebookPath('/v', '/a/app')).not.toBe(notebookPath('/v', '/b/app'))
+  expect(projectOf(notebookMarkdown('/a/app', [], 0))).toBe('/a/app')
+  expect(findingPath('/v', '/home/u/demo-app', '../escape', 0)).toMatch(/^\/v\/demo-app-[0-9a-f]{6}\/1970-01-01 [^/]+\.md$/)
   expect(isInside('/v', '/v/demo-app/x.md')).toBe(true)
   expect(isInside('/v', '/vault-other/x.md')).toBe(false)
 })

@@ -26,7 +26,7 @@ import {
 import { auroraCells, toBase64 } from './scenes'
 import { PALETTES, paletteOf } from './theme'
 import type { Palette } from './theme'
-import { findingMarkdown, findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook } from './vault'
+import { findingMarkdown, findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf } from './vault'
 import { Band, Pane, ordered } from './views'
 import type { Acts } from './views'
 
@@ -637,6 +637,8 @@ async function syncFromVault($: EngineInterface): Promise<void> {
     if (!st || st.mtimeMs <= (lastWritten.get(folder) ?? 0) + 1500) continue
     lastWritten.set(folder, st.mtimeMs)
     const text = await $.fs.read(file).catch(() => '')
+    // only a notebook that names this exact project comes back into it
+    if (projectOf(text) !== folder) continue
     const parsed = parseNotebook(text, now())
     const before = JSON.stringify((all[folder] ?? []).map(n => [n.id, n.text, !!n.pending]))
     if (JSON.stringify(parsed.map(n => [n.id, n.text, !!n.pending])) === before) continue
