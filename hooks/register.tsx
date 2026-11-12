@@ -78,6 +78,10 @@ let pollCount = 0
 let lastOk = Date.now() // when the collector last answered
 // the children of running crew turns, by thread; leaving a loop (return) kills its child
 const running = new Map<string, AsyncIterator<unknown, unknown>>()
+// the run that owns each thread right now; a stop revokes it, and a revoked run
+// may neither start a child nor write the thread again
+const owner = new Map<string, number>()
+let runSeq = 0
 
 const now = (): number => Date.now() / 1000
 
@@ -329,15 +333,19 @@ async function runTurn(
 ): Promise<void> {
   let t = await findThread($, name)
   if (!t) return
+  const run = ++runSeq
+  owner.set(name, run)
+  const isMine = () => owner.get(name) === run
   // A long thread is compacted first: the helper writes a state brief, and a
   // fresh conversation starts from it, so the thread keeps what matters.
   let seed: string | undefined
-  const isStopped = async () => (await findThread($, name))?.turns.find(u => u.n === n)?.status === 'stopped'
+  const isStopped = async () =>
+    !isMine() || (await findThread($, name))?.turns.find(u => u.n === n)?.status === 'stopped'
   // A Codex edit turn always starts a fresh worktree session (a resumed one would
   // edit your real tree), so it carries the thread over as a state brief too.
   const isCodexEdit = t.agent === 'codex' && t.mode === 'edit'
   if (t.session && (needsCompaction(t) || isCodexEdit)) {
-    const briefRun = await execTurn($, { ...t, mode: 'read' }, COMPACT_PROMPT, n, true)
+    const briefRun = await execTurn($, { ...t, mode: 'read' }, COMPACT_PROMPT, n, true, isMine)
     if (await isStopped()) return
     const fresh = briefRun.ok ? briefRun.answer.trim() : ''
     if (fresh || isCodexEdit) {
@@ -353,11 +361,16 @@ async function runTurn(
       t = { ...((await findThread($, name)) ?? t), session: '' }
     }
   }
-  if (await isStopped()) return
+  // a fresh conversation after an earlier compaction (say, its first try failed) starts
+  // from the saved brief, never from nothing
+  if (!t.session && seed === undefined && t.brief) seed = t.brief
   const notes = (await read($, notebooks))[t.cwd] ?? []
   const nb = notebookDelta(t.sentNotes, notes, !t.session)
-  await patchThread($, name, x => ({ ...x, sentNotes: nb.sent }))
-  const res = await execTurn($, t, brief(t, by, task, context, seed, nb.text, nb.isDelta), n, false)
+  if (await isStopped()) return
+  const res = await execTurn($, t, brief(t, by, task, context, seed, nb.text, nb.isDelta), n, false, isMine)
+  if (!isMine()) return
+  // the helper has these notes only once the turn really went through
+  if (res.ok) await patchThread($, name, x => ({ ...x, sentNotes: nb.sent }))
   // what the helper offered for the shared notebook goes in, signed by it
   if (res.ok) await addNotes($, t.cwd, notesIn(res.answer), t.agent)
   await patchThread($, name, x => {
@@ -376,6 +389,7 @@ async function runTurn(
     if (by === 'claude') await handToClaude($, name, n)
     else $.ui.toast(`Crew · ${name} answered (${settled.status})`)
   }
+  if (isMine()) owner.delete(name)
   await persist($)
 }
 
@@ -388,6 +402,7 @@ async function execTurn(
   prompt: string,
   n: number,
   isBrief: boolean,
+  isMine: () => boolean,
 ): Promise<{ ok: boolean; answer: string }> {
   const argv = argvFor({
     agent: t.agent,
@@ -404,6 +419,7 @@ async function execTurn(
   let ctx = 0
   let out = 0
   let code: number | null = null
+  let isFatal = false
   let fresh: string[] = []
   let pushed = 0
   const buf = { stdout: '', stderr: '' }
@@ -416,9 +432,11 @@ async function execTurn(
     if (p.contextTokens) ctx = p.contextTokens
     if (p.outputTokens) out = p.outputTokens
     if (p.log) fresh.push(isBrief ? `[state brief] ${p.log}` : p.log)
+    if (p.fatal) isFatal = true
   }
   const flush = async (force: boolean) => {
     if (!force && now() - pushed < 0.4) return
+    if (!isMine()) return // a revoked run writes nothing, its session id included
     pushed = now()
     const text = final ?? answer
     const add = fresh
@@ -440,6 +458,7 @@ async function execTurn(
     }))
   }
   try {
+    if (!isMine()) return { ok: false, answer: '' } // stopped before it started: no child at all
     it = $.process.spawn({ argv, cwd: t.cwd })[Symbol.asyncIterator]()
     running.set(t.name, it as AsyncIterator<unknown, unknown>)
     for (;;) {
@@ -465,16 +484,20 @@ async function execTurn(
   if (buf.stdout.trim()) take('stdout', buf.stdout)
   if (buf.stderr.trim()) take('stderr', buf.stderr)
   await flush(true)
-  return { ok: code === 0, answer: final ?? answer }
+  return { ok: code === 0 && !isFatal, answer: final ?? answer }
 }
 
 async function stopThread($: EngineInterface, name: string): Promise<void> {
+  // revoke the run and take its child before the thread looks idle to anyone
+  owner.delete(name)
+  const child = running.get(name)
+  running.delete(name)
   await patchThread($, name, x => ({
     ...x,
     status: 'idle',
     turns: x.turns.map(u => (u.status === 'running' ? { ...u, status: 'stopped', ended: now() } : u)),
   }))
-  await running.get(name)?.return?.(undefined)
+  await child?.return?.(undefined)
 }
 
 /** Tells Claude a turn finished: the summary inline (no extra call), the rest on demand. */
@@ -1217,7 +1240,19 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const s = await read($, snap)
-    if (e.props.hasSurvey || s === null) return next(e)
+    if (e.props.hasSurvey) return next(e)
+    if (s === null) {
+      // no snapshot yet: say so when the collector is failing, else stay out of the way
+      const err = await read($, error)
+      if (!err) return next(e)
+      const { Text } = $.ui.resolve(e)
+      const p = paletteOf(await read($, theme))
+      return (
+        <Text color={p.warn} wrap="truncate-end">
+          ◆ FLEET ◌ {err}
+        </Text>
+      )
+    }
 
     const list = await read($, threads)
     const crewNow = {

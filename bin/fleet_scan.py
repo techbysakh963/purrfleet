@@ -295,6 +295,33 @@ def system(cache, now):
     }
 
 
+def tail_calls(path, sid, now, out):
+    """The tool calls of the last 10 minutes from a transcript's end: a first read starts at
+    the beginning, and a long transcript's recent calls would otherwise wait until it catches up."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 4 * 1024 * 1024))
+            tail = f.read()
+    except OSError:
+        return
+    for raw in tail.split(b"\n")[1:]:
+        try:
+            row = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(row, dict) or row.get("type") != "assistant" or not isinstance(row.get("message"), dict):
+            continue
+        ts = iso_to_epoch(row.get("timestamp", ""))
+        if not ts or now - ts >= RECENT_WINDOW:
+            continue
+        content = row["message"].get("content")
+        for b in content if isinstance(content, list) else []:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                out.append([ts, sid, b.get("name", "?"), b.get("id") or f"{path}:{ts}"])
+
+
 def load_cache():
     try:
         c = json.loads(read_text(CACHE, "{}"))
@@ -327,21 +354,27 @@ def save_cache(c):
         raise
 
 
-def scan_file(path, entry, budget, feed_sid, feed, names):
+def scan_file(path, entry, budget, feed_sid, feed, names, tally_sid=None, tally_out=None, now=0.0):
     """Parse new complete lines of one transcript; returns bytes consumed."""
     try:
-        size = os.path.getsize(path)
+        st = os.stat(path)
     except OSError:
         return 0
+    size = st.st_size
     off = entry.get("off", 0)
-    if size < off:  # rewritten: start over
+    # a file replaced under the same name (another inode) or shrunk is read from the start
+    if size < off or entry.get("ino", st.st_ino) != st.st_ino:
         entry.clear()
         off = 0
+    entry["ino"] = st.st_ino
     if size == off or budget <= 0:
         return 0
-    with open(path, "rb") as f:
-        f.seek(off)
-        chunk = f.read(min(size - off, budget))
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            chunk = f.read(min(size - off, budget))
+    except OSError:  # it vanished between the stat and the open
+        return 0
     end = chunk.rfind(b"\n")
     if end < 0:
         if len(chunk) >= budget and budget >= READ_BUDGET // 2:
@@ -382,13 +415,17 @@ def scan_file(path, entry, budget, feed_sid, feed, names):
                 entry["ctx"] = to_int(u.get("input_tokens")) + to_int(u.get("cache_creation_input_tokens")) \
                     + to_int(u.get("cache_read_input_tokens"))
                 entry["model"] = model
+        content = msg.get("content")
+        blocks = [b for b in (content if isinstance(content, list) else []) if isinstance(b, dict) and b.get("type") == "tool_use"]
+        # the tally counts recent calls even on a first read, which the feed skips to avoid a flood
+        if tally_sid and tally_out is not None and ts and now - ts < RECENT_WINDOW:
+            for b in blocks:
+                tally_out.append([ts, tally_sid, b.get("name", "?"), b.get("id") or f"{path}:{ts}"])
         if feed_sid:
-            content = msg.get("content")
-            for b in content if isinstance(content, list) else []:
-                if isinstance(b, dict) and b.get("type") == "tool_use":
-                    feed.append({"t": ts, "sid": feed_sid, "name": names.get(feed_sid, feed_sid[:8]),
-                                 "tool": b.get("name", "?"), "detail": detail_of(b.get("input")),
-                                 "agent": bool(row.get("isSidechain") or "/subagents/" in path)})
+            for b in blocks:
+                feed.append({"t": ts, "sid": feed_sid, "name": names.get(feed_sid, feed_sid[:8]),
+                             "tool": b.get("name", "?"), "detail": detail_of(b.get("input")),
+                             "agent": bool(row.get("isSidechain") or "/subagents/" in path)})
     entry["lastId"] = last_id
     return len(chunk)
 
@@ -410,8 +447,12 @@ def build():
             s = json.loads(read_text(os.path.join(sd, f)))
         except Exception:
             continue
+        # a session file of the wrong shape is skipped, never fatal
+        if not isinstance(s, dict) or not isinstance(s.get("sessionId"), str) or not isinstance(s.get("cwd", ""), str):
+            continue
         pid = s.get("pid")
-        if not pid or not alive(pid) or s.get("kind", "interactive") != "interactive":
+        # interactive windows and resumed background sessions; never one-shot print runs
+        if not isinstance(pid, int) or not alive(pid) or s.get("kind", "interactive") not in ("interactive", "bg"):
             continue
         sessions.append(s)
     names = {s["sessionId"]: s.get("name") or os.path.basename(s.get("cwd", "")) for s in sessions}
@@ -444,13 +485,21 @@ def build():
         cache["history"], cache["historyAt"] = found, now
     recent = [p for p in cache["history"] if os.path.exists(p)]
     is_first = {p: p not in files for p in live_paths}
-    feed_before = len(feed)
+    fresh_calls = []
+    for p, sid in live_paths.items():
+        if is_first[p]:
+            tail_calls(p, sid, now, fresh_calls)
     for p in list(live_paths) + [p for p in recent if p not in live_paths]:
         entry = files.setdefault(p, {})
         # the very first read of a live transcript would flood the feed with history
         feed_sid = live_paths.get(p) if not is_first.get(p, True) else None
-        budget -= scan_file(p, entry, budget, feed_sid, feed, names)
-    pending = sum(max(0, os.path.getsize(p) - files.get(p, {}).get("off", 0)) for p in recent if os.path.exists(p))
+        budget -= scan_file(p, entry, budget, feed_sid, feed, names, live_paths.get(p), fresh_calls, now)
+    def unread(p):
+        try:
+            return max(0, os.path.getsize(p) - files.get(p, {}).get("off", 0))
+        except OSError:
+            return 0
+    pending = sum(unread(p) for p in recent)
 
     # drop entries for files gone or older than the window
     keep = set(recent) | set(live_paths)
@@ -459,11 +508,12 @@ def build():
             del files[p]
     # every call of the last 10 minutes is counted, not just the few the Feed keeps
     tally_log = cache.get("tally", []) if isinstance(cache.get("tally"), list) else []
-    tally_log += [[e["t"], e["sid"], e["tool"]] for e in feed[feed_before:]]
-    tally_log = [x for x in tally_log if now - x[0] < RECENT_WINDOW][-20000:]
+    seen = {x[3] for x in tally_log if len(x) > 3}
+    tally_log += [x for x in fresh_calls if x[3] not in seen]  # each call once, by its tool-call id
+    tally_log = [x for x in tally_log if len(x) > 3 and now - x[0] < RECENT_WINDOW][-20000:]
     cache["tally"] = tally_log
     tally = {}
-    for _, sid, tool in tally_log:
+    for _, sid, tool, _id in tally_log:
         tally.setdefault(sid, {}).setdefault(tool, 0)
         tally[sid][tool] += 1
     feed = sorted(feed, key=lambda e: e["t"])[-FEED_KEEP:]

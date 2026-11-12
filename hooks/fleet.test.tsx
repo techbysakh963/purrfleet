@@ -438,3 +438,31 @@ test('the band shows crew counts and says when data is stale; old threads and tu
   expect(await crew.find({ type: 'Text', text: /data is \d+s old/ })).toBeDefined()
   await crew.unmount()
 })
+
+test('notebook delivery records exactly what a helper received', async () => {
+  const a = { id: 1, text: 'old instruction', by: 'you' as const, at: 0 }
+  const first = notebookDelta(undefined, [a], true)
+  // an edited note is sent again, as an edit
+  const edited = notebookDelta(first.sent, [{ ...a, text: 'replacement fact' }], false)
+  expect(edited.text).toContain('~ now reads: replacement fact')
+  expect(edited.sent).toEqual([{ id: 1, text: 'replacement fact' }])
+  // past the cap, only what was rendered counts as sent: the rest goes next time
+  const many = Array.from({ length: 40 }, (_, i) => ({ id: i + 1, text: `note ${i + 1} ${'x'.repeat(390)}`, by: 'you' as const, at: 0 }))
+  const capped = notebookDelta(undefined, many, true)
+  expect(capped.sent.length).toBe(capped.text.split('\n').length)
+  expect(capped.sent.length).toBeLessThan(40)
+  // whatever was cut arrives over the next turns, newest first, until the helper has it all
+  let sent = capped.sent
+  for (let turn = 0; turn < 5 && sent.length < 40; turn++) sent = notebookDelta(sent, many, false).sent
+  expect(sent.length).toBe(40)
+  // a removal goes first and is never dropped by the cap
+  const removal = notebookDelta([{ id: 100, text: 'obsolete fact' }, ...capped.sent], many, false)
+  expect(removal.text.startsWith('− no longer valid: obsolete fact')).toBe(true)
+  expect(removal.sent.some(s => s.id === 100)).toBe(false)
+})
+
+test('a failure reported in the helper stream fails the turn', async () => {
+  expect(parseLine('codex', '{"type":"turn.failed","error":{"message":"quota"}}').fatal).toBe(true)
+  expect(parseLine('agy', '{"event":"result","result":{"status":"ERROR","response":""}}').fatal).toBe(true)
+  expect(parseLine('agy', '{"event":"result","result":{"status":"SUCCESS","response":"ok"}}').fatal).toBeUndefined()
+})

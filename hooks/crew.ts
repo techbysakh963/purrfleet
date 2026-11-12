@@ -46,28 +46,49 @@ export function notebookText(notes: readonly CrewNote[]): string {
   return out.join('\n')
 }
 
+type Sent = { id: number; text: string }
+
 /**
- * What of the notebook a message carries: all of it when the helper's conversation
- * is fresh, else only what changed since it was last sent (added, or no longer valid),
- * so a long thread doesn't pay for the same notes on every turn.
+ * What of the notebook a message carries, and what the helper will then have seen.
+ * A fresh conversation gets the whole notebook (newest first, as much as fits); a
+ * resumed one gets only the changes: notes no longer valid first, then edited ones,
+ * then new ones, as many whole changes as fit. `sent` records exactly what was
+ * delivered, so anything cut is sent next time, and it is only committed once the
+ * helper really got the message.
  */
 export function notebookDelta(
-  sent: readonly { id: number; text: string }[] | undefined,
+  sent: readonly Sent[] | undefined,
   notes: readonly CrewNote[],
   isFresh: boolean,
-): { text: string; isDelta: boolean; sent: { id: number; text: string }[] } {
+): { text: string; isDelta: boolean; sent: Sent[] } {
   const approved = notes.filter(n => !n.pending)
-  const nowSent = approved.map(n => ({ id: n.id, text: n.text }))
-  if (isFresh || !sent) return { text: notebookText(notes), isDelta: false, sent: nowSent }
-  const added = approved.filter(n => !sent.some(s => s.id === n.id))
-  const gone = sent.filter(s => !approved.some(n => n.id === s.id))
-  const text = [
-    ...added.map(n => `+ ${n.text.slice(0, 400)} (${n.by})`),
-    ...gone.map(s => `− no longer valid: ${s.text.slice(0, 120)}`),
-  ]
-    .join('\n')
-    .slice(0, NOTEBOOK_CAP)
-  return { text, isDelta: true, sent: nowSent }
+  const lines: string[] = []
+  let size = 0
+  const fits = (line: string) => {
+    if (size + line.length + 1 > NOTEBOOK_CAP) return false
+    lines.push(line)
+    size += line.length + 1
+    return true
+  }
+  if (isFresh || !sent) {
+    const delivered: Sent[] = []
+    for (const n of [...approved].reverse()) {
+      if (fits(`- ${n.text.slice(0, 400)} (${n.by})`)) delivered.push({ id: n.id, text: n.text })
+    }
+    return { text: lines.join('\n'), isDelta: false, sent: delivered }
+  }
+  const next = new Map(sent.map(s => [s.id, s.text]))
+  for (const s of sent) {
+    if (!approved.some(n => n.id === s.id) && fits(`− no longer valid: ${s.text.slice(0, 120)}`)) next.delete(s.id)
+  }
+  for (const n of approved) {
+    const before = next.get(n.id)
+    if (before !== undefined && before !== n.text && fits(`~ now reads: ${n.text.slice(0, 400)} (${n.by})`)) next.set(n.id, n.text)
+  }
+  for (const n of [...approved].reverse()) {
+    if (!next.has(n.id) && fits(`+ ${n.text.slice(0, 400)} (${n.by})`)) next.set(n.id, n.text)
+  }
+  return { text: lines.join('\n'), isDelta: true, sent: [...next].map(([id, text]) => ({ id, text })) }
 }
 
 /** The NOTE: lines a helper offered for the notebook, at most three, each short. */
@@ -219,6 +240,8 @@ export type Parsed = {
   /** context size of the turn, in tokens */
   contextTokens?: number
   outputTokens?: number
+  /** the helper reported that the turn failed */
+  fatal?: boolean
 }
 
 const str = (v: unknown): string => (typeof v === 'string' ? v : '')
@@ -249,7 +272,8 @@ export function parseLine(agent: CrewAgent, line: string): Parsed {
       const u = obj(ev.usage)
       return { contextTokens: num(u.input_tokens), outputTokens: num(u.output_tokens) }
     }
-    if (type === 'turn.failed' || type === 'error') return { log: `! ${str(obj(ev.error).message) || str(ev.message)}` }
+    // a failure the helper reports in its stream fails the turn, whatever its exit code
+    if (type === 'turn.failed' || type === 'error') return { log: `! ${str(obj(ev.error).message) || str(ev.message)}`, fatal: true }
     return {}
   }
   const event = str(ev.event)
@@ -259,11 +283,13 @@ export function parseLine(agent: CrewAgent, line: string): Parsed {
     if (str(s.step_type) === 'agent_response') return { answer: str(s.text_delta) }
     return str(s.state) === 'ACTIVE' ? { log: str(s.step_type).replace(/_/g, ' ') } : {}
   }
+  if (event === 'error') return { log: `! ${str(ev.message) || str(obj(ev.error).message)}`, fatal: true }
   if (event === 'result') {
     const r = obj(ev.result)
     const u = obj(r.usage)
     const denied = Array.isArray(r.denied_actions) ? r.denied_actions.map(d => str(obj(d).display_name)).join(', ') : ''
     return {
+      ...(str(r.status) && str(r.status) !== 'SUCCESS' ? { fatal: true } : {}),
       final: str(r.response),
       contextTokens: num(u.input_tokens),
       outputTokens: num(u.output_tokens),
