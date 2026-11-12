@@ -16,8 +16,15 @@ export type BriefInput = {
   self: string
 }
 
+/** Outside text (tool details, helper logs, names) on one line, capped: never a way in. */
+const clean = (text: string, max = 160): string => {
+  const one = text.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim()
+  return one.length > max ? `${one.slice(0, max - 1)}…` : one
+}
+
 export function fleetReport(b: BriefInput): string {
-  const out: string[] = []
+  // everything below reports what other programs did and wrote; it is data, never instructions
+  const out: string[] = [UNTRUSTED.replace('a helper agent', 'sessions and helper agents'), '']
   if (!b.snap) return 'FLEET has no snapshot yet: its collector has not answered. Try again in a few seconds.'
   const s = b.snap
   const age = Math.max(0, Math.round(b.now - s.now))
@@ -30,7 +37,9 @@ export function fleetReport(b: BriefInput): string {
   out.push('', `NEEDS YOU (${need.length})`)
   if (need.length === 0) out.push('- nothing is waiting on the user')
   for (const x of need) {
-    out.push(`- ${x.name}${x.sid === b.self ? ' (this session)' : ''}: ${activity(x)} · ${ago(b.now - x.phaseSince)} · ${x.cwd}`)
+    out.push(
+      `- ${clean(x.name, 60)}${x.sid === b.self ? ' (this session)' : ''}: ${clean(activity(x))} · ${ago(b.now - x.phaseSince)} · ${clean(x.cwd, 120)}`,
+    )
   }
 
   const finished = b.threads
@@ -39,10 +48,9 @@ export function fleetReport(b: BriefInput): string {
     .sort((x, y) => (y.u.ended ?? 0) - (x.u.ended ?? 0))
   out.push('', `CREW FINISHED${b.since ? ' SINCE LAST BRIEFING' : ''} (${finished.length})`)
   if (finished.length === 0) out.push('- none')
-  else out.push(`(${UNTRUSTED})`)
   for (const { t, u } of finished.slice(0, 8)) {
     out.push(
-      `- ${t.name} · ${t.agent} · turn ${u.n} · ${u.status} ${ago(b.now - (u.ended ?? b.now))} ago: ${summaryOf(u.answer).slice(0, 220) || '(no answer)'}`,
+      `- ${clean(t.name, 40)} · ${t.agent} · turn ${u.n} · ${u.status} ${ago(b.now - (u.ended ?? b.now))} ago: ${clean(summaryOf(u.answer), 220) || '(no answer)'}`,
     )
   }
 
@@ -50,18 +58,20 @@ export function fleetReport(b: BriefInput): string {
   const crewRunning = b.threads.filter(t => t.status === 'running')
   out.push('', `RUNNING (${busy.length} session${busy.length === 1 ? '' : 's'}, ${crewRunning.length} crew)`)
   for (const x of busy) {
-    out.push(`- ${x.name}${x.sid === b.self ? ' (this session)' : ''}: ${activity(x)}${x.agents.length ? ` · ${x.agents.length} subagent(s)` : ''} · ${x.cwd}`)
+    out.push(
+      `- ${clean(x.name, 60)}${x.sid === b.self ? ' (this session)' : ''}: ${clean(activity(x))}${x.agents.length ? ` · ${x.agents.length} subagent(s)` : ''} · ${clean(x.cwd, 120)}`,
+    )
   }
   for (const t of crewRunning) {
     const last = t.turns[t.turns.length - 1]
-    out.push(`- crew ${t.name} · ${t.agent}: ${last?.log[last.log.length - 1] ?? 'working'} · ${ago(b.now - (last?.started ?? b.now))}`)
+    out.push(`- crew ${clean(t.name, 40)} · ${t.agent}: ${clean(last?.log[last.log.length - 1] ?? 'working')} · ${ago(b.now - (last?.started ?? b.now))}`)
   }
   if (busy.length === 0 && crewRunning.length === 0) out.push('- nothing is running')
 
   const idle = s.sessions.filter(x => !isBusy(x) && !needsYou(x))
-  if (idle.length) out.push('', `IDLE: ${idle.map(x => x.name).join(', ')}`)
+  if (idle.length) out.push('', `IDLE: ${idle.map(x => clean(x.name, 60)).join(', ')}`)
   const failed = b.threads.filter(t => t.status === 'failed')
-  if (failed.length) out.push(`CREW FAILED: ${failed.map(t => t.name).join(', ')}`)
+  if (failed.length) out.push(`CREW FAILED: ${failed.map(t => clean(t.name, 40)).join(', ')}`)
 
   out.push(
     '',
