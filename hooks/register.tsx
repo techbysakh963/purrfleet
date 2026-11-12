@@ -70,7 +70,8 @@ let busyCount = 0
 let sessionCwd = ''
 // the Obsidian vault for long-term memory, and when FLEET last wrote each notebook note
 let vaultDir = ''
-const lastWritten = new Map<string, number>()
+const lastWritten = new Map<string, string>() // what FLEET last wrote to each notebook note
+const lastSeen = new Map<string, number>() // the mtime FLEET last looked at
 let pollCount = 0
 // the children of running crew turns, by thread; leaving a loop (return) kills its child
 const running = new Map<string, AsyncIterator<unknown, unknown>>()
@@ -131,7 +132,19 @@ async function alertOnNew($: EngineInterface, sessions: Session[]): Promise<void
 }
 
 /** Repaint every mounted Raster in place; one that no longer stands is forgotten. */
+let isPainting = false
+
 async function paint($: EngineInterface): Promise<void> {
+  if (isPainting) return // a slow frame is dropped, never stacked
+  isPainting = true
+  try {
+    await paintOnce($)
+  } finally {
+    isPainting = false
+  }
+}
+
+async function paintOnce($: EngineInterface): Promise<void> {
   for (const [key, m] of [...mounted]) {
     const r = await $.ui.blit({ requestId: PANE, key, cells: frameOf(m) })
     if (r.deny !== undefined) mounted.delete(key)
@@ -218,8 +231,22 @@ type AskOpts = {
 }
 
 /** Sends a message to a thread, opening it if it is new. Answers an error string, or the thread. */
+// threads being claimed right now: checked and set with no await between, so two
+// sends can never both find a thread idle and both start a turn
+const claiming = new Set<string>()
+
 async function sendToThread($: EngineInterface, o: AskOpts): Promise<CrewThread | string> {
   const name = slug(o.name)
+  if (claiming.has(name)) return `Thread "${name}" is taking another message right now; try again in a moment.`
+  claiming.add(name)
+  try {
+    return await claimAndSend($, name, o)
+  } finally {
+    claiming.delete(name)
+  }
+}
+
+async function claimAndSend($: EngineInterface, name: string, o: AskOpts): Promise<CrewThread | string> {
   const existing = await findThread($, name)
   if (existing?.status === 'running') {
     return `Thread "${name}" is still answering its last message. Wait for it (crew_read) or use another thread.`
@@ -268,7 +295,17 @@ async function sendToThread($: EngineInterface, o: AskOpts): Promise<CrewThread 
     isHanded: false,
   }
   thread.turns = [...base.turns, turn].slice(-20)
-  await update($, threads, list => (existing ? list.map(t => (t.name === name ? thread : t)) : [...list, thread].slice(-16)))
+  await update($, threads, list => {
+    if (existing) return list.map(t => (t.name === name ? thread : t))
+    // past 16 threads the oldest idle ones go; a running one never does
+    const next = [...list, thread]
+    while (next.length > 16) {
+      const i = next.findIndex(t => t.status !== 'running')
+      if (i < 0 || next[i] === thread) break
+      next.splice(i, 1)
+    }
+    return next
+  })
   void runTurn($, name, turn.n, o.task, o.context, o.by)
   return thread
 }
@@ -286,32 +323,43 @@ async function runTurn(
   // A long thread is compacted first: the helper writes a state brief, and a
   // fresh conversation starts from it, so the thread keeps what matters.
   let seed: string | undefined
+  const isStopped = async () => (await findThread($, name))?.turns.find(u => u.n === n)?.status === 'stopped'
   // A Codex edit turn always starts a fresh worktree session (a resumed one would
   // edit your real tree), so it carries the thread over as a state brief too.
   const isCodexEdit = t.agent === 'codex' && t.mode === 'edit'
   if (t.session && (needsCompaction(t) || isCodexEdit)) {
     const briefRun = await execTurn($, { ...t, mode: 'read' }, COMPACT_PROMPT, n, true)
-    if (briefRun.ok && briefRun.answer.trim()) {
-      seed = briefRun.answer.trim()
-      if (!isCodexEdit) await patchThread($, name, x => ({ ...x, compactions: x.compactions + 1 }))
-      await patchThread($, name, x => ({ ...x, brief: seed ?? '' }))
+    if (await isStopped()) return
+    const fresh = briefRun.ok ? briefRun.answer.trim() : ''
+    if (fresh || isCodexEdit) {
+      // a failed brief keeps the conversation, except for a Codex edit, which must start
+      // fresh: it then carries the last good brief, if there is one
+      seed = fresh || t.brief || undefined
+      await patchThread($, name, x => ({
+        ...x,
+        session: '',
+        brief: seed ?? x.brief,
+        ...(fresh && !isCodexEdit ? { compactions: x.compactions + 1, compactedAt: n - 1 } : {}),
+      }))
+      t = { ...((await findThread($, name)) ?? t), session: '' }
     }
-    await patchThread($, name, x => ({ ...x, session: '' }))
-    t = (await findThread($, name)) ?? t
-    t = { ...t, session: '' }
   }
+  if (await isStopped()) return
   const notes = (await read($, notebooks))[t.cwd] ?? []
   const res = await execTurn($, t, brief(t, by, task, context, seed, notebookText(notes)), n, false)
   // what the helper offered for the shared notebook goes in, signed by it
   if (res.ok) await addNotes($, t.cwd, notesIn(res.answer), t.agent)
-  await patchThread($, name, x => ({
-    ...x,
-    status: res.ok ? 'idle' : 'failed',
-    updated: now(),
-    turns: x.turns.map(u =>
-      u.n !== n || u.status === 'stopped' ? u : { ...u, status: res.ok ? 'done' : 'failed', ended: now() },
-    ),
-  }))
+  await patchThread($, name, x => {
+    const mine = x.turns.find(u => u.n === n)
+    // a stopped turn, or one a newer turn has replaced, does not get to set the thread's status
+    if (!mine || mine.status === 'stopped' || x.turns[x.turns.length - 1]?.n !== n) return x
+    return {
+      ...x,
+      status: res.ok ? 'idle' : 'failed',
+      updated: now(),
+      turns: x.turns.map(u => (u.n !== n ? u : { ...u, status: res.ok ? 'done' : 'failed', ended: now() })),
+    }
+  })
   const settled = (await findThread($, name))?.turns.find(u => u.n === n)
   if (settled && settled.status !== 'stopped') {
     if (by === 'claude') await handToClaude($, name, n)
@@ -348,6 +396,16 @@ async function execTurn(
   let fresh: string[] = []
   let pushed = 0
   const buf = { stdout: '', stderr: '' }
+  let it: AsyncIterator<{ stream: 'stdout' | 'stderr'; text: string }, unknown> | undefined
+  const take = (stream: 'stdout' | 'stderr', line: string) => {
+    const p = stream === 'stdout' ? parseLine(t.agent, line) : { log: line.trim() }
+    if (p.session) session = p.session
+    if (p.answer) answer = (answer + p.answer).slice(-200_000)
+    if (p.final) final = p.final.slice(-200_000)
+    if (p.contextTokens) ctx = p.contextTokens
+    if (p.outputTokens) out = p.outputTokens
+    if (p.log) fresh.push(isBrief ? `[state brief] ${p.log}` : p.log)
+  }
   const flush = async (force: boolean) => {
     if (!force && now() - pushed < 0.4) return
     pushed = now()
@@ -371,33 +429,30 @@ async function execTurn(
     }))
   }
   try {
-    const it = $.process.spawn({ argv, cwd: t.cwd })[Symbol.asyncIterator]()
+    it = $.process.spawn({ argv, cwd: t.cwd })[Symbol.asyncIterator]()
     running.set(t.name, it as AsyncIterator<unknown, unknown>)
     for (;;) {
       const step = await it.next()
       if (step.done) {
-        code = (step.value as { code: number | null }).code
+        code = (step.value as { code: number | null } | undefined)?.code ?? null
         break
       }
       const { stream, text } = step.value
       const split = lines(buf[stream], text.replace(ANSI, ''))
-      buf[stream] = split.rest
-      for (const line of split.complete) {
-        const p = stream === 'stdout' ? parseLine(t.agent, line) : { log: line.trim() }
-        if (p.session) session = p.session
-        if (p.answer) answer += p.answer
-        if (p.final) final = p.final
-        if (p.contextTokens) ctx = p.contextTokens
-        if (p.outputTokens) out = p.outputTokens
-        if (p.log) fresh.push(isBrief ? `[state brief] ${p.log}` : p.log)
-      }
+      // an unfinished line is held, but never grows without bound
+      buf[stream] = split.rest.slice(-1_000_000)
+      for (const line of split.complete) take(stream, line)
       await flush(false)
     }
   } catch (failure) {
     fresh.push(`! ${String(failure)}`)
   } finally {
-    running.delete(t.name)
+    // only the run that owns the child forgets it
+    if (it && running.get(t.name) === it) running.delete(t.name)
   }
+  // a last line without a newline still counts
+  if (buf.stdout.trim()) take('stdout', buf.stdout)
+  if (buf.stderr.trim()) take('stderr', buf.stderr)
   await flush(true)
   return { ok: code === 0, answer: final ?? answer }
 }
@@ -416,7 +471,6 @@ async function handToClaude($: EngineInterface, name: string, n: number): Promis
   const t = await findThread($, name)
   const turn = t?.turns.find(u => u.n === n)
   if (!t || !turn) return
-  await patchThread($, name, x => ({ ...x, turns: x.turns.map(u => (u.n === n ? { ...u, isHanded: true } : u)) }))
   // Only a fixed notice goes into the prompt: the helper's words reach Claude as
   // crew_read's tool output, never as text that reads like the user's own.
   const text =
@@ -425,7 +479,10 @@ async function handToClaude($: EngineInterface, name: string, n: number): Promis
         `Read its summary with crew_read {"thread": "${name}"} and check it before relying on it.`
       : `[FLEET crew] The user sent you turn ${n} of thread "${name}" (${t.agent}) to review. ` +
         `Read it with crew_read {"thread": "${name}", "turn": ${n}, "full": true}, then say what you'd keep.`
-  void $.prompt.submit({ text })
+  await $.prompt
+    .submit({ text })
+    .then(() => patchThread($, name, x => ({ ...x, turns: x.turns.map(u => (u.n === n ? { ...u, isHanded: true } : u)) })))
+    .catch(() => undefined)
 }
 
 type Args = Record<string, unknown>
@@ -476,7 +533,7 @@ async function answerCrewAsk($: EngineInterface, e: Args): Promise<Answer> {
   return {
     result:
       `Sent to thread "${res.name}" (${res.agent}${res.model !== 'default' ? ` ${res.model}` : ''}, ${modeLabel(res.agent, res.mode)}), ` +
-      `turn ${turn?.n ?? 1}. It answers in the background; you'll get its SUMMARY when it finishes. ` +
+      `turn ${turn?.n ?? 1}. It answers in the background; you'll get a notice when it finishes, then crew_read gives its SUMMARY. ` +
       `Meanwhile carry on with other work.`,
   }
 }
@@ -529,7 +586,7 @@ async function registerCrewTools($: EngineInterface): Promise<void> {
       'Send a message to a crew thread: an ongoing conversation with another coding agent on this machine, "codex" ' +
       '(OpenAI Codex CLI) or "agy" (Google Antigravity CLI). Name threads by topic ("auth-review") and keep reusing them: ' +
       'the helper remembers the whole thread, and FLEET compacts long threads into a state brief by itself. It returns at ' +
-      'once; the helper works in the background and you get its SUMMARY when it is done. Helpers see only what you send ' +
+      'once; the helper works in the background, and you get a notice when it is done (read it with crew_read). Helpers see only what you send ' +
       'plus their thread, so make each task self-contained (goal, what you know, where to look, what you want back). ' +
       'Read-only unless mode is "edit", which the user must approve. You are the lead: check what comes back.',
     inputSchema: {
@@ -621,9 +678,10 @@ async function saveNotebook($: EngineInterface, folder: string): Promise<void> {
   const all = await read($, notebooks)
   await $.store.set('notebooks', all)
   if (!vaultDir) return
+  const text = notebookMarkdown(folder, all[folder] ?? [], now())
   await $.fs
-    .write(notebookPath(vaultDir, folder), notebookMarkdown(folder, all[folder] ?? [], now()))
-    .then(() => lastWritten.set(folder, Date.now()))
+    .write(notebookPath(vaultDir, folder), text)
+    .then(() => lastWritten.set(folder, text))
     .catch(() => undefined)
 }
 
@@ -634,9 +692,11 @@ async function syncFromVault($: EngineInterface): Promise<void> {
   for (const folder of new Set([sessionCwd, ...Object.keys(all)])) {
     const file = notebookPath(vaultDir, folder)
     const st = await $.fs.stat(file).catch(() => undefined)
-    if (!st || st.mtimeMs <= (lastWritten.get(folder) ?? 0) + 1500) continue
-    lastWritten.set(folder, st.mtimeMs)
+    if (!st || st.mtimeMs === lastSeen.get(folder)) continue
+    lastSeen.set(folder, st.mtimeMs)
     const text = await $.fs.read(file).catch(() => '')
+    // FLEET's own write coming back is no edit; anything else is yours, however soon
+    if (text === lastWritten.get(folder)) continue
     // only a notebook that names this exact project comes back into it
     if (projectOf(text) !== folder) continue
     const parsed = parseNotebook(text, now())
@@ -697,7 +757,8 @@ async function answerCrewSave($: EngineInterface, e: Args): Promise<Answer> {
   if (!text) return { deny: 'crew_save needs text, or a thread to save.' }
   const title = optStr(e.title) ?? (t ? `${t.name} thread` : 'finding')
   const cwd = t?.cwd ?? sessionCwd
-  const path = findingPath(vaultDir, cwd, title, now())
+  let path = findingPath(vaultDir, cwd, title, now())
+  for (let i = 2; await $.fs.exists(path); i++) path = findingPath(vaultDir, cwd, `${title} ${i}`, now())
   await $.fs.write(path, findingMarkdown({ title, text, cwd, now: now(), ...(t ? { thread: t.name, agent: t.agent } : {}) }))
   return { result: `Saved to the vault: ${path}. Point a helper at it later with crew_ask {"notes": ["${path.slice(vaultDir.length + 1)}"]}.` }
 }
@@ -710,7 +771,8 @@ async function addNotes($: EngineInterface, folder: string, texts: string[], by:
     let id = Math.max(Date.now(), list.reduce((m, n) => Math.max(m, n.id), 0))
     const known = new Set(list.map(n => n.text.toLowerCase()))
     const fresh = texts
-      .filter(t => !known.has(t.toLowerCase()))
+      .map(t => t.trim().slice(0, 400))
+      .filter(t => t && !known.has(t.toLowerCase()))
       .map(text => ({ id: ++id, text, by, at: now(), ...(by === 'codex' || by === 'agy' ? { pending: true } : {}) }))
     const all2 = [...list, ...fresh]
     // separate caps: pending offers can't push approved notes out
@@ -790,12 +852,12 @@ type Launch = { forceNew?: boolean; agent?: CrewAgent; thread?: string }
  * Sends your message: to a named thread, else the selected one, else a new
  * thread named from the message. Answers what happened, for a toast or /crew.
  */
-async function launch($: EngineInterface, task: string, how: Launch = {}): Promise<string> {
+async function launch($: EngineInterface, task: string, how: Launch = {}): Promise<{ ok: boolean; message: string }> {
   const text = task.trim()
-  if (!text) return 'Nothing to send.'
+  if (!text) return { ok: false, message: 'Nothing to send.' }
   const sel = how.thread ?? (how.forceNew ? null : await read($, crewSel))
   const current = sel ? await findThread($, slug(sel)) : undefined
-  if (how.thread && !current) return `No thread "${slug(how.thread)}". /crew lists them.`
+  if (how.thread && !current) return { ok: false, message: `No thread "${slug(how.thread)}". /crew lists them.` }
   const agent = how.agent ?? (await read($, crewAgent))
   const base = slug(text.split(/\s+/).slice(0, 4).join(' '))
   const taken = new Set((await read($, threads)).map(t => t.name))
@@ -809,20 +871,28 @@ async function launch($: EngineInterface, task: string, how: Launch = {}): Promi
     context: '',
     by: 'you',
     agent: current ? current.agent : agent,
-    model: await read($, crewModel),
-    effort: await read($, crewEffort),
-    mode: await read($, crewMode),
+    // the pickers set up a NEW thread; a follow-up keeps its thread's own settings
+    ...(current
+      ? {}
+      : { model: await read($, crewModel), effort: await read($, crewEffort), mode: await read($, crewMode) }),
   })
-  if (typeof res === 'string') return res
+  if (typeof res === 'string') return { ok: false, message: res }
   await update($, crewSel, () => res.name)
-  return `Sent to ${res.agent} thread "${res.name}" (${modeLabel(res.agent, res.mode)}). Its answer shows in the FLEET pane, tab 3.`
+  return {
+    ok: true,
+    message: `Sent to ${res.agent} thread "${res.name}" (${modeLabel(res.agent, res.mode)}). Its answer shows in the FLEET pane, tab 3.`,
+  }
 }
 
 async function launchFromPane($: EngineInterface, task: string): Promise<void> {
   if (!task.trim()) return
-  await update($, crewDraft, () => '')
-  await update($, crewInputGen, g => g + 1)
-  $.ui.toast(await launch($, task))
+  const res = await launch($, task)
+  $.ui.toast(res.message)
+  // the box empties only once the message is really on its way
+  if (res.ok) {
+    await update($, crewDraft, () => '')
+    await update($, crewInputGen, g => g + 1)
+  }
 }
 
 /**
@@ -848,11 +918,11 @@ async function crewCommand($: EngineInterface, args: string): Promise<string> {
   const fresh = text.match(/^new(?:\s+(codex|agy))?\s+([\s\S]+)$/i)
   if (fresh) {
     const agent = fresh[1]?.toLowerCase() === 'agy' ? 'agy' : fresh[1] ? 'codex' : undefined
-    return launch($, fresh[2] ?? '', { forceNew: true, ...(agent ? { agent } : {}) })
+    return (await launch($, fresh[2] ?? '', { forceNew: true, ...(agent ? { agent } : {}) })).message
   }
   const named = text.match(/^@(\S+)\s+([\s\S]+)$/)
-  if (named) return launch($, named[2] ?? '', { thread: named[1] ?? '' })
-  return launch($, text)
+  if (named) return (await launch($, named[2] ?? '', { thread: named[1] ?? '' })).message
+  return (await launch($, text)).message
 }
 
 function acts($: EngineInterface): Acts {
@@ -998,6 +1068,8 @@ export const register: Register = on => {
         return <Raster key={key} columns={m.cols} rows={m.rows} cells={frameOf(m)} />
       }
       const aurora = raster('aurora', { kind: 'aurora', cols: Math.max(10, width), rows: 1 })
+      // with the cat off, everything holds still: the ribbon is drawn once, not animated
+      if (sceneName === 'off') next.delete('aurora')
       // the cat sits beside the session legend; any stored value but 'off' means the cat
       // the Crew tab's pickers and input box: Input and Select, where the surface has them
       const { Input, Select } = E as Partial<Elements['terminal']>

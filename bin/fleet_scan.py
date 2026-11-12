@@ -101,6 +101,21 @@ def detail_of(inp):
     return ""
 
 
+def to_int(v, default=0):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def ls(d):
+    """A folder's entries, or none when it vanished (the HUD removes them as tools finish)."""
+    try:
+        return os.listdir(d)
+    except OSError:
+        return []
+
+
 def hud_state(sid):
     d = os.path.join(HUD, f"s-{sid}")
     out = {"phase": "", "phaseSince": 0, "tools": [], "agents": [], "calls": 0}
@@ -108,30 +123,30 @@ def hud_state(sid):
         return out
     ph = read_text(os.path.join(d, "phase")).strip().split("\t")
     if len(ph) == 2:
-        out["phaseSince"] = int(ph[0] or 0)
+        out["phaseSince"] = to_int(ph[0])
         out["phase"] = ph[1]
     try:
         out["calls"] = os.path.getsize(os.path.join(d, "calls"))
     except OSError:
         pass
     td = os.path.join(d, "tools")
-    for f in sorted(os.listdir(td)) if os.path.isdir(td) else []:
+    for f in sorted(ls(td)):
         p = read_text(os.path.join(td, f)).rstrip("\n").split("\t")
         if len(p) >= 2:
-            out["tools"].append({"tool": p[1], "detail": p[2] if len(p) > 2 else "", "since": int(p[0] or 0)})
+            out["tools"].append({"tool": p[1], "detail": p[2] if len(p) > 2 else "", "since": to_int(p[0])})
     rows = {}
     rd = os.path.join(d, "agentrows")
-    for f in os.listdir(rd) if os.path.isdir(rd) else []:
+    for f in ls(rd):
         p = read_text(os.path.join(rd, f)).rstrip("\n").split("\t")
         if len(p) >= 7:
-            rows[p[6]] = {"tokens": int(p[2] or 0), "ctx": int(p[3] or 0), "status": p[5]}
+            rows[p[6]] = {"tokens": to_int(p[2]), "ctx": to_int(p[3]), "status": p[5]}
     ad = os.path.join(d, "agents")
-    for f in sorted(os.listdir(ad)) if os.path.isdir(ad) else []:
+    for f in sorted(ls(ad)):
         p = read_text(os.path.join(ad, f)).rstrip("\n").split("\t")
         if len(p) >= 2:
             task = p[2] if len(p) > 2 else ""
             r = rows.get(task, {})
-            out["agents"].append({"id": f, "type": p[1], "task": task, "since": int(p[0] or 0),
+            out["agents"].append({"id": f, "type": p[1], "task": task, "since": to_int(p[0]),
                                   "tokens": r.get("tokens", 0), "ctx": r.get("ctx", 0)})
     return out
 
@@ -323,6 +338,10 @@ def scan_file(path, entry, budget, feed_sid, feed, names):
         chunk = f.read(min(size - off, budget))
     end = chunk.rfind(b"\n")
     if end < 0:
+        if len(chunk) >= budget and budget >= READ_BUDGET // 2:
+            # one record larger than a whole read: skip past it rather than stall on it forever
+            entry["off"] = off + len(chunk)
+            return len(chunk)
         return 0
     chunk = chunk[: end + 1]
     entry["off"] = off + len(chunk)
@@ -335,27 +354,31 @@ def scan_file(path, entry, budget, feed_sid, feed, names):
             row = json.loads(raw)
         except Exception:
             continue
-        if row.get("type") != "assistant":
+        # one odd record is skipped, never the whole snapshot
+        if not isinstance(row, dict) or row.get("type") != "assistant":
             continue
-        msg = row.get("message") or {}
+        msg = row.get("message")
+        if not isinstance(msg, dict):
+            continue
         ts = iso_to_epoch(row.get("timestamp", ""))
         model = msg.get("model") or ""
-        u = msg.get("usage")
+        u = msg.get("usage") if isinstance(msg.get("usage"), dict) else None
         mid = msg.get("id")
         if u and mid != last_id and model and model != "<synthetic>":
             last_id = mid
             day = local_day(ts) if ts else local_day(time.time())
             dm = days.setdefault(day, {}).setdefault(model, {"in": 0, "out": 0, "cw": 0, "cr": 0})
-            dm["in"] += u.get("input_tokens", 0) or 0
-            dm["out"] += u.get("output_tokens", 0) or 0
-            dm["cw"] += u.get("cache_creation_input_tokens", 0) or 0
-            dm["cr"] += u.get("cache_read_input_tokens", 0) or 0
+            dm["in"] += to_int(u.get("input_tokens"))
+            dm["out"] += to_int(u.get("output_tokens"))
+            dm["cw"] += to_int(u.get("cache_creation_input_tokens"))
+            dm["cr"] += to_int(u.get("cache_read_input_tokens"))
             if not row.get("isSidechain"):
-                entry["ctx"] = (u.get("input_tokens", 0) or 0) + (u.get("cache_creation_input_tokens", 0) or 0) \
-                    + (u.get("cache_read_input_tokens", 0) or 0)
+                entry["ctx"] = to_int(u.get("input_tokens")) + to_int(u.get("cache_creation_input_tokens")) \
+                    + to_int(u.get("cache_read_input_tokens"))
                 entry["model"] = model
         if feed_sid:
-            for b in msg.get("content") or []:
+            content = msg.get("content")
+            for b in content if isinstance(content, list) else []:
                 if isinstance(b, dict) and b.get("type") == "tool_use":
                     feed.append({"t": ts, "sid": feed_sid, "name": names.get(feed_sid, feed_sid[:8]),
                                  "tool": b.get("name", "?"), "detail": detail_of(b.get("input")),

@@ -194,7 +194,7 @@ test('answers are read summary-first', async () => {
   expect(short).not.toContain('DETAILS')
   expect(short.startsWith('Below is output from a helper agent')).toBe(true)
   expect(report(thread, thread.turns[0]!, true)).toContain('DETAILS')
-  const first = brief({ ...thread, turns: [] }, 'claude', 'look', '')
+  const first = brief({ ...thread, session: '', turns: [] }, 'claude', 'look', '')
   expect(first).toContain('read-only')
   expect(first).toContain('SUMMARY:')
   expect(brief(thread, 'claude', 'more', '', 'what we know')).toContain('State brief carried over')
@@ -365,4 +365,29 @@ test('the guide in Actions shows every section, wrapped rather than cut, even na
     expect(row?.text).toBe('every Claude window; whoever needs you is on top; press a row for its card')
     await ui.unmount()
   }
+})
+
+test('regressions from the Codex review stay fixed', async () => {
+  const t: CrewThread = {
+    name: 'r', agent: 'codex', model: 'default', effort: 'default', mode: 'read', cwd: '/p', by: 'claude',
+    session: '', status: 'running', compactions: 0, brief: '', created: 0, updated: 0,
+    turns: [{ n: 1, by: 'claude', ask: 'look', status: 'running', started: 0, answer: '', log: [], contextTokens: 0, outputTokens: 0, isHanded: false }],
+  }
+  // the runner adds the turn before the brief: the first message still carries the rules
+  expect(brief(t, 'claude', 'look', '')).toContain('You are read-only')
+  expect(brief({ ...t, session: 's' }, 'claude', 'more', '')).not.toContain('You are read-only')
+  // compaction keeps firing after the first one
+  const done = (n: number) => ({ n, by: 'you' as const, ask: 'q', status: 'done' as const, started: 0, answer: 'a', log: [], contextTokens: 1000, outputTokens: 1, isHanded: false })
+  const after = { ...t, session: 's', compactions: 2, compactedAt: 20, turns: Array.from({ length: 10 }, (_, i) => done(21 + i)) }
+  expect(needsCompaction(after)).toBe(true)
+  expect(needsCompaction({ ...after, turns: after.turns.slice(0, 5) })).toBe(false)
+  // one oversized note never hides the rest
+  expect(notebookText([{ id: 1, text: 'useful fact', by: 'you', at: 0 }, { id: 2, text: 'x'.repeat(9000), by: 'claude', at: 0 }])).toContain('useful fact')
+  // a summary read sends a short task label, and names the turn it read
+  const long = { ...done(3), ask: 'y'.repeat(2000), answer: 'SUMMARY: fine' }
+  const r = report({ ...t, turns: [done(1), done(2), long] }, long, false)
+  expect(r.length).toBeLessThan(800)
+  expect(r).toContain('"turn": 3')
+  // a last stream line without a newline is held, then still counts at the end
+  expect(lines('', '{"type":"thread.started","thread_id":"t1"}').rest).toContain('thread.started')
 })

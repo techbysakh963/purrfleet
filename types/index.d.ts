@@ -117,6 +117,8 @@ export type CrewThread = {
   status: 'idle' | 'running' | 'failed'
   turns: CrewTurn[]
   compactions: number
+  /** the turn number the last compaction happened before (0: never) */
+  compactedAt?: number
   /** the state brief a compaction carried into the fresh conversation */
   brief: string
   created: number

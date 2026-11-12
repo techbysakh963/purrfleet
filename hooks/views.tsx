@@ -671,7 +671,7 @@ function Crew(E: Els, v: View, act: Acts) {
         <Box flexDirection="column" marginTop={1}>
           <Text color={p.dim}>No threads yet. Type a task above, or ask Claude:</Text>
           <Text color={p.text}> "open a codex thread 'auth-review' and have it audit the login flow"</Text>
-          <Text color={p.dim}>Threads remember everything; long ones compact themselves into a brief.</Text>
+          <Text color={p.dim}>Threads remember their conversation; long ones are compacted into a brief (some detail is lost).</Text>
         </Box>
       ) : (
         <Box flexDirection="column" marginTop={1}>
