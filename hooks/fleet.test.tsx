@@ -3,7 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Snapshot } from '../types'
 import { ago, bar, spark, usd } from './fmt'
 import { catCells } from './cat'
-import { argvFor, batchNotice, brief, digest, editDecision, grepAnswer, localBrief, receipt, sections, lines, mergeThreads, needsCompaction, notebookDelta, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
+import { argvFor, batchNotice, brief, digest, editDecision, findingsIn, grepAnswer, localBrief, mergeFindings, receipt, reviewDigest, reviewTask, sections, lines, mergeThreads, needsCompaction, notebookDelta, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
 import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { fleetReport } from './brief'
@@ -913,4 +913,24 @@ test('the status line beside a prompt: fixed words and names only, once per chan
   expect(statusNews([t, f], {}).key).not.toBe(news.key) // a change makes a new key
   expect(statusNews([t, f], { '/p': [{ id: 1, text: 'x', by: 'codex', at: 0, pending: true }] }).key).toBe(news.key)
   expect(statusNews([crewThread('q', { turns: [doneTurn(1, { unread: false })] })], {}).text).toBe('')
+})
+
+test('crew_review: a fixed brief with the diff, F lines parsed, two reviewers merged into one list', async () => {
+  const task = reviewTask({ intent: 'fix the refresh race', agent: 'agy', stat: ' a.ts | 3 +-', patch: 'diff --git a/a.ts b/a.ts', truncated: true, diffCmd: 'git diff HEAD' })
+  expect(task).toContain('fix the refresh race')
+  expect(task).toContain('naming')
+  expect(task).toContain('F1 [high|med|low]')
+  expect(task).toContain('Read the changed files above') // agy can't run git in plan mode
+  expect(reviewTask({ intent: 'x', agent: 'codex', stat: '', patch: '', truncated: true, diffCmd: 'git diff HEAD' })).toContain('Run `git diff HEAD`')
+  const codex = findingsIn('SUMMARY: two\nF1 [high] src/auth/refresh.ts:88 — no lock — two tabs both refresh\nF2 [low] test/a.test.ts — no test — logout race', 'codex')
+  const agy = findingsIn('- **F1** [medium] `src/auth/refresh.ts:90` - lock missing - double token\nF2 [med] src/auth/index.ts:12 — two names — confusion', 'agy')
+  expect(codex.length).toBe(2)
+  expect(agy[0]).toEqual({ sev: 'med', path: 'src/auth/refresh.ts', line: 90, text: 'lock missing - double token', by: ['agy'] })
+  const merged = mergeFindings([codex, agy])
+  expect(merged.length).toBe(3)
+  expect(merged[0]).toMatchObject({ sev: 'high', path: 'src/auth/refresh.ts', by: ['codex', 'agy'] })
+  const block = reviewDigest('review-auth', merged, 'codex medium')
+  expect(block).toContain('3 findings (1 raised by both)')
+  expect(block).toContain('F1 [high] src/auth/refresh.ts:88 (codex, agy)')
+  expect(findingsIn('no findings here', 'codex')).toEqual([])
 })

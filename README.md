@@ -85,6 +85,10 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   helper Claude started by mistake. `crew_note`, `crew_save`, `vault_search` and `crew_stop` are
   deferred tools, loaded on demand, so they cost nothing in requests that don't use them. A new
   `fleet-delegate` skill says when a helper pays for itself.
+- **`crew_review`** (v0.16): one call has Codex and Antigravity review a change (uncommitted, staged,
+  a branch, a commit, or files). FLEET makes the diff through its hardened git path, gives each a
+  complementary focus and a strict finding format, and `crew_read {"new": true}` returns one merged
+  list (the same file within 5 lines counts once, naming both). The `fleet-review` skill uses it.
 - **Crew news for Claude** (v0.15): when a helper answered or failed, or notes are waiting, since
   Claude last looked, one line rides along with your next typed prompt, which only the model reads
   (`[FLEET] since you last looked: ◆ review-ui#3 (agy) answered · …`). Fixed words, thread names and

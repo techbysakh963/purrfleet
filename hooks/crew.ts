@@ -585,3 +585,79 @@ export const depthRule = (depth: Depth = 'normal'): string[] =>
 /** One-line receipt for a crew_ask. */
 export const receipt = (sent: readonly { name: string; n: number; agent: CrewAgent; mode: CrewMode }[], extra = ''): string =>
   `sent · ${sent.map(x => `${x.name}#${x.n} (${x.agent}, ${modeLabel(x.agent, x.mode)})`).join(' · ')} · ${sent.length > 1 ? 'one notice when all finish' : "a notice when it's done"}${extra}`
+
+// ── crew_review: one call, both helpers, the diff handed over, findings merged ──
+
+export type Finding = { sev: 'high' | 'med' | 'low'; path: string; line?: number; text: string; by: string[] }
+
+const SEV_RANK: Record<Finding['sev'], number> = { high: 0, med: 1, low: 2 }
+
+/** The fixed brief a reviewer gets: intent, the change, its focus, and a strict finding format. */
+export function reviewTask(o: { intent: string; focus?: string; agent: CrewAgent; stat: string; patch: string; truncated: boolean; diffCmd: string }): string {
+  const angle =
+    o.agent === 'codex'
+      ? 'correctness, edge cases, error handling, concurrency, and tests that are missing'
+      : 'interface and API design, naming, readability, and consistency with the code around it'
+  return [
+    `Review this change, read-only. What it is meant to do: ${o.intent}`,
+    `Look hardest at: ${angle}${o.focus ? `; and above all: ${o.focus}` : ''}.`,
+    '',
+    'Report every finding on its own line, exactly like this, most severe first:',
+    'F1 [high|med|low] path/to/file.ts:LINE — the claim — a concrete failure scenario',
+    'Only findings you can point to in the code. No praise, no restating the diff.',
+    '',
+    'Files changed:',
+    o.stat.trim() || '(none)',
+    '',
+    'The diff:',
+    o.patch,
+    ...(o.truncated
+      ? ['', `(The diff was cut here. ${o.agent === 'codex' ? `Run \`${o.diffCmd}\` for the rest.` : 'Read the changed files above for the rest.'})`]
+      : []),
+  ].join('\n')
+}
+
+/** The F lines of a review answer. */
+export function findingsIn(answer: string, by: string): Finding[] {
+  const out: Finding[] = []
+  for (const raw of answer.split('\n')) {
+    const m = raw.match(/^\s*[-*]?\s*\**F\d+\**\s*\[(high|med|medium|low)\]\s*`?([^\s:`]+)(?::(\d+))?`?\s*[—–-]+\s*(.+)$/i)
+    if (!m) continue
+    const sevRaw = (m[1] ?? '').toLowerCase()
+    out.push({
+      sev: sevRaw === 'high' ? 'high' : sevRaw === 'low' ? 'low' : 'med',
+      path: m[2] ?? '',
+      ...(m[3] ? { line: Number(m[3]) } : {}),
+      text: (m[4] ?? '').replace(/\*\*/g, '').trim().slice(0, 300),
+      by: [by],
+    })
+  }
+  return out
+}
+
+/** Two reviewers' findings as one list: the same file within 5 lines is one finding, naming both. */
+export function mergeFindings(lists: readonly Finding[][]): Finding[] {
+  const merged: Finding[] = []
+  for (const f of lists.flat()) {
+    const same = merged.find(
+      g => g.path === f.path && (g.line === undefined || f.line === undefined ? g.line === f.line : Math.abs(g.line - f.line) <= 5),
+    )
+    if (same) {
+      for (const b of f.by) if (!same.by.includes(b)) same.by.push(b)
+      if (SEV_RANK[f.sev] < SEV_RANK[same.sev]) same.sev = f.sev
+    } else merged.push({ ...f, by: [...f.by] })
+  }
+  return merged.sort((a, b) => SEV_RANK[a.sev] - SEV_RANK[b.sev] || b.by.length - a.by.length)
+}
+
+/** The merged block crew_read shows for a two-helper review. */
+export function reviewDigest(topic: string, merged: readonly Finding[], confidence: string): string {
+  const both = merged.filter(f => f.by.length > 1).length
+  return [
+    `${topic} · merged from ${[...new Set(merged.flatMap(f => f.by))].join(' and ') || 'both reviewers'} · ${merged.length} finding${merged.length === 1 ? '' : 's'}${both ? ` (${both} raised by both)` : ''}`,
+    ...merged.slice(0, 20).map((f, i) => `F${i + 1} [${f.sev}] ${f.path}${f.line ? `:${f.line}` : ''} (${f.by.join(', ')}) — ${f.text}`),
+    ...(merged.length > 20 ? [`… ${merged.length - 20} more`] : []),
+    ...(confidence ? [`CONFIDENCE: ${confidence}`] : []),
+    `(one finding's detail: crew_read {"thread":"${topic}-codex","grep":"F1"})`,
+  ].join('\n')
+}

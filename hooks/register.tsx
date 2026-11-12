@@ -14,7 +14,12 @@ import {
   brief,
   digest,
   editDecision,
+  findingsIn,
   localBrief,
+  mergeFindings,
+  reviewDigest,
+  reviewTask,
+  sections,
   grepAnswer,
   receipt,
   UNTRUSTED,
@@ -987,6 +992,67 @@ async function answerVaultSearch($: EngineInterface, e: Args): Promise<Answer> {
   }
 }
 
+const REVIEW_INLINE = 30_000 // characters of patch sent inside each reviewer's task
+
+/** The git diff arguments for a review target; undefined when the target is not one FLEET accepts. */
+function diffArgs(target: string): { args: string[]; label: string } | undefined {
+  const ref = (x: string) => /^[\w./~^@{}-]+$/.test(x) && !x.startsWith('-')
+  if (target === 'working') return { args: ['diff', 'HEAD'], label: 'git diff HEAD' }
+  if (target === 'staged') return { args: ['diff', '--cached'], label: 'git diff --cached' }
+  const [kind, rest = ''] = [target.slice(0, target.indexOf(':')), target.slice(target.indexOf(':') + 1)]
+  if (kind === 'branch' && ref(rest)) return { args: ['diff', `${rest}...HEAD`], label: `git diff ${rest}...HEAD` }
+  if (kind === 'commit' && ref(rest)) return { args: ['diff', `${rest}^!`], label: `git diff ${rest}^!` }
+  if (kind === 'files') {
+    const files = rest.split(',').map(f => f.trim()).filter(f => f && !f.startsWith('-'))
+    if (files.length) return { args: ['diff', 'HEAD', '--', ...files], label: `git diff HEAD -- ${files.join(' ')}` }
+  }
+  return undefined
+}
+
+/** One call: FLEET works out the diff and has both helpers review it, each from its own angle. */
+async function answerCrewReview($: EngineInterface, e: Args): Promise<Answer> {
+  const intent = optStr(e.intent)
+  if (!intent) return { deny: 'crew_review needs the intent: what the change is meant to do.' }
+  const target = optStr(e.target) ?? 'working'
+  const how = diffArgs(target)
+  if (!how) return { deny: `Unknown target "${target}". Use working, staged, branch:<base>, commit:<sha>, or files:<a,b>.` }
+  const repo = await repoAt($, sessionCwd)
+  if (!repo) return { deny: `${sessionCwd} is not a git repository.` }
+  const opts = ['--no-ext-diff', '--no-textconv']
+  const stat = await gitOut($, ['-C', repo.root, ...how.args.slice(0, 1), ...opts, '--stat', ...how.args.slice(1)])
+  if (!stat.ok) return { deny: `git couldn't read the change: ${stat.why}` }
+  if (!stat.out.trim()) return { deny: `No changes for target "${target}".` }
+  const patch = await gitOut($, ['-C', repo.root, ...how.args.slice(0, 1), ...opts, ...how.args.slice(1)])
+  if (!patch.ok) return { deny: `git couldn't read the change: ${patch.why}` }
+  const truncated = patch.out.length > REVIEW_INLINE
+  const head = patch.out.slice(0, REVIEW_INLINE)
+  const branch = await gitOut($, ['-C', repo.root, 'rev-parse', '--abbrev-ref', 'HEAD'])
+  const topic = slug(optStr(e.topic) ?? `review-${branch.ok ? branch.out.trim() : 'change'}`).slice(0, 24)
+  const agents = (Array.isArray(e.agents) ? e.agents : ['codex', 'agy']).filter((a): a is CrewAgent => a === 'codex' || a === 'agy')
+  if (agents.length === 0) return { deny: 'agents must name codex and/or agy.' }
+  const sent: { name: string; n: number; agent: CrewAgent; mode: CrewMode }[] = []
+  const refused: string[] = []
+  for (const agent of agents) {
+    const res = await sendToThread($, {
+      name: `${topic}-${agent}`,
+      agent,
+      task: reviewTask({ intent, ...(optStr(e.focus) ? { focus: optStr(e.focus) } : {}), agent, stat: stat.out, patch: head, truncated, diffCmd: how.label }),
+      context: '',
+      by: 'claude',
+      depth: 'normal',
+      folder: repo.root,
+      mode: 'read',
+    })
+    if (typeof res === 'string') refused.push(res)
+    else sent.push({ name: res.name, n: res.turns[res.turns.length - 1]?.n ?? 1, agent: res.agent, mode: res.mode })
+  }
+  if (sent.length === 0) return { deny: refused.join(' ') }
+  const files = stat.out.trim().split('\n').pop() ?? ''
+  return {
+    result: `review started · ${sent.map(x => `${x.name}#${x.n}`).join(' · ')} · ${files.trim()}${truncated ? ` · diff cut at ${REVIEW_INLINE.toLocaleString('en-US')} chars` : ''}${refused.length ? ` · not sent: ${refused.join(' ')}` : ''} · one notice when all finish, then crew_read {"new": true}`,
+  }
+}
+
 /** Claude stops a helper turn it started by mistake. */
 async function answerCrewStop($: EngineInterface, e: Args): Promise<Answer> {
   const name = slug(optStr(e.thread) ?? '')
@@ -1020,9 +1086,36 @@ async function answerCrewRead($: EngineInterface, e: Args): Promise<Answer> {
       }
     }
     const blocks: string[] = []
+    const done = new Set<string>()
     for (const { t, u } of due) {
+      if (done.has(t.name)) continue
+      // a review pair (<topic>-codex and <topic>-agy) whose answers carry F lines reads as one merged list
+      const pair = t.name.match(/^(.*)-(codex|agy)$/)
+      const mate = pair ? due.find(x => x.t.name === `${pair[1]}-${pair[2] === 'codex' ? 'agy' : 'codex'}`) : undefined
+      if (pair && mate) {
+        const a = await fullTurn($, t.name, u)
+        const b = await fullTurn($, mate.t.name, mate.u)
+        const fa = findingsIn(a.answer, t.agent)
+        const fb = findingsIn(b.answer, mate.t.agent)
+        if (fa.length + fb.length > 0) {
+          const conf = [a, b]
+            .map((x, i) => {
+              const c = sections(x.answer).confidence
+              return c ? `${i === 0 ? t.agent : mate.t.agent} ${c.slice(0, 120)}` : ''
+            })
+            .filter(Boolean)
+            .join(' · ')
+          blocks.push(reviewDigest(pair[1] ?? t.name, mergeFindings([fa, fb]), conf))
+          for (const x of [{ t, u }, mate]) {
+            await markRead($, x.t.name, x.u.n)
+            done.add(x.t.name)
+          }
+          continue
+        }
+      }
       blocks.push(digest(t, await fullTurn($, t.name, u), t0) + deliveryNote(u.delivery))
       await markRead($, t.name, u.n)
+      done.add(t.name)
     }
     toldKey = statusNews(await read($, threads), await read($, notebooks)).key
     return { result: [UNTRUSTED, '', blocks.join('\n\n')].join('\n') }
@@ -1174,6 +1267,27 @@ async function registerCrewTools($: EngineInterface): Promise<void> {
       },
     },
     isDeferred: true,
+  })
+  await $.tool.register({
+    name: 'crew_review',
+    description:
+      'Have Codex and Antigravity review a change, read-only, in parallel. FLEET works out the diff, hands it to each ' +
+      'reviewer with a complementary focus (codex: correctness, edge cases, concurrency, missing tests; agy: interface, ' +
+      'naming, consistency), and asks for findings as "F<n> [high|med|low] path:line — claim — failure scenario". You get ' +
+      'one notice; crew_read {"new": true} then shows ONE merged list (the same file within 5 lines counts once, naming ' +
+      'both). You still verify every finding.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        intent: { type: 'string', description: 'what the change is meant to do, in a sentence or two' },
+        target: { type: 'string', description: 'working (default: uncommitted changes), staged, branch:<base>, commit:<sha>, or files:<a,b>' },
+        focus: { type: 'string', description: 'optional: what to look hardest at' },
+        agents: { type: 'array', items: { type: 'string', enum: ['codex', 'agy'] }, description: 'default both' },
+        topic: { type: 'string', description: 'thread name stem; default review-<branch>' },
+      },
+      required: ['intent'],
+    },
+    isDeferred: false,
   })
   await $.tool.register({
     name: 'vault_search',
@@ -1687,6 +1801,7 @@ export const register: Register = on => {
     if (name === 'mcp__fleet__fleet_read') return answerFleetRead($, e as unknown as Args)
     if (name === 'mcp__fleet__vault_search') return answerVaultSearch($, e as unknown as Args)
     if (name === 'mcp__fleet__crew_stop') return answerCrewStop($, e as unknown as Args)
+    if (name === 'mcp__fleet__crew_review') return answerCrewReview($, e as unknown as Args)
     return next(e)
   }).catch(($, e, next) => {
     // fail safe: FLEET's own tool reports the failure; every other tool goes on untouched
