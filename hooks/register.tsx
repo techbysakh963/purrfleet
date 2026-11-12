@@ -11,6 +11,7 @@ import {
   argvFor,
   batchNotice,
   brief,
+  editDecision,
   capAnswer,
   lines,
   mergeThreads,
@@ -30,7 +31,7 @@ import { PALETTES, paletteOf } from './theme'
 import type { Palette } from './theme'
 import { fleetReport } from './brief'
 import { inbox } from './inbox'
-import { deliveryLine, newCodexWorktree, parseNumstat, parseWorktrees } from './delivery'
+import { deliveryLine, newCodexWorktrees, parseNumstat, parseWorktrees } from './delivery'
 import { findingMarkdown, findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf } from './vault'
 import { Band, Pane, ordered } from './views'
 import type { Acts } from './views'
@@ -214,7 +215,7 @@ async function stopSession($: EngineInterface, s: Session): Promise<void> {
     header: 'FLEET',
     options: ['Interrupt its current turn', 'End the session', 'Cancel'],
   })
-  const signal = answer.startsWith('Interrupt') ? '-INT' : answer.startsWith('End') ? '-TERM' : null
+  const signal = answer === 'Interrupt its current turn' ? '-INT' : answer === 'End the session' ? '-TERM' : null
   if (signal === null) return
   const run = await $.process.run(['kill', signal, String(s.pid)])
   $.ui.toast(run.exitCode === 0 ? `Sent ${signal.slice(1)} to ${s.name}` : `kill failed: ${run.stderr.trim()}`)
@@ -241,27 +242,35 @@ const SAFE_GIT = [
   '-c', 'core.fsmonitor=false',
   '-c', 'core.hooksPath=/dev/null',
   '-c', 'core.untrackedCache=false',
-  '-c', 'diff.external=',
   '-c', 'core.pager=cat',
   '-c', 'protocol.allow=never',
 ] as const
 
-const git = ($: EngineInterface, args: readonly string[], stdin?: string) =>
+const git = ($: EngineInterface, args: readonly string[], stdin?: string, env: Record<string, string> = {}) =>
   $.process.run(['git', ...SAFE_GIT, ...args], {
     timeoutMs: 30_000,
-    env: { GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' },
+    env: { GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', ...env },
     ...(stdin === undefined ? {} : { stdin }),
   })
+
+/** A git answer, or why there is none: a failed or cut-off output is never taken as whole. */
+type GitOut = { ok: true; out: string } | { ok: false; why: string }
+const gitOut = async ($: EngineInterface, args: readonly string[], env: Record<string, string> = {}): Promise<GitOut> => {
+  const r = await git($, args, undefined, env).catch((e: unknown) => ({ exitCode: -1, stdout: '', stderr: String(e), isStdoutTruncated: false }))
+  if (r.exitCode !== 0) return { ok: false, why: r.stderr.trim().split('\n')[0] || `git exited ${r.exitCode}` }
+  if (r.isStdoutTruncated) return { ok: false, why: 'the change is too large to read whole (over 4 MB)' }
+  return { ok: true, out: r.stdout }
+}
 
 /**
  * The worktree's git dir as your repo (trusted) records it: the entry under
  * <common dir>/worktrees whose `gitdir` file points at <path>/.git. Never the
  * worktree's own `.git` pointer, which Codex could have rewritten.
  */
-async function trustedGitDir($: EngineInterface, cwd: string, path: string): Promise<string | undefined> {
-  const r = await git($, ['-C', cwd, 'rev-parse', '--path-format=absolute', '--git-common-dir']).catch(() => undefined)
-  if (!r || r.exitCode !== 0) return undefined
-  const base = `${r.stdout.trim()}/worktrees`
+async function trustedGitDir($: EngineInterface, root: string, path: string): Promise<string | undefined> {
+  const r = await gitOut($, ['-C', root, 'rev-parse', '--path-format=absolute', '--git-common-dir'])
+  if (!r.ok) return undefined
+  const base = `${r.out.trim()}/worktrees`
   for (const e of await $.fs.list(base).catch(() => [])) {
     if (e.kind !== 'dir') continue
     const pointer = (await $.fs.read(`${base}/${e.name}/gitdir`).catch(() => '')).trim()
@@ -271,37 +280,69 @@ async function trustedGitDir($: EngineInterface, cwd: string, path: string): Pro
 }
 
 async function worktreesOf($: EngineInterface, cwd: string): Promise<string[]> {
-  const r = await git($, ['-C', cwd, 'worktree', 'list', '--porcelain']).catch(() => undefined)
-  return r && r.exitCode === 0 ? parseWorktrees(r.stdout) : []
+  const r = await gitOut($, ['-C', cwd, 'worktree', 'list', '--porcelain'])
+  return r.ok ? parseWorktrees(r.out) : []
 }
 
-/** Everything Codex changed in its worktree, staged there so new files count too. */
-async function stagedIn($: EngineInterface, cwd: string, path: string, what: 'numstat' | 'patch'): Promise<string | undefined> {
-  const gitDir = await trustedGitDir($, cwd, path)
-  if (!gitDir) return undefined
-  const at = ['--git-dir', gitDir, '--work-tree', path]
-  if ((await git($, [...at, 'add', '-A'])).exitCode !== 0) return undefined
-  const r = await git($, [...at, 'diff', '--cached', '--no-ext-diff', '--no-textconv', what === 'numstat' ? '--numstat' : '--binary'])
-  return r.exitCode === 0 ? r.stdout : undefined
+/** The repository's top folder and current commit: patches are made and applied from the top. */
+async function repoAt($: EngineInterface, cwd: string): Promise<{ root: string; head: string } | undefined> {
+  const r = await gitOut($, ['-C', cwd, 'rev-parse', '--show-toplevel', 'HEAD'])
+  if (!r.ok) return undefined
+  const [root, head] = r.out.trim().split('\n')
+  return root && head ? { root, head } : undefined
 }
 
-async function deliveryOf($: EngineInterface, cwd: string, before: readonly string[]): Promise<Delivery | undefined> {
+/**
+ * Settings that make every filter a no-op while FLEET reads Codex's worktree: a
+ * `.gitattributes` Codex wrote could otherwise name a filter whose command then
+ * runs outside its sandbox. Attributes also come from the turn's starting commit.
+ */
+async function noFilters($: EngineInterface, root: string): Promise<string[]> {
+  const r = await gitOut($, ['-C', root, 'config', '--name-only', '--get-regexp', '^filter\\.'])
+  const names = new Set(r.ok ? r.out.split('\n').map(l => l.match(/^filter\.(.+)\.[^.]+$/)?.[1]).filter((x): x is string => !!x) : [])
+  return [...names].flatMap(n => ['-c', `filter.${n}.clean=`, '-c', `filter.${n}.smudge=`, '-c', `filter.${n}.process=`, '-c', `filter.${n}.required=false`])
+}
+
+/** Everything Codex changed since the turn began, commits included: staged in its worktree, diffed from the starting commit. */
+async function captured($: EngineInterface, root: string, d: Pick<Delivery, 'path' | 'base'>, what: 'numstat' | 'patch'): Promise<GitOut> {
+  const gitDir = await trustedGitDir($, root, d.path)
+  if (!gitDir) return { ok: false, why: "Codex's worktree is gone, or not one your repo knows" }
+  const env: Record<string, string> = d.base ? { GIT_ATTR_SOURCE: d.base } : {}
+  const at = [...(await noFilters($, root)), '-c', 'core.attributesFile=/dev/null', '--git-dir', gitDir, '--work-tree', d.path]
+  const add = await gitOut($, [...at, 'add', '-A'], env)
+  if (!add.ok) return add
+  const base = d.base ?? (await gitOut($, [...at, 'rev-parse', 'HEAD'], env))
+  const from = typeof base === 'string' ? base : base.ok ? base.out.trim() : 'HEAD'
+  return gitOut($, [...at, 'diff', '--cached', '--no-ext-diff', '--no-textconv', what === 'numstat' ? '--numstat' : '--binary', from], env)
+}
+
+/** The worktree a Codex edit turn made, read when the turn ends. Two new ones at once can't be told apart: then none is claimed. */
+async function deliveryOf($: EngineInterface, cwd: string, before: readonly string[], start: { root: string; head: string }): Promise<Delivery | undefined> {
   const home = (await $.env.get('HOME')) ?? ''
-  const path = newCodexWorktree(before, await worktreesOf($, cwd), home)
-  if (!path) return undefined
-  const stat = await stagedIn($, cwd, path, 'numstat')
-  return { path, files: stat === undefined ? [] : parseNumstat(stat), state: 'pending' }
+  const fresh = newCodexWorktrees(before, await worktreesOf($, cwd), home)
+  if (fresh.length === 0) return undefined
+  if (fresh.length > 1) {
+    return { path: '', root: start.root, base: start.head, files: [], state: 'discarded', note: `${fresh.length} new Codex worktrees appeared at once; FLEET can't tell which is this turn's, so it claims none. Look in ~/.codex/worktrees.` }
+  }
+  const d: Delivery = { path: fresh[0]!, root: start.root, base: start.head, files: [], state: 'pending' }
+  const stat = await captured($, start.root, d, 'numstat')
+  return stat.ok ? { ...d, files: parseNumstat(stat.out) } : { ...d, note: `couldn't read the changes: ${stat.why}` }
 }
 
 const deliveryAt = async ($: EngineInterface, name: string, n: number) => {
   const t = await findThread($, name)
   const u = t?.turns.find(x => x.n === n)
-  return t && u?.delivery ? { t, d: u.delivery } : undefined
+  if (!t || !u?.delivery) return undefined
+  // deliveries from before v0.11.1 carry no root: find it from the thread's folder
+  const root = u.delivery.root ?? (await repoAt($, t.cwd))?.root ?? t.cwd
+  return { t, d: { ...u.delivery, root } }
 }
 
+/** A decision is news to other windows too: it moves the thread's `updated` on. */
 async function setDelivery($: EngineInterface, name: string, n: number, change: Partial<Delivery>): Promise<void> {
   await patchThread($, name, x => ({
     ...x,
+    updated: now(),
     turns: x.turns.map(u => (u.n === n && u.delivery ? { ...u, delivery: { ...u.delivery, ...change } } : u)),
   }))
   await persist($)
@@ -313,49 +354,78 @@ async function viewDelivery($: EngineInterface, name: string, n: number): Promis
   if ((await read($, crewDiff))?.key === key) return void (await update($, crewDiff, () => null))
   const at = await deliveryAt($, name, n)
   if (!at) return
-  const patch = await stagedIn($, at.t.cwd, at.d.path, 'patch')
-  const text = patch === undefined ? '(the worktree is gone or git failed to read it)' : patch.trim() || '(no changes)'
+  const patch = await captured($, at.d.root, at.d, 'patch')
+  const text = !patch.ok ? `(${patch.why})` : patch.out.trim() || '(no changes)'
   await update($, crewDiff, () => ({ key, text: text.length > 60_000 ? `${text.slice(0, 60_000)}\n…(cut)` : text }))
 }
 
-/** Applies Codex's changes to your tree, after you confirm; then its worktree goes. */
+// one decision per delivery at a time: a second press waits out the first's confirmation
+const deciding = new Set<string>()
+
+/** Applies Codex's changes to your repository, after you confirm; then its worktree goes. */
 async function acceptDelivery($: EngineInterface, name: string, n: number): Promise<void> {
-  const at = await deliveryAt($, name, n)
-  if (!at || at.d.state !== 'pending') return
-  const answer = await $.ui.ask(`Apply ${deliveryLine(at.d)} from codex › ${name} to ${at.t.cwd}?`, {
-    header: 'FLEET crew',
-    options: ['Apply to my tree', 'Cancel'],
-  })
-  if (!answer.startsWith('Apply')) return
-  const patch = await stagedIn($, at.t.cwd, at.d.path, 'patch')
-  if (patch === undefined) return setDelivery($, name, n, { note: "couldn't read the worktree; it may be gone" })
-  if (!patch.trim()) return setDelivery($, name, n, { note: 'nothing to apply' })
-  const check = await git($, ['-C', at.t.cwd, 'apply', '--check', '-'], patch)
-  if (check.exitCode !== 0) {
-    const why = check.stderr.trim().split('\n')[0] ?? 'git apply refused'
-    $.ui.toast(`Crew · ${name}: not applied, ${why}`)
-    return setDelivery($, name, n, { note: `not applied: ${why}` })
+  const key = `${name}#${n}`
+  if (deciding.has(key)) return
+  deciding.add(key)
+  try {
+    const at = await deliveryAt($, name, n)
+    if (!at || at.d.state !== 'pending') return
+    const answer = await $.ui.ask(`Apply ${deliveryLine(at.d)} from codex › ${name} to ${at.d.root}?`, {
+      header: 'FLEET crew',
+      options: ['Apply to my tree', 'Cancel'],
+    })
+    if (answer !== 'Apply to my tree') return
+    // read again after the pause: another window may have decided meanwhile
+    const now2 = await deliveryAt($, name, n)
+    if (!now2 || now2.d.state !== 'pending') return
+    const patch = await captured($, at.d.root, at.d, 'patch')
+    if (!patch.ok) return setDelivery($, name, n, { note: `not applied: ${patch.why}` })
+    if (!patch.out.trim()) return setDelivery($, name, n, { note: 'nothing to apply' })
+    // from the repository's top folder, so no path in the patch is silently skipped
+    const check = await git($, ['-C', at.d.root, 'apply', '--check', '-'], patch.out)
+    if (check.exitCode !== 0) {
+      const why = check.stderr.trim().split('\n')[0] || 'git apply refused'
+      $.ui.toast(`Crew · ${name}: not applied, ${why}`)
+      return setDelivery($, name, n, { note: `not applied: ${why}` })
+    }
+    const done = await git($, ['-C', at.d.root, 'apply', '-'], patch.out)
+    if (done.exitCode !== 0) return setDelivery($, name, n, { note: `not applied: ${done.stderr.trim().split('\n')[0] ?? ''}` })
+    const gone = await git($, ['-C', at.d.root, 'worktree', 'remove', '--force', at.d.path]).catch(() => undefined)
+    $.ui.toast(`Crew · ${name}: applied ${deliveryLine(at.d)} to your tree (not committed)`)
+    await update($, crewDiff, cur => (cur?.key === key ? null : cur))
+    await setDelivery($, name, n, {
+      state: 'accepted',
+      note: gone?.exitCode === 0 ? undefined : `applied; Codex's worktree could not be removed (${at.d.path})`,
+    })
+  } finally {
+    deciding.delete(key)
   }
-  const done = await git($, ['-C', at.t.cwd, 'apply', '-'], patch)
-  if (done.exitCode !== 0) return setDelivery($, name, n, { note: `not applied: ${done.stderr.trim().split('\n')[0] ?? ''}` })
-  await git($, ['-C', at.t.cwd, 'worktree', 'remove', '--force', at.d.path]).catch(() => undefined)
-  $.ui.toast(`Crew · ${name}: applied ${deliveryLine(at.d)} to your tree (not committed)`)
-  await update($, crewDiff, cur => (cur?.key === `${name}#${n}` ? null : cur))
-  await setDelivery($, name, n, { state: 'accepted', note: undefined })
 }
 
 /** Throws Codex's changes away with its worktree, after you confirm. */
 async function discardDelivery($: EngineInterface, name: string, n: number): Promise<void> {
-  const at = await deliveryAt($, name, n)
-  if (!at || at.d.state !== 'pending') return
-  const answer = await $.ui.ask(`Discard ${deliveryLine(at.d)} from codex › ${name}? Its worktree is deleted.`, {
-    header: 'FLEET crew',
-    options: ['Discard', 'Keep it'],
-  })
-  if (!answer.startsWith('Discard')) return
-  await git($, ['-C', at.t.cwd, 'worktree', 'remove', '--force', at.d.path]).catch(() => undefined)
-  await update($, crewDiff, cur => (cur?.key === `${name}#${n}` ? null : cur))
-  await setDelivery($, name, n, { state: 'discarded', note: undefined })
+  const key = `${name}#${n}`
+  if (deciding.has(key)) return
+  deciding.add(key)
+  try {
+    const at = await deliveryAt($, name, n)
+    if (!at || at.d.state !== 'pending') return
+    const answer = await $.ui.ask(`Discard ${deliveryLine(at.d)} from codex › ${name}? Its worktree is deleted.`, {
+      header: 'FLEET crew',
+      options: ['Discard', 'Keep it'],
+    })
+    if (answer !== 'Discard') return
+    const now2 = await deliveryAt($, name, n)
+    if (!now2 || now2.d.state !== 'pending') return
+    const gone = await git($, ['-C', at.d.root, 'worktree', 'remove', '--force', at.d.path]).catch(() => undefined)
+    await update($, crewDiff, cur => (cur?.key === key ? null : cur))
+    if (gone?.exitCode !== 0) {
+      return setDelivery($, name, n, { note: `couldn't delete the worktree: ${gone?.stderr.trim().split('\n')[0] ?? 'git failed'}` })
+    }
+    await setDelivery($, name, n, { state: 'discarded', note: undefined })
+  } finally {
+    deciding.delete(key)
+  }
 }
 
 // ── crew: named, ongoing conversations with Codex and Antigravity ────────────
@@ -446,6 +516,20 @@ async function claimAndSend($: EngineInterface, name: string, o: AskOpts): Promi
   if (!existing && !o.agent) return `There is no thread "${name}" yet; say which agent opens it ("codex" or "agy").`
   if (existing && o.folder && existing.cwd !== o.folder) {
     return `Thread "${name}" works in ${existing.cwd}. Open another thread for ${o.folder}.`
+  }
+  // the folder rule holds on every path, not only when a folder is passed: never / or
+  // your home folder itself, which would hand a helper everything you own
+  const folder = existing?.cwd ?? o.folder ?? sessionCwd
+  const home = (await $.env.get('HOME')) ?? ''
+  if (!folder || folder === '/' || folder === home || folder === `${home}/`) {
+    return `Helpers don't work in ${folder || 'an unknown folder'} itself: it is too broad. Open a project folder, or name one.`
+  }
+  // one Codex edit at a time per folder, so each turn's worktree is unmistakably its own
+  const agentNow = existing?.agent ?? o.agent
+  const modeNow = o.mode ?? existing?.mode ?? 'read'
+  if (agentNow === 'codex' && modeNow === 'edit') {
+    const busy = (await read($, threads)).find(x => x.name !== name && x.status === 'running' && x.agent === 'codex' && x.mode === 'edit' && x.cwd === folder)
+    if (busy) return `Codex is already editing ${folder} in thread "${busy.name}". Wait for it, so each edit's changes stay apart.`
   }
   const base: CrewThread = existing ?? {
     name,
@@ -545,10 +629,11 @@ async function runTurn(
   if (await isStopped()) return
   // a Codex edit turn makes its own git worktree; which one is only visible from git
   const before = isCodexEdit ? await worktreesOf($, t.cwd) : []
+  const start = isCodexEdit ? await repoAt($, t.cwd) : undefined
   const res = await execTurn($, t, brief(t, by, task, context, seed, nb.text, nb.isDelta), n, false, isMine)
   if (!isMine()) return
-  if (isCodexEdit) {
-    const delivery = await deliveryOf($, t.cwd, before).catch(() => undefined)
+  if (isCodexEdit && start) {
+    const delivery = await deliveryOf($, t.cwd, before, start).catch(() => undefined)
     if (delivery) await patchThread($, name, x => ({ ...x, turns: x.turns.map(u => (u.n === n ? { ...u, delivery } : u)) }))
   }
   await archiveAnswer($, name, n, res.answer)
@@ -696,51 +781,68 @@ const HAND_WAIT_MS = 180_000 // a slow sibling never holds the others back longe
 let handQueue: { name: string; n: number }[] = []
 let handGen = 0
 
+const RETRY_MS = 30_000
+let handTries = 0
+
 async function queueForClaude($: EngineInterface, name: string, n: number): Promise<void> {
+  // the wait starts at the batch's FIRST finished turn: later ones never push it back
+  const isFirst = handQueue.length === 0
   handQueue.push({ name, n })
   const siblings = (await read($, threads)).filter(
     t => t.status === 'running' && owner.has(t.name) && t.turns[t.turns.length - 1]?.by === 'claude',
   )
   if (siblings.length === 0) return flushForClaude($)
-  const gen = ++handGen
+  if (!isFirst) return
+  const gen = handGen
   void $.clock.sleep(HAND_WAIT_MS).then(() => (gen === handGen ? flushForClaude($) : undefined))
 }
 
+/** Sends what's queued as one notice; if the notice can't be sent, it is kept and tried again. */
 async function flushForClaude($: EngineInterface): Promise<void> {
   const due = handQueue
   handQueue = []
   handGen++
-  if (due.length === 1) return handToClaude($, due[0]!.name, due[0]!.n)
   if (due.length === 0) return
-  const text = batchNotice(due, await read($, threads))
+  const list = await read($, threads)
+  const text = due.length === 1 ? singleNotice(list, due[0]!.name, due[0]!.n) : batchNotice(due, list)
+  if (!text) return
+  const isSent = await $.prompt
+    .submit({ text })
+    .then(() => true)
+    .catch(() => false)
+  if (isSent) {
+    handTries = 0
+    for (const { name, n } of due) {
+      await patchThread($, name, x => ({ ...x, turns: x.turns.map(u => (u.n === n ? { ...u, isHanded: true } : u)) }))
+    }
+    return
+  }
+  // put them back in front and try again, a few times; the Crew tab still shows them either way
+  handQueue = [...due, ...handQueue]
+  if (++handTries <= 5) void $.clock.sleep(RETRY_MS).then(() => flushForClaude($))
+  else handTries = 0
+}
+
+/** The fixed notice for one finished turn: the helper's words reach Claude through crew_read, never the prompt. */
+function singleNotice(list: readonly CrewThread[], name: string, n: number): string {
+  const t = list.find(x => x.name === name)
+  const turn = t?.turns.find(u => u.n === n)
+  if (!t || !turn) return ''
+  return turn.by === 'claude'
+    ? `[FLEET crew] Thread "${name}" (${t.agent}) finished turn ${n} (${turn.status}). ` +
+        `Read it with crew_read {"thread": "${name}", "turn": ${n}} and check it before relying on it.`
+    : `[FLEET crew] The user sent you turn ${n} of thread "${name}" (${t.agent}) to review. ` +
+        `Read it with crew_read {"thread": "${name}", "turn": ${n}, "full": true}, then say what you'd keep.`
+}
+
+/** The user's "send to Claude": one turn, now. */
+async function handToClaude($: EngineInterface, name: string, n: number): Promise<void> {
+  const text = singleNotice(await read($, threads), name, n)
   if (!text) return
   await $.prompt
     .submit({ text })
-    .then(async () => {
-      for (const { name, n } of due) {
-        await patchThread($, name, x => ({ ...x, turns: x.turns.map(u => (u.n === n ? { ...u, isHanded: true } : u)) }))
-      }
-    })
-    .catch(() => undefined)
-}
-
-/** Tells Claude a turn finished: the summary inline (no extra call), the rest on demand. */
-async function handToClaude($: EngineInterface, name: string, n: number): Promise<void> {
-  const t = await findThread($, name)
-  const turn = t?.turns.find(u => u.n === n)
-  if (!t || !turn) return
-  // Only a fixed notice goes into the prompt: the helper's words reach Claude as
-  // crew_read's tool output, never as text that reads like the user's own.
-  const text =
-    turn.by === 'claude'
-      ? `[FLEET crew] Thread "${name}" (${t.agent}) finished turn ${n} (${turn.status}). ` +
-        `Read its summary with crew_read {"thread": "${name}"} and check it before relying on it.`
-      : `[FLEET crew] The user sent you turn ${n} of thread "${name}" (${t.agent}) to review. ` +
-        `Read it with crew_read {"thread": "${name}", "turn": ${n}, "full": true}, then say what you'd keep.`
-  await $.prompt
-    .submit({ text })
     .then(() => patchThread($, name, x => ({ ...x, turns: x.turns.map(u => (u.n === n ? { ...u, isHanded: true } : u)) })))
-    .catch(() => undefined)
+    .catch(() => $.ui.toast(`Couldn't hand ${name} to Claude right now; try again in a moment.`))
 }
 
 type Args = Record<string, unknown>
@@ -772,8 +874,13 @@ async function answerCrewAsk($: EngineInterface, e: Args): Promise<Answer> {
         `: ${task.slice(0, 160)}`,
       { header: 'FLEET crew', options: ['Allow edits', 'Read-only instead', 'Cancel'] },
     )
-    if (answer.startsWith('Cancel')) return { deny: 'The user cancelled this crew message.' }
-    if (answer.startsWith('Read-only')) return answerCrewAsk($, { ...e, mode: 'read' })
+    // only the exact label allows edits; a typed answer ("No, explain first") never does
+    const decision = editDecision(answer)
+    if (decision === 'read') return answerCrewAsk($, { ...e, mode: 'read' })
+    if (decision === 'deny') {
+      const said = answer && answer !== 'Cancel' ? ` They wrote: "${answer.replace(/\s+/g, ' ').slice(0, 300)}"` : ''
+      return { deny: `The user did not allow edits, so nothing was sent.${said}` }
+    }
   }
   const res = await sendToThread($, {
     name,
@@ -1126,7 +1233,7 @@ async function resolveFolder($: EngineInterface, path: string, why: string): Pro
     header: 'FLEET crew',
     options: ['Allow this folder', 'Deny'],
   })
-  return answer.startsWith('Allow') ? real : { deny: `The user did not allow ${real}.` }
+  return answer === 'Allow this folder' ? real : { deny: `The user did not allow ${real}.` }
 }
 
 /** You rewrite a fact in place (or keep or delete it); a rewritten suggestion counts as kept. */
@@ -1315,7 +1422,11 @@ function acts($: EngineInterface): Acts {
     // a crew or notebook row on Live opens in place, like a session's; opening an answer reads it
     openInline: key => {
       void update($, selected, cur => (cur === key ? '' : key))
-      if (key.startsWith('crew:')) void markRead($, key.slice(5))
+      // only the answer you can see counts as read, not older ones you never opened
+      if (key.startsWith('crew:')) {
+        const name = key.slice(5)
+        void findThread($, name).then(t => (t ? markRead($, name, t.turns[t.turns.length - 1]?.n) : undefined))
+      }
     },
     deliveryView: (name, n) => void viewDelivery($, name, n),
     deliveryAccept: (name, n) => void acceptDelivery($, name, n),

@@ -524,7 +524,9 @@ function Live(E: Els, v: View, act: Acts) {
   // the rows come first; the cat sits beside them when there is room, else below
   const isBeside = v.hero !== null && v.width >= 90 // narrower, the rows need the room
   const rowsView = isBeside ? { ...v, width: v.width - CAT_COLS - 2 } : v
-  const items = inbox(v.snap.sessions, v.threads, v.notebooks)
+  // an opened crew row stays listed while it is open, even once it has been read
+  const keep = v.selected?.startsWith('crew:') ? v.selected.slice(5) : undefined
+  const items = inbox(v.snap.sessions, v.threads, v.notebooks, keep)
   // group headings only when there is more than one kind of thing to look at
   const isGrouped = new Set(items.map(x => x.group)).size > 1
   const rows: Node[] = [
@@ -835,6 +837,10 @@ function ThreadDetail(E: Els, v: View, t: CrewThread, m: Mark, act: Acts, isOnLi
                 ))
             : []),
           ...(last.delivery ? DeliveryCard(E, v, t, last.n, last.delivery, act) : []),
+          // an earlier turn's changes still waiting for a decision keep their card and buttons
+          ...t.turns
+            .filter(u => u.n !== last.n && u.delivery?.state === 'pending')
+            .flatMap(u => [Labeled(E, v, `turn ${u.n}`, 'changes from this earlier turn are still waiting'), ...DeliveryCard(E, v, t, u.n, u.delivery!, act)]),
           <Text color={p.dim} wrap="truncate-end">
             {meta}
           </Text>,
@@ -1011,7 +1017,8 @@ function Crew(E: Els, v: View, act: Acts) {
   const list = [...v.threads].sort((a, b) => b.updated - a.updated)
   const target = v.threads.find(t => t.name === v.crewSel)
   // what is new (running, unread, or open right now) shows; what you've seen folds away
-  const isFresh = (t: CrewThread) => t.status === 'running' || t.turns.some(u => u.unread) || t.name === v.crewSel
+  const isFresh = (t: CrewThread) =>
+    t.status === 'running' || t.turns.some(u => u.unread || u.delivery?.state === 'pending') || t.name === v.crewSel
   const fresh = list.filter(isFresh)
   const earlier = list.filter(t => !isFresh(t))
   const running = list.filter(t => t.status === 'running').length
@@ -1211,9 +1218,11 @@ function CostView(E: Els, v: View) {
   const cells = Math.max(10, Math.min(40, v.width - 2 - ww - 10 - 26))
   const week = c.days.reduce((n, d) => n + d.usd, 0)
   const peak = Math.max(...c.days.map(d => d.usd), 0.01)
-  const live = [...v.snap.sessions].sort((a, b) => b.cost - a.cost)
-  const closed = Math.max(0, c.today - live.reduce((n, s) => n + s.cost, 0))
-  const top = Math.max(...live.map(s => s.cost), closed, 0.01)
+  // today's spend only: a session that also ran yesterday counts just today's part
+  const todayOf = (s: Session) => s.costToday ?? s.cost
+  const live = [...v.snap.sessions].sort((a, b) => todayOf(b) - todayOf(a))
+  const closed = Math.max(0, c.today - live.reduce((n, s) => n + todayOf(s), 0))
+  const top = Math.max(...live.map(todayOf), closed, 0.01)
   const models = Object.entries(c.models).sort((a, b) => b[1] - a[1])
   const topModel = Math.max(...models.map(([, n]) => n), 0.01)
   const row = (mk: Node, label: string, frac: number, amount: number, note = '', bold = false, quiet = false) => (
@@ -1274,7 +1283,7 @@ function CostView(E: Els, v: View) {
       {head('TODAY BY SESSION')}
       {live.map(s => {
         const m = sessionMark(v, s)
-        return row(<Text color={m.color}>{m.glyph} </Text>, s.name, s.cost / top, s.cost, `${s.model} · ${tok(s.tokens)} tokens`, false, !needsYou(s) && !isBusy(s))
+        return row(<Text color={m.color}>{m.glyph} </Text>, s.name, todayOf(s) / top, todayOf(s), `${s.model} · ${tok(s.tokensToday ?? s.tokens)} tokens today`, false, !needsYou(s) && !isBusy(s))
       })}
       {closed > 0.005 ? row(<Text>{'  '}</Text>, 'closed sessions', closed / top, closed, '', false, true) : null}
       {blank}

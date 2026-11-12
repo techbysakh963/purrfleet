@@ -68,6 +68,12 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   (+/− per file), **view diff**, **accept into your tree** (asks first; applies with `git apply`,
   never commits) and **discard** (deletes Codex's worktree). Until you decide, it stays on Live.
   `crew_read` tells Claude where the worktree is, so it can inspect the changes; only you decide.
+  The card covers everything since the turn began (Codex's own commits too), is made and applied
+  from the repository's top folder, and is read with filters, hooks and fsmonitor off and
+  attributes taken from the starting commit, so nothing Codex wrote can run while FLEET reads it.
+  One Codex edit runs per folder at a time; if two worktrees appear at once, FLEET claims neither.
+- Every confirmation takes only its exact answer: a typed reply ("no, explain first") never
+  allows an edit, an apply, a discard or a stop.
 - **Shared notebook**: per project folder, a short list of durable facts (about 1.5k tokens at
   most) that every helper message carries, so Claude, Codex and Antigravity share what matters
   without re-sending history. Helpers add `NOTE:` lines; Claude curates with `crew_note`.

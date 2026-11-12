@@ -3,12 +3,12 @@ import { expect, test } from 'claude-code/testing'
 import type { Snapshot } from '../types'
 import { ago, bar, spark, usd } from './fmt'
 import { catCells } from './cat'
-import { argvFor, batchNotice, brief, lines, mergeThreads, needsCompaction, notebookDelta, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
+import { argvFor, batchNotice, brief, editDecision, lines, mergeThreads, needsCompaction, notebookDelta, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
 import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { fleetReport } from './brief'
 import { inbox, tally } from './inbox'
-import { deliveryLine, newCodexWorktree, parseNumstat, parseWorktrees } from './delivery'
+import { deliveryLine, newCodexWorktrees, parseNumstat, parseWorktrees } from './delivery'
 import { age, fitWho, sections } from './views'
 import { PALETTES } from './theme'
 import { findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf, safeName } from './vault'
@@ -651,9 +651,10 @@ test('the grid: answers keep their shape, helper names are cut thread-first, age
 test('Codex deliveries: the new worktree is found, its changes counted, and they wait on Live until decided', async ($, on) => {
   const porcelain = 'worktree /p\nHEAD abc\nbranch refs/heads/main\n\nworktree /h/.codex/worktrees/7/p\nHEAD abc\ndetached\n'
   expect(parseWorktrees(porcelain)).toEqual(['/p', '/h/.codex/worktrees/7/p'])
-  expect(newCodexWorktree(['/p'], parseWorktrees(porcelain), '/h')).toBe('/h/.codex/worktrees/7/p')
-  expect(newCodexWorktree(['/p', '/h/.codex/worktrees/7/p'], parseWorktrees(porcelain), '/h')).toBeUndefined()
-  expect(newCodexWorktree(['/p'], ['/p', '/elsewhere/wt'], '/h')).toBeUndefined() // not Codex's: never touched
+  expect(newCodexWorktrees(['/p'], parseWorktrees(porcelain), '/h')).toEqual(['/h/.codex/worktrees/7/p'])
+  expect(newCodexWorktrees(['/p', '/h/.codex/worktrees/7/p'], parseWorktrees(porcelain), '/h')).toEqual([])
+  expect(newCodexWorktrees(['/p'], ['/p', '/elsewhere/wt'], '/h')).toEqual([]) // not Codex's: never touched
+  expect(newCodexWorktrees(['/p'], ['/p', '/h/.codex/worktrees/1/p', '/h/.codex/worktrees/2/p'], '/h').length).toBe(2) // two at once: ambiguous
   const files = parseNumstat('1\t0\ta.txt\n12\t3\tsrc/b c.ts\n-\t-\timg.png\n')
   expect(files).toEqual([
     { path: 'a.txt', added: 1, removed: 0 },
@@ -684,4 +685,42 @@ test('Codex deliveries: the new worktree is found, its changes counted, and they
   expect(await crew.find({ key: 'da-fix-auth#1' })).toBeDefined() // accept
   expect(await crew.find({ key: 'dd-fix-auth#1' })).toBeDefined() // discard
   await crew.unmount()
+})
+
+test('v0.11.1: only the exact "Allow edits" allows edits; stale windows cannot undo decisions; opened rows stay', async () => {
+  expect(editDecision('Allow edits')).toBe('allow')
+  expect(editDecision('Read-only instead')).toBe('read')
+  for (const typed of ['No, explain first', 'Allow edits please', 'yes', '', 'Cancel']) expect(editDecision(typed)).toBe('deny')
+
+  // a window that never saw the accept, or the hand-off, can't revert them when it saves
+  const d = { path: '/h/.codex/worktrees/1/p', files: [], state: 'pending' as const }
+  const stale = crewThread('fix', { updated: 9, turns: [doneTurn(1, { delivery: d, isHanded: false, unread: true })] })
+  const decided = crewThread('fix', { updated: 5, turns: [doneTurn(1, { delivery: { ...d, state: 'accepted' }, isHanded: true, unread: false })] })
+  const merged = mergeThreads([stale], [decided], new Set())[0]!.turns[0]!
+  expect(merged.delivery?.state).toBe('accepted')
+  expect(merged.isHanded).toBe(true)
+  expect(merged.unread).toBe(false)
+
+  // the opened row stays listed once read; an earlier undecided delivery keeps the thread listed
+  const read1 = crewThread('seen', { turns: [doneTurn(1, { unread: false })] })
+  expect(inbox([], [read1], {}).length).toBe(0)
+  expect(inbox([], [read1], {}, 'seen').map(x => x.key)).toEqual(['t:seen'])
+  const older = crewThread('two', { turns: [doneTurn(1, { unread: false, delivery: d }), doneTurn(2, { unread: false })] })
+  const it = inbox([], [older], {})[0]
+  expect(it?.kind === 'turn' && it.u.n).toBe(1)
+})
+
+test('Cost counts only today for each session', async ($, on) => {
+  const snap = { ...SNAP, cost: { ...SNAP.cost, today: 5 }, sessions: SNAP.sessions.map((s, i) => ({ ...s, cost: 50 + i, costToday: i ? 1 : 2 })) }
+  on('state.get', (_, e, next) => {
+    if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: snap }, version: 1 } }
+    if (e.key === 'tab') return { value: { value: 'cost', version: 1 } }
+    if (e.key === 'toured') return { value: { value: true, version: 1 } }
+    return next(e)
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  expect(await ui.find({ type: 'Text', text: /\$2\.00/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /\$50/ })).toBeUndefined() // lifetime totals stay out of "today"
+  expect(await ui.find({ type: 'Text', text: /closed sessions/ })).toBeDefined() // 5 - (2 + 1) closed today
+  await ui.unmount()
 })

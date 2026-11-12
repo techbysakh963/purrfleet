@@ -36,6 +36,9 @@ export type Session = {
   ctx: number
   cost: number
   tokens: number
+  /** today's part of cost and tokens (Cost's "today by session") */
+  costToday?: number
+  tokensToday?: number
   transcript: string
   branch: string
   added: number
@@ -89,6 +92,10 @@ export type CrewNote = {
 export type Delivery = {
   /** the worktree Codex edited in */
   path: string
+  /** the repository's top folder: patches are made and applied from here */
+  root?: string
+  /** the commit the turn started from: the diff covers Codex's commits too */
+  base?: string
   files: { path: string; added: number; removed: number }[]
   state: 'pending' | 'accepted' | 'discarded'
   /** why the last accept failed, if it did */

@@ -203,6 +203,11 @@ def git_head(cwd):
     return ""
 
 
+# git in a project FLEET only watches: nothing in the repo's config or attributes may run a command
+SAFE_GIT = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false",
+            "-c", "core.pager=cat", "-c", "protocol.allow=never"]
+
+
 def git_diff(cwd, cache, now):
     """Lines added/removed vs HEAD, refreshed at most every GIT_EVERY seconds."""
     g = cache.setdefault("git", {})
@@ -211,7 +216,8 @@ def git_diff(cwd, cache, now):
         return hit["add"], hit["del"]
     add = rem = 0
     try:
-        out = subprocess.run(["git", "-C", cwd, "diff", "--shortstat", "HEAD"], capture_output=True,
+        out = subprocess.run(["git", *SAFE_GIT, "-C", cwd, "diff", "--no-ext-diff", "--no-textconv", "--shortstat", "HEAD"],
+                             capture_output=True, env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"},
                              text=True, timeout=2).stdout
         for part in out.split(","):
             n = int("".join(c for c in part if c.isdigit()) or 0)
@@ -567,15 +573,21 @@ def build():
                         tot[k] += u[k]
 
     def session_cost(sid, cwd):
+        """A session's whole cost and tokens, and today's part of them (Cost shows today's)."""
         base = os.path.join(CLAUDE, "projects", slug(cwd))
-        c, toks = 0.0, 0
+        c, toks, c_today, toks_today = 0.0, 0, 0.0, 0
         for p, e in files.items():
             if p.startswith(os.path.join(base, sid)):
-                for ms in (e.get("days") or {}).values():
+                for day, ms in (e.get("days") or {}).items():
                     for m, u in ms.items():
-                        c += cost(m, u)
-                        toks += u["in"] + u["out"] + u["cw"] + u["cr"]
-        return c, toks
+                        k = cost(m, u)
+                        n = u["in"] + u["out"] + u["cw"] + u["cr"]
+                        c += k
+                        toks += n
+                        if day == today:
+                            c_today += k
+                            toks_today += n
+        return c, toks, c_today, toks_today
 
     out_sessions = []
     for s in sorted(sessions, key=lambda s: s.get("startedAt", 0)):
@@ -583,7 +595,7 @@ def build():
         h = hud_state(sid)
         main_t = os.path.join(CLAUDE, "projects", slug(s.get("cwd", "")), sid + ".jsonl")
         e = files.get(main_t, {})
-        c, toks = session_cost(sid, s.get("cwd", ""))
+        c, toks, c_today, toks_today = session_cost(sid, s.get("cwd", ""))
         branch = git_head(s.get("cwd", ""))
         added, removed = git_diff(s.get("cwd", ""), cache, now) if branch else (0, 0)
         phase = h["phase"] or ("thinking" if s.get("status") == "busy" else "idle")
@@ -597,7 +609,8 @@ def build():
             "tools": h["tools"], "agents": live_agents(h["agents"], os.path.join(CLAUDE, "projects", slug(s.get("cwd", "")), sid), now),
             "calls": h["calls"],
             "model": short_model(e.get("model", "")), "ctx": e.get("ctx", 0),
-            "cost": round(c, 4), "tokens": toks, "transcript": main_t,
+            "cost": round(c, 4), "tokens": toks, "costToday": round(c_today, 4), "tokensToday": toks_today,
+            "transcript": main_t,
             "branch": branch, "added": added, "removed": removed,
         })
 

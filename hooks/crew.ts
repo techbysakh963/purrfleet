@@ -400,11 +400,28 @@ export function mergeThreads(
   return out
 }
 
-/** `t`, with every turn `other` has already marked read marked read too. */
+/**
+ * `t`, with what `other` already knows folded in, turn by turn: read anywhere is
+ * read, handed to Claude anywhere is handed, and a Codex delivery decided anywhere
+ * (accepted or discarded) stays decided. A stale copy can never undo any of them.
+ */
 function seenIn(t: CrewThread, other: CrewThread): CrewThread {
-  const read = new Set(other.turns.filter(u => u.unread === false || (u.unread === undefined && u.status !== 'running')).map(u => `${u.n}:${u.started}`))
-  if (!t.turns.some(u => u.unread && read.has(`${u.n}:${u.started}`))) return t
-  return { ...t, turns: t.turns.map(u => (u.unread && read.has(`${u.n}:${u.started}`) ? { ...u, unread: false } : u)) }
+  const theirs = new Map(other.turns.map(u => [`${u.n}:${u.started}`, u]))
+  let changed = false
+  const turns = t.turns.map(u => {
+    const o = theirs.get(`${u.n}:${u.started}`)
+    if (!o) return u
+    const isRead = o.unread === false || (o.unread === undefined && o.status !== 'running')
+    const next = {
+      ...u,
+      ...(u.unread && isRead ? { unread: false } : {}),
+      ...(!u.isHanded && o.isHanded ? { isHanded: true } : {}),
+      ...(u.delivery?.state === 'pending' && o.delivery && o.delivery.state !== 'pending' ? { delivery: o.delivery } : {}),
+    }
+    if (next.unread !== u.unread || next.isHanded !== u.isHanded || next.delivery !== u.delivery) changed = true
+    return next
+  })
+  return changed ? { ...t, turns } : t
 }
 
 /**
@@ -424,7 +441,15 @@ export function batchNotice(due: readonly { name: string; n: number }[], threads
     .map(t => `"${t.name}"`)
   return (
     `[FLEET crew] ${parts.length} thread${parts.length === 1 ? '' : 's'} you started finished: ${parts.join(', ')}. ` +
-    `Read each summary with crew_read {"thread": "<name>"} and check them before relying on them; weigh them together.` +
+    `Read each with crew_read {"thread": "<name>", "turn": <n>} and check them before relying on them; weigh them together.` +
     (stillRunning.length ? ` Still running: ${stillRunning.join(', ')} (you'll hear when it finishes).` : '')
   )
+}
+
+/**
+ * What the user's answer to "let a helper edit files?" means. Only the exact
+ * "Allow edits" allows; anything typed instead, even "yes", is not consent.
+ */
+export function editDecision(answer: string): 'allow' | 'read' | 'deny' {
+  return answer === 'Allow edits' ? 'allow' : answer === 'Read-only instead' ? 'read' : 'deny'
 }

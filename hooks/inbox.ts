@@ -30,6 +30,8 @@ export function inbox(
   sessions: readonly Session[],
   threads: readonly CrewThread[],
   notebooks: Readonly<Record<string, readonly CrewNote[]>>,
+  /** a thread opened on Live: it stays listed while open, read or not */
+  keep?: string,
 ): Item[] {
   const items: Item[] = []
   for (const s of sessions) {
@@ -43,6 +45,8 @@ export function inbox(
     const unread = [...t.turns].reverse().find(u => isUnread(u) || u.delivery?.state === 'pending')
     if (unread) {
       items.push({ kind: 'turn', group: unread.status === 'failed' ? 'need' : 'read', key: `t:${t.name}`, t, u: unread })
+    } else if (t.name === keep && last && t.status !== 'running') {
+      items.push({ kind: 'turn', group: 'read', key: `t:${t.name}`, t, u: last })
     }
   }
   for (const [folder, notes] of Object.entries(notebooks)) {

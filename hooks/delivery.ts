@@ -14,10 +14,9 @@ export function parseWorktrees(porcelain: string): string[] {
     .filter(Boolean)
 }
 
-/** The worktree a Codex edit turn made: new since `before`, and under Codex's own folder. */
-export function newCodexWorktree(before: readonly string[], after: readonly string[], home: string): string | undefined {
-  const fresh = after.filter(p => !before.includes(p) && p.startsWith(`${home}/.codex/worktrees/`))
-  return fresh[fresh.length - 1]
+/** Codex worktrees that appeared since `before`: exactly one means it is this turn's. */
+export function newCodexWorktrees(before: readonly string[], after: readonly string[], home: string): string[] {
+  return after.filter(p => !before.includes(p) && p.startsWith(`${home}/.codex/worktrees/`))
 }
 
 /** Files from `git diff --numstat` (a binary file counts as 0/0). */
