@@ -1,0 +1,4 @@
+dev/.build/
+dev/out/
+.claude-plugin/types/
+__pycache__/

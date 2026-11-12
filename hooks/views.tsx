@@ -1,0 +1,695 @@
+import type { Elements } from 'claude-code'
+
+import type { CrewAgent, CrewJob, CrewMode, Session, Snapshot, Tab } from '../types'
+import { modeLabel } from './crew'
+import { idleFrame } from './anim'
+import { ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, tok, usd } from './fmt'
+import type { Palette } from './theme'
+import { heat, ramp } from './theme'
+
+/** Box, Text and Button: the elements every surface carries, with the same props. */
+export type Els = Pick<Elements['desktop'], 'Box' | 'Text' | 'Button'>
+type Node = ReturnType<Els['Box']>
+
+export type Acts = {
+  tab: (tab: Tab) => void
+  select: (sid: string) => void
+  filter: (sid: string | null) => void
+  copy: (text: string, what: string) => void
+  open: (path: string) => void
+  stop: (s: Session) => void
+  theme: () => void
+  scene: () => void
+  crewAgent: () => void
+  crewMode: () => void
+  crewLaunch: (task: string) => void
+  crewStop: (id: number) => void
+  crewSend: (id: number) => void
+}
+
+export type View = {
+  snap: Snapshot
+  tab: Tab
+  selected: string | null
+  feedFilter: string | null
+  width: number
+  self: string
+  p: Palette
+  scene: string
+  /** pixel art, drawn only where the surface has a Raster (the terminal) */
+  aurora: Node | null
+  hero: Node | null
+  frame: number
+  crew: readonly CrewJob[]
+  crewAgent: CrewAgent
+  crewMode: CrewMode
+  /** the launch box: an Input, where the surface has one */
+  launcher: Node | null
+}
+
+const TABS: { tab: Tab; label: string; key: string }[] = [
+  { tab: 'live', label: 'Live', key: '1' },
+  { tab: 'feed', label: 'Feed', key: '2' },
+  { tab: 'crew', label: 'Crew', key: '3' },
+  { tab: 'cost', label: 'Cost', key: '4' },
+  { tab: 'actions', label: 'Actions', key: '5' },
+]
+
+/** The colour a session keeps everywhere: its legend dot, its band dot, its feed name. */
+export const sessionColor = (s: Session, p: Palette): string =>
+  needsYou(s) ? phaseLook(s.phase, p).color : isBusy(s) ? p.accent : s.phase === 'ready' ? p.ok : p.cyan
+
+function Grad(E: Els, text: string, from: string, to: string, bold = false) {
+  const { Text } = E
+  return (
+    <Text weight={bold ? 'bold' : 'regular'}>
+      {ramp(text, from, to).map(c => (
+        <Text color={c.color}>{c.ch}</Text>
+      ))}
+    </Text>
+  )
+}
+
+/** A fuel gauge: filled cells shade green → yellow → red along the bar. */
+function Gauge(E: Els, pct: number, cells: number, p: Palette) {
+  const { Text } = E
+  const full = Math.round((Math.max(0, Math.min(100, pct)) / 100) * cells)
+  return (
+    <Text>
+      {Array.from({ length: cells }, (_, i) =>
+        i < full ? <Text color={heat(i / (cells - 1), p)}>■</Text> : <Text color={p.border}>□</Text>,
+      )}
+    </Text>
+  )
+}
+
+const Sep = (E: Els, p: Palette) => <E.Text color={p.border}> │ </E.Text>
+
+export function Pane(E: Els, v: View, act: Acts) {
+  const { Box, Text, Button } = E
+  const { p } = v
+  const waiting = v.snap.sessions.filter(needsYou).length
+  const busy = v.snap.sessions.filter(isBusy).length
+  const agents = v.snap.sessions.reduce((n, s) => n + s.agents.length, 0)
+  const crewBusy = v.crew.filter(j => j.status === 'running').length
+
+  return (
+    <Box flexDirection="column">
+      {v.aurora ?? <Text>{Grad(E, '━'.repeat(Math.max(10, v.width)), p.accent, p.cyan)}</Text>}
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text>
+          <Text color={p.accent}>◆ </Text>
+          {Grad(E, 'FLEET', p.accent, p.cyan, true)}
+        </Text>
+        <Text>
+          <Text color={p.accent}>◉ </Text>
+          <Text color={p.text}>{busy}</Text>
+          <Text color={p.dim}>/{v.snap.sessions.length} busy</Text>
+          {Sep(E, p)}
+          <Text color={p.violet}>◇ </Text>
+          <Text color={p.text}>{agents}</Text>
+          <Text color={p.dim}> agents</Text>
+          {Sep(E, p)}
+          <Text color={p.gold}>{usd(v.snap.cost.today)}</Text>
+        </Text>
+      </Box>
+      <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+        {TABS.map(t => (
+          <Button key={`tab-${t.tab}`} plain hotkey={t.key} onPress={() => act.tab(t.tab)}>
+            {t.tab === v.tab ? (
+              <Text color={p.accent} weight="bold">
+                ◆ {t.label}
+              </Text>
+            ) : (
+              <Text color={p.dim}>◇ {t.label}</Text>
+            )}
+            {t.tab === 'live' && waiting > 0 ? <Text color={p.warn} weight="bold"> ▲{waiting}</Text> : ''}
+            {t.tab === 'crew' && crewBusy > 0 ? <Text color={p.accent}> ◉{crewBusy}</Text> : ''}
+          </Button>
+        ))}
+      </Box>
+      <Text color={p.border}>{'─'.repeat(Math.max(10, v.width))}</Text>
+      {(v.tab === 'live' || v.tab === 'needs') && Live(E, v, act)}
+      {v.tab === 'feed' && Feed(E, v, act)}
+      {v.tab === 'crew' && Crew(E, v, act)}
+      {v.tab === 'cost' && CostView(E, v)}
+      {v.tab === 'actions' && Actions(E, v, act)}
+      <Box flexDirection="row" columnGap={2} marginTop={1}>
+        <Button key="cycle-theme" plain hotkey="t" onPress={act.theme}>
+          <Text color={p.dim}>t </Text>
+          <Text color={p.accent}>● {p.name}</Text>
+        </Button>
+        <Button key="cycle-scene" plain hotkey="a" onPress={act.scene}>
+          <Text color={p.dim}>a </Text>
+          <Text color={p.cyan}>◎ {v.scene}</Text>
+        </Button>
+        <Text color={p.dim}>ctrl+x tab: keys</Text>
+      </Box>
+    </Box>
+  )
+}
+
+function Legend(E: Els, v: View) {
+  const { Box, Text } = E
+  const { p } = v
+  const c = v.snap.cost
+  return (
+    <Box flexDirection="column" marginLeft={2} flexGrow={1}>
+      {v.snap.sessions.some(needsYou) ? (
+        <Text color={p.warn} weight="bold">
+          ▲ someone needs you
+        </Text>
+      ) : v.snap.sessions.some(isBusy) ? (
+        <Text color={p.accent}>◉ the fleet is working</Text>
+      ) : (
+        <Text color={p.dim}>○ all quiet · the cat is napping</Text>
+      )}
+      {v.snap.sessions.map(s => {
+        const look = phaseLook(s.phase, p)
+        return (
+          <Text wrap="truncate-end">
+            <Text color={sessionColor(s, p)}>● </Text>
+            <Text color={p.text}>{cut(s.name, 18).padEnd(18)} </Text>
+            <Text color={look.color}>{look.label}</Text>
+            <Text color={p.dim}> {ago(v.snap.now - s.phaseSince)}</Text>
+          </Text>
+        )
+      })}
+      <Text> </Text>
+      <Text>
+        <Text color={p.dim}>today </Text>
+        <Text color={p.gold}>{usd(c.today)}</Text>
+        <Text color={p.dim}> · {tok(c.tokens)} tok</Text>
+      </Text>
+      <Text>
+        <Text color={p.dim}>cache </Text>
+        {Gauge(E, c.cacheHit * 100, 8, { ...p, ok: p.bad, bad: p.ok })}
+        <Text color={p.ok}> {Math.round(c.cacheHit * 100)}%</Text>
+      </Text>
+    </Box>
+  )
+}
+
+function Card(E: Els, v: View, s: Session, act: Acts) {
+  const { Box, Text, Button } = E
+  const { p } = v
+  const look = phaseLook(s.phase, p)
+  const pct = ctxPct(s)
+  const tool = s.tools[s.tools.length - 1]
+  const isSel = s.sid === v.selected
+  const w = Math.max(30, v.width - 4)
+  const border = needsYou(s) ? look.color : isSel ? p.accent : isBusy(s) ? p.violet : p.border
+
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor={border} paddingX={1}>
+      <Box flexDirection="row" justifyContent="space-between">
+        <Button key={`s-${s.sid}`} plain onPress={() => act.select(s.sid)}>
+          <Text color={look.color}>{look.glyph} </Text>
+          <Text color={p.text} weight="bold">
+            {cut(s.name, Math.max(10, w - 24))}
+          </Text>
+          {s.sid === v.self ? <Text color={p.dim}> · here</Text> : ''}
+        </Button>
+        <Text>
+          <Text color={look.color} weight="bold">
+            {look.label}
+          </Text>
+          <Text color={p.dim}> {ago(v.snap.now - s.phaseSince)}</Text>
+        </Text>
+      </Box>
+      <Text wrap="truncate-end">
+        <Text color={p.dim}>[ </Text>
+        <Text color={p.cyan}>{s.model}</Text>
+        <Text color={p.dim}> ] </Text>
+        {Gauge(E, pct, 10, p)}
+        <Text color={heat(pct / 100, p)}> {pct}%</Text>
+        <Text color={p.dim}> ctx</Text>
+        {Sep(E, p)}
+        <Text color={p.gold}>{usd(s.cost)}</Text>
+        {Sep(E, p)}
+        <Text color={p.dim}>{hms(v.snap.now - s.startedAt)}</Text>
+        {s.branch ? Sep(E, p) : ''}
+        {s.branch ? <Text color={p.violet}>⌥ {cut(s.branch, 18)}</Text> : ''}
+        {s.added || s.removed ? Sep(E, p) : ''}
+        {s.added ? <Text color={p.ok}>+{s.added} </Text> : ''}
+        {s.removed ? <Text color={p.bad}>−{s.removed}</Text> : ''}
+      </Text>
+      {tool ? (
+        <Text wrap="truncate-end">
+          <Text color={p.accent}>› </Text>
+          <Text color={p.cyan} weight="bold">
+            {tool.tool}
+          </Text>
+          <Text color={p.dim}> {cut(tool.detail, w - tool.tool.length - 4)}</Text>
+        </Text>
+      ) : null}
+      {s.agents.map((a, i) => (
+        <Text wrap="truncate-end">
+          <Text color={p.border}>{i === s.agents.length - 1 ? '└─' : '├─'}</Text>
+          <Text color={p.violet}>◇ {a.type}</Text>
+          <Text color={p.dim}>
+            {' '}
+            {ago(v.snap.now - a.since)}
+            {a.tokens ? ` · ${tok(a.tokens)}` : ''} · {cut(a.task, Math.max(8, w - a.type.length - 20))}
+          </Text>
+        </Text>
+      ))}
+    </Box>
+  )
+}
+
+/** Who to look at first: needs-you, then busy, then the rest; newest change first within each. */
+export const ordered = (sessions: readonly Session[]): Session[] =>
+  [...sessions].sort((a, b) => {
+    const rank = (s: Session) => (needsYou(s) ? 0 : isBusy(s) ? 1 : 2)
+    return rank(a) - rank(b) || b.phaseSince - a.phaseSince
+  })
+
+/** What a session is up to, in a few words. */
+function activity(s: Session): string {
+  const tool = s.tools[s.tools.length - 1]
+  if (s.phase === 'error') return 'last turn ended on an API error'
+  if (needsYou(s)) return tool ? `${tool.tool}: ${tool.detail}` : 'waiting for your permission'
+  if (tool) return `› ${tool.tool} ${tool.detail}`
+  if (s.phase === 'thinking') return 'thinking…'
+  if (s.phase === 'compacting') return 'compacting its context…'
+  return s.phase === 'ready' ? 'ready' : 'idle'
+}
+
+/** One calm line per session; pressing it selects it (and expands it into its card). */
+function Row(E: Els, v: View, s: Session, act: Acts) {
+  const { Text, Button } = E
+  const { p } = v
+  const look = phaseLook(s.phase, p)
+  const quiet = !needsYou(s) && !isBusy(s)
+  const tail = `${s.agents.length ? ` ◇${s.agents.length}` : ''} ${ago(v.snap.now - s.phaseSince)}`
+  const room = Math.max(8, v.width - 16 - tail.length - 2)
+
+  return (
+    <Button key={`s-${s.sid}`} plain onPress={() => act.select(s.sid)}>
+      <Text color={look.color}>{look.glyph} </Text>
+      <Text color={quiet ? p.dim : p.text}>{cut(s.name, 13).padEnd(14)}</Text>
+      <Text color={needsYou(s) ? p.warn : quiet ? p.dim : p.cyan}>{cut(activity(s), room).padEnd(room)}</Text>
+      {s.agents.length ? <Text color={p.violet}> ◇{s.agents.length}</Text> : ''}
+      <Text color={p.dim}> {ago(v.snap.now - s.phaseSince)}</Text>
+    </Button>
+  )
+}
+
+function Live(E: Els, v: View, act: Acts) {
+  const { Box, Text } = E
+  const { p } = v
+  const isQuiet = !v.snap.sessions.some(s => isBusy(s) || needsYou(s))
+
+  return (
+    <Box flexDirection="column">
+      {v.hero ? (
+        <Box flexDirection="row">
+          {v.hero}
+          {Legend(E, v)}
+        </Box>
+      ) : isQuiet && v.scene !== 'off' ? (
+        <Box flexDirection="column">
+          {idleFrame(v.frame, v.width).map(line => (
+            <Text color={p.accent}>{line}</Text>
+          ))}
+        </Box>
+      ) : (
+        Legend(E, v)
+      )}
+      <Text color={p.border}>{'─'.repeat(Math.max(10, v.width))}</Text>
+      {ordered(v.snap.sessions).map(s => (s.sid === v.selected ? Card(E, v, s, act) : Row(E, v, s, act)))}
+      <Text color={p.dim}>press a row for its details · 5 for its actions</Text>
+    </Box>
+  )
+}
+
+type Kind = { glyph: string; color: (p: Palette) => string; label: string }
+const KINDS: Record<string, Kind> = {
+  read: { glyph: '○', color: p => p.cyan, label: 'reads' },
+  write: { glyph: '■', color: p => p.gold, label: 'edits' },
+  run: { glyph: '$', color: p => p.accent, label: 'commands' },
+  agent: { glyph: '◇', color: p => p.violet, label: 'agents' },
+  web: { glyph: '◎', color: p => p.ok, label: 'web' },
+  ask: { glyph: '▲', color: p => p.warn, label: 'questions' },
+  other: { glyph: '›', color: p => p.dim, label: 'other' },
+}
+const kindOf = (tool: string): string =>
+  /^(Read|Glob|Grep|LS|NotebookRead)$/.test(tool)
+    ? 'read'
+    : /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(tool)
+      ? 'write'
+      : /^(Bash|BashOutput|KillShell|Monitor)$/.test(tool)
+        ? 'run'
+        : /^(Agent|Task|Workflow|SendMessage)$/.test(tool)
+          ? 'agent'
+          : /^(WebFetch|WebSearch)$/.test(tool) || tool.startsWith('mcp__')
+            ? 'web'
+            : /^(AskUserQuestion|ExitPlanMode)$/.test(tool)
+              ? 'ask'
+              : 'other'
+
+function Feed(E: Els, v: View, act: Acts) {
+  const { Box, Text, Button } = E
+  const { p } = v
+  const colorOf = new Map(v.snap.sessions.map(s => [s.sid, sessionColor(s, p)]))
+  const all = v.snap.feed.filter(f => !v.feedFilter || f.sid === v.feedFilter)
+  const recent = all.filter(f => v.snap.now - f.t < 600)
+  const tally = new Map<string, number>()
+  for (const f of recent) tally.set(kindOf(f.tool), (tally.get(kindOf(f.tool)) ?? 0) + 1)
+  const items = all.slice(-24).reverse()
+  const w = Math.max(30, v.width)
+
+  // runs of the same session read as one block under its name
+  const blocks: { sid: string; name: string; items: typeof items }[] = []
+  for (const f of items) {
+    const last = blocks[blocks.length - 1]
+    if (last && last.sid === f.sid) last.items.push(f)
+    else blocks.push({ sid: f.sid, name: f.name, items: [f] })
+  }
+
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+        <Button key="f-all" plain onPress={() => act.filter(null)}>
+          <Text color={v.feedFilter === null ? p.accent : p.dim}>{v.feedFilter === null ? '◆' : '◇'} all</Text>
+        </Button>
+        {v.snap.sessions.map(s => (
+          <Button key={`f-${s.sid}`} plain onPress={() => act.filter(s.sid)}>
+            <Text color={v.feedFilter === s.sid ? p.accent : p.dim}>
+              {v.feedFilter === s.sid ? '◆' : '◇'} {cut(s.name, 16)}
+            </Text>
+          </Button>
+        ))}
+      </Box>
+      <Text wrap="truncate-end">
+        <Text color={p.dim}>last 10 min </Text>
+        <Text color={p.text}>{recent.length}</Text>
+        <Text color={p.dim}> calls</Text>
+        {[...tally]
+          .sort((a, b) => b[1] - a[1])
+          .map(([k, n]) => {
+            const kind = KINDS[k] ?? KINDS.other!
+            return (
+              <Text>
+                <Text color={p.border}> · </Text>
+                <Text color={kind.color(p)}>
+                  {kind.glyph} {n}
+                </Text>
+                <Text color={p.dim}> {kind.label}</Text>
+              </Text>
+            )
+          })}
+      </Text>
+      {items.length === 0 ? <Text color={p.dim}>No activity yet. Tool calls stream in here as they happen.</Text> : null}
+      {blocks.map(b => (
+        <Box flexDirection="column" marginTop={1}>
+          <Text>
+            <Text color={colorOf.get(b.sid) ?? p.dim}>● </Text>
+            <Text color={p.text} weight="bold">
+              {b.name}
+            </Text>
+          </Text>
+          {b.items.map(f => {
+            const kind = KINDS[kindOf(f.tool)] ?? KINDS.other!
+            return (
+              <Text wrap="truncate-end">
+                <Text color={p.dim}>{ago(v.snap.now - f.t).padStart(6)} </Text>
+                <Text color={p.border}>{f.agent ? '┊ ' : '│ '}</Text>
+                <Text color={kind.color(p)}>{kind.glyph} </Text>
+                <Text color={f.agent ? p.violet : p.text}>{f.tool}</Text>
+                <Text color={p.dim}> {cut(f.detail, w - 14 - f.tool.length)}</Text>
+              </Text>
+            )
+          })}
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
+
+function JobCard(E: Els, v: View, j: CrewJob, act: Acts) {
+  const { Box, Text, Button } = E
+  const { p } = v
+  const look =
+    j.status === 'running'
+      ? { glyph: '◉', color: p.accent, word: 'running' }
+      : j.status === 'done'
+        ? { glyph: '◆', color: p.ok, word: 'done' }
+        : j.status === 'failed'
+          ? { glyph: '×', color: p.bad, word: 'failed' }
+          : { glyph: '■', color: p.dim, word: 'stopped' }
+  const when = j.status === 'running' ? ago(v.snap.now - j.started) : `${ago(v.snap.now - (j.ended ?? j.started))} ago`
+  const w = Math.max(30, v.width - 4)
+  const border = j.status === 'running' ? p.accent : j.status === 'failed' ? p.bad : p.border
+
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor={border} paddingX={1}>
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text>
+          <Text color={look.color}>{look.glyph} </Text>
+          <Text color={p.cyan} weight="bold">
+            {j.agent}
+          </Text>
+          <Text color={p.dim}> #{j.id} </Text>
+          <Text color={j.by === 'claude' ? p.violet : p.gold}>‹by {j.by === 'claude' ? 'Claude' : 'you'}›</Text>
+          <Text color={p.dim}> {modeLabel(j.agent, j.mode)}</Text>
+        </Text>
+        <Text>
+          <Text color={look.color}>{look.word}</Text>
+          <Text color={p.dim}> {when}</Text>
+        </Text>
+      </Box>
+      <Text wrap="truncate-end">
+        <Text color={p.dim}>task </Text>
+        <Text color={p.text}>{cut(j.task, w - 5)}</Text>
+      </Text>
+      {j.tail.map(line => (
+        <Text wrap="truncate-end">
+          <Text color={p.border}>┊ </Text>
+          <Text color={p.dim}>{cut(line, w - 2)}</Text>
+        </Text>
+      ))}
+      <Box flexDirection="row" columnGap={3}>
+        {j.status === 'running' ? (
+          <Button key={`stop-${j.id}`} plain onPress={() => act.crewStop(j.id)}>
+            <Text color={p.bad}>■ stop</Text>
+          </Button>
+        ) : j.isHanded ? (
+          <Text color={p.violet}>↳ handed to Claude</Text>
+        ) : (
+          <Button key={`send-${j.id}`} plain onPress={() => act.crewSend(j.id)}>
+            <Text color={p.violet}>↳ send to Claude</Text>
+          </Button>
+        )}
+        {j.output || j.log ? (
+          <Button key={`copy-${j.id}`} plain onPress={() => act.copy(j.output || j.log, `job #${j.id} output`)}>
+            <Text color={p.dim}>◇ copy output</Text>
+          </Button>
+        ) : null}
+      </Box>
+    </Box>
+  )
+}
+
+function Crew(E: Els, v: View, act: Acts) {
+  const { Box, Text, Button } = E
+  const { p } = v
+  const jobs = [...v.crew].reverse()
+
+  return (
+    <Box flexDirection="column">
+      <Text color={p.dim} wrap="wrap">
+        Codex and Antigravity work for Claude: it hands them jobs with crew_run and reviews what comes back. You can launch one too.
+      </Text>
+      <Box flexDirection="row" columnGap={2} marginTop={1}>
+        <Button key="crew-agent" plain hotkey="g" onPress={act.crewAgent}>
+          <Text color={p.dim}>g </Text>
+          <Text color={p.cyan} weight="bold">
+            ◆ {v.crewAgent}
+          </Text>
+        </Button>
+        <Button key="crew-mode" plain hotkey="m" onPress={act.crewMode}>
+          <Text color={p.dim}>m </Text>
+          <Text color={v.crewMode === 'edit' ? p.warn : p.ok}>◇ {modeLabel(v.crewAgent, v.crewMode)}</Text>
+        </Button>
+      </Box>
+      {v.launcher ?? <Text color={p.dim}>(launching needs the terminal or desktop app)</Text>}
+      {jobs.length === 0 ? (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color={p.dim}>No jobs yet. Try, in the box above:</Text>
+          <Text color={p.text}>  find every TODO in this repo and group them by file</Text>
+          <Text color={p.dim}>or ask Claude: "have codex double-check this diff while you write the tests"</Text>
+        </Box>
+      ) : null}
+      {jobs.slice(0, 6).map(j => JobCard(E, v, j, act))}
+      {jobs.length > 6 ? <Text color={p.dim}>+{jobs.length - 6} older jobs (Claude can list them with crew_result)</Text> : null}
+    </Box>
+  )
+}
+
+const BARS = ' ▁▂▃▄▅▆▇█'
+
+function CostView(E: Els, v: View) {
+  const { Box, Text } = E
+  const { p } = v
+  const c = v.snap.cost
+  const days = c.days.map(d => d.usd)
+  const max = Math.max(...days, 0.01)
+  const week = days.reduce((a, b) => a + b, 0)
+  const models = Object.entries(c.models)
+  const today = c.today || 1
+  const H = 4
+  // a 4-row bar chart: each day a 3-wide column, shaded by how heavy the day was
+  const level = (usdOf: number) => (usdOf / max) * H * 8
+
+  return (
+    <Box flexDirection="column">
+      <Text>
+        <Text color={p.dim}>TODAY </Text>
+        <Text color={p.gold} weight="bold">
+          {usd(c.today)}
+        </Text>
+        {Sep(E, p)}
+        <Text color={p.text}>{tok(c.tokens)}</Text>
+        <Text color={p.dim}> tokens</Text>
+        {Sep(E, p)}
+        <Text color={p.dim}>cache </Text>
+        <Text color={p.ok}>{Math.round(c.cacheHit * 100)}%</Text>
+      </Text>
+      <Box flexDirection="column" marginTop={1}>
+        {Array.from({ length: H }, (_, row) => (
+          <Text>
+            {days.map(d => {
+              const fill = Math.max(0, Math.min(8, Math.round(level(d) - (H - 1 - row) * 8)))
+              return <Text color={heat(d / max, p)}>{` ${BARS[fill]!.repeat(3)}`}</Text>
+            })}
+          </Text>
+        ))}
+        <Text color={p.dim}>
+          {c.days.map(d => ` ${'SMTWTFS'[new Date(`${d.date}T12:00:00`).getDay()]}  `).join('')}
+        </Text>
+        <Text>
+          <Text color={p.dim}>7 days </Text>
+          <Text color={p.gold}>{usd(week)}</Text>
+          <Text color={p.dim}> · peak {usd(max)}</Text>
+        </Text>
+      </Box>
+      <Box flexDirection="column" marginTop={1}>
+        <Text color={p.dim}>MODELS TODAY</Text>
+        {models.length === 0 ? <Text color={p.dim}>none yet</Text> : null}
+        {models.map(([m, n]) => (
+          <Text>
+            <Text color={p.cyan}>{cut(m, 12).padEnd(12)} </Text>
+            {Gauge(E, (n / today) * 100, 14, { ...p, ok: p.accent, warn: p.violet, bad: p.cyan })}
+            <Text color={p.gold}> {usd(n)}</Text>
+          </Text>
+        ))}
+      </Box>
+      <Box flexDirection="column" marginTop={1}>
+        <Text color={p.dim}>LIVE SESSIONS</Text>
+        {v.snap.sessions.map(s => (
+          <Text wrap="truncate-end">
+            <Text color={sessionColor(s, p)}>● </Text>
+            <Text color={p.text}>{cut(s.name, 22).padEnd(22)} </Text>
+            <Text color={p.gold}>{usd(s.cost).padStart(7)}</Text>
+            <Text color={p.dim}> · {tok(s.tokens)} tok</Text>
+          </Text>
+        ))}
+      </Box>
+      {c.pendingBytes > 0 ? <Text color={p.dim}>reading history… {tok(c.pendingBytes)}B to go</Text> : null}
+      <Text color={p.dim}>≈ API list prices · a subscription bills differently</Text>
+    </Box>
+  )
+}
+
+const TIPS: [string, string][] = [
+  ['/fleet', 'open or close this pane'],
+  ['/agents', 'manage your subagent types'],
+  ['/context', "what fills this session's context"],
+  ['/usage', 'plan limits and usage'],
+  ['/compact', 'shrink a long conversation'],
+  ['/resume', 'reopen an earlier session'],
+  ['/reload-plugins', 'reload FLEET after an edit'],
+]
+
+function Actions(E: Els, v: View, act: Acts) {
+  const { Box, Text, Button } = E
+  const { p } = v
+  const s = v.snap.sessions.find(x => x.sid === v.selected) ?? v.snap.sessions[0]
+  const btn = (key: string, hotkey: string, label: string, color: string, onPress: () => void) => (
+    <Button key={key} plain hotkey={hotkey} onPress={onPress}>
+      <Text color={p.dim}>{hotkey} </Text>
+      <Text color={color}>{label}</Text>
+    </Button>
+  )
+
+  return (
+    <Box flexDirection="column">
+      {s ? Card(E, v, s, act) : <Text color={p.dim}>No live sessions.</Text>}
+      {s ? (
+        <Box flexDirection="column" paddingX={1}>
+          <Text color={p.dim} wrap="truncate-middle">
+            {s.cwd} · pid {s.pid}
+          </Text>
+          <Box flexDirection="row" flexWrap="wrap" columnGap={3} marginTop={1}>
+            {btn('a-id', 'c', '◇ copy id', p.cyan, () => act.copy(s.sid, 'session id'))}
+            {btn('a-dir', 'f', '◇ copy folder', p.cyan, () => act.copy(s.cwd, 'folder'))}
+            {btn('a-open', 'o', '◇ open transcript', p.violet, () => act.open(s.transcript))}
+            {s.sid === v.self ? null : btn('a-stop', 'x', '■ stop…', p.bad, () => act.stop(s))}
+          </Box>
+          <Text color={p.dim}>pick another session on the Live tab (1)</Text>
+        </Box>
+      ) : null}
+      <Box flexDirection="column" marginTop={1}>
+        <Text color={p.dim}>THINGS YOU CAN DO · press one to copy it</Text>
+        {TIPS.map(([cmd, what]) => (
+          <Button key={`tip-${cmd}`} plain onPress={() => act.copy(cmd, cmd)}>
+            <Text color={p.accent}>› </Text>
+            <Text color={p.cyan}>{cmd.padEnd(17)}</Text>
+            <Text color={p.dim}>{what}</Text>
+          </Button>
+        ))}
+      </Box>
+    </Box>
+  )
+}
+
+export function Band(E: Els, snap: Snapshot, p: Palette) {
+  const { Box, Text } = E
+  const busy = snap.sessions.filter(isBusy).length
+  const agents = snap.sessions.reduce((n, s) => n + s.agents.length, 0)
+  const need = snap.sessions.filter(needsYou)
+
+  return (
+    <Box flexDirection="row">
+      <Text color={p.accent}>◆ </Text>
+      {Grad(E, 'FLEET', p.accent, p.cyan, true)}
+      <Text>
+        {'  '}
+        {snap.sessions.map(s => (
+          <Text color={sessionColor(s, p)}>●</Text>
+        ))}
+        <Text color={p.dim}> {snap.sessions.length} live</Text>
+        {Sep(E, p)}
+        <Text color={p.accent}>◉ {busy}</Text>
+        <Text color={p.dim}> busy</Text>
+        {Sep(E, p)}
+        <Text color={p.violet}>◇ {agents}</Text>
+        <Text color={p.dim}> agents</Text>
+        {Sep(E, p)}
+        <Text color={p.gold}>{usd(snap.cost.today)}</Text>
+        <Text color={p.dim}> today</Text>
+      </Text>
+      {need.length > 0 ? (
+        <Text>
+          {Sep(E, p)}
+          <Text color={p.warn} weight="bold">
+            ▲ {need.map(s => s.name).join(', ')} {need.length === 1 ? 'needs' : 'need'} you
+          </Text>
+        </Text>
+      ) : null}
+    </Box>
+  )
+}
