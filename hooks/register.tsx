@@ -784,14 +784,19 @@ async function toggleCrewMode($: EngineInterface): Promise<void> {
 }
 
 /** The launch box: continues the selected thread, or opens a new one named from the task. */
-async function launchFromPane($: EngineInterface, task: string): Promise<void> {
+type Launch = { forceNew?: boolean; agent?: CrewAgent; thread?: string }
+
+/**
+ * Sends your message: to a named thread, else the selected one, else a new
+ * thread named from the message. Answers what happened, for a toast or /crew.
+ */
+async function launch($: EngineInterface, task: string, how: Launch = {}): Promise<string> {
   const text = task.trim()
-  if (!text) return
-  await update($, crewDraft, () => '')
-  await update($, crewInputGen, g => g + 1)
-  const sel = await read($, crewSel)
-  const current = sel ? await findThread($, sel) : undefined
-  const agent = await read($, crewAgent)
+  if (!text) return 'Nothing to send.'
+  const sel = how.thread ?? (how.forceNew ? null : await read($, crewSel))
+  const current = sel ? await findThread($, slug(sel)) : undefined
+  if (how.thread && !current) return `No thread "${slug(how.thread)}". /crew lists them.`
+  const agent = how.agent ?? (await read($, crewAgent))
   const base = slug(text.split(/\s+/).slice(0, 4).join(' '))
   const taken = new Set((await read($, threads)).map(t => t.name))
   let name = base
@@ -808,11 +813,46 @@ async function launchFromPane($: EngineInterface, task: string): Promise<void> {
     effort: await read($, crewEffort),
     mode: await read($, crewMode),
   })
-  if (typeof res === 'string') $.ui.toast(res)
-  else {
-    await update($, crewSel, () => res.name)
-    $.ui.toast(`Crew · sent to ${res.name}`)
+  if (typeof res === 'string') return res
+  await update($, crewSel, () => res.name)
+  return `Sent to ${res.agent} thread "${res.name}" (${modeLabel(res.agent, res.mode)}). Its answer shows in the FLEET pane, tab 3.`
+}
+
+async function launchFromPane($: EngineInterface, task: string): Promise<void> {
+  if (!task.trim()) return
+  await update($, crewDraft, () => '')
+  await update($, crewInputGen, g => g + 1)
+  $.ui.toast(await launch($, task))
+}
+
+/**
+ * /crew in Claude Code's own prompt, with all its editing:
+ *   /crew <message>                 the selected thread, or a new one
+ *   /crew new [codex|agy] <message> a new thread
+ *   /crew @<thread> <message>       a named thread
+ *   /crew                           the threads, and how to use it
+ */
+async function crewCommand($: EngineInterface, args: string): Promise<string> {
+  const text = args.trim()
+  await update($, tab, () => 'crew')
+  if (!(await isPaneShown($))) void $.ui.open({ id: PANE, title: 'FLEET' })
+  if (!text) {
+    const sel = await read($, crewSel)
+    return [
+      listing(await read($, threads)),
+      '',
+      `Selected: ${sel ?? 'none (a message opens a new thread)'}`,
+      'Usage: /crew <message> · /crew new codex|agy <message> · /crew @<thread> <message>',
+    ].join('\n')
   }
+  const fresh = text.match(/^new(?:\s+(codex|agy))?\s+([\s\S]+)$/i)
+  if (fresh) {
+    const agent = fresh[1]?.toLowerCase() === 'agy' ? 'agy' : fresh[1] ? 'codex' : undefined
+    return launch($, fresh[2] ?? '', { forceNew: true, ...(agent ? { agent } : {}) })
+  }
+  const named = text.match(/^@(\S+)\s+([\s\S]+)$/)
+  if (named) return launch($, named[2] ?? '', { thread: named[1] ?? '' })
+  return launch($, text)
 }
 
 function acts($: EngineInterface): Acts {
@@ -877,6 +917,12 @@ export const register: Register = on => {
     if (typeof savedScene === 'string') await update($, scene, () => savedScene)
     palette = paletteOf(await read($, theme))
     await $.command.register({
+      name: 'crew',
+      description: 'Message a Codex/Antigravity crew thread from the prompt: /crew <msg>, /crew new codex|agy <msg>, /crew @thread <msg>',
+      argumentHint: '[new codex|agy | @thread] <message>',
+      immediate: true,
+    })
+    await $.command.register({
       name: 'fleet',
       description: 'Open or close FLEET, the live dashboard of all your Claude Code sessions',
     })
@@ -897,6 +943,8 @@ export const register: Register = on => {
     if (name === 'mcp__fleet__crew_save') return answerCrewSave($, e as unknown as Args)
     return next(e)
   })
+
+  on('command.run', { command: 'crew' }, async ($, e) => ({ text: await crewCommand($, e.args) }))
 
   on('command.run', { command: 'fleet' }, async $ => {
     // close only what you can see; a pane opened unasked on a narrow window comes up instead
@@ -991,14 +1039,22 @@ export const register: Register = on => {
       // margin: the label sits left, the send hint right.
       const draft = await read($, crewDraft)
       const inputGen = await read($, crewInputGen)
+      // The field shows one row per line you break, never wrapping a long one, so a
+      // wrapped preview above it shows the whole message once it runs past the field.
       const boxWidth = Math.max(10, width - 30 - (target ? target.name.length + 4 : 18))
-      const draftRows = Math.max(
-        1,
-        Math.min(8, draft.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / boxWidth)), 0)),
-      )
+      const draftRows = Math.max(1, Math.min(8, draft.split('\n').length))
+      const needsPreview = draft.split('\n').some(line => line.length > boxWidth)
       const launcher = Input ? (
         <Box flexDirection="column">
           {pickers}
+          {needsPreview ? (
+            <Box borderStyle="single" borderColor={palette.border} paddingX={1} flexDirection="column">
+              <Text color={palette.dim}>your message ({draft.length} chars)</Text>
+              <Text color={palette.text} wrap="wrap">
+                {draft.length > 3000 ? `…${draft.slice(-3000)}` : draft}
+              </Text>
+            </Box>
+          ) : null}
           <Box borderStyle="round" borderColor={palette.accent} paddingX={1}>
             <Input
               key={`crew-task-${inputGen}`}

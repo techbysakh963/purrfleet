@@ -285,7 +285,7 @@ test("crew_note answers with the project's notebook", async ($, on) => {
   expect(r.text ?? JSON.stringify(r.result)).toContain('notebook')
 })
 
-test('the crew input grows as you type and keeps what you typed', async ($, on) => {
+test('the crew input keeps what you typed, previews a long line wrapped, grows with line breaks', async ($, on) => {
   on('state.get', (_, e, next) => {
     if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: SNAP }, version: 1 } }
     if (e.key === 'tab') return { value: { value: 'crew', version: 1 } }
@@ -296,8 +296,10 @@ test('the crew input grows as you type and keeps what you typed', async ($, on) 
   expect(before?.props?.rows).toBe(1)
   expect(before?.props?.value).toBeUndefined() // the field owns its text
   await ui.input({ key: 'crew-task-0', text: 'x'.repeat(400), kind: 'change' })
+  expect(await ui.find({ type: 'Text', text: /your message \(400 chars\)/ })).toBeDefined()
+  await ui.input({ key: 'crew-task-0', text: 'one\ntwo\nthree', kind: 'change' })
   const after = (await ui.find({ key: 'crew-task-0' })) as { props?: { rows?: number } } | undefined
-  expect(after?.props?.rows ?? 0).toBeGreaterThan(1)
+  expect(after?.props?.rows).toBe(3)
   await ui.unmount()
 })
 
@@ -335,4 +337,13 @@ test('vault paths stay inside the vault', async () => {
   expect(findingPath('/v', '/home/u/demo-app', '../escape', 0)).toMatch(/^\/v\/demo-app-[0-9a-f]{6}\/1970-01-01 [^/]+\.md$/)
   expect(isInside('/v', '/v/demo-app/x.md')).toBe(true)
   expect(isInside('/v', '/vault-other/x.md')).toBe(false)
+})
+
+test('/crew with nothing after it lists the threads and how to use it', async ($, on) => {
+  on('state.get', (_, e, next) => next(e))
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const run = $.command.run as unknown as (input: { command: string; args: string }) => Promise<{ text?: string }>
+  const r = await run({ command: 'crew', args: '' })
+  expect(r.text ?? '').toContain('Usage: /crew')
 })

@@ -665,6 +665,7 @@ function Crew(E: Els, v: View, act: Acts) {
         )}
       </Box>
       {v.launcher ?? <Text color={p.dim}>(the input box needs the terminal or the desktop app)</Text>}
+      <Text color={p.dim}>or type in Claude's prompt: /crew your message · /crew new agy … · /crew @thread …</Text>
       {Notebook(E, v, act)}
       {list.length === 0 ? (
         <Box flexDirection="column" marginTop={1}>

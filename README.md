@@ -27,6 +27,8 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
 
 ## Use
 
+- `/crew <message>` talks to the crew from Claude Code's own prompt (full editing, wrapping, paste):
+  `/crew new codex|agy <message>` opens a thread, `/crew @thread <message>` picks one, `/crew` lists them.
 - `/fleet` opens or closes the pane. The band above the prompt is always on.
 - `ctrl+x tab` gives the pane the keyboard: `1`–`6` switch tabs, `t` cycles the theme, `a` toggles the cat.
 - **Live**: one calm row per session, needs-you on top; press a row to expand it.
