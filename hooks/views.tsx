@@ -44,6 +44,8 @@ export type Acts = {
   openThread: (thread: string) => void
   /** jump to a project's notebook in the Crew tab */
   openNotebook: (folder: string) => void
+  /** turn the crew status line beside the user's prompts on or off */
+  toggleStatusLine: () => void
   /** rewrite a notebook fact (asks for the new text) */
   noteEdit: (folder: string, id: number) => void
   /** open a crew or notebook row in place on Live ("crew:<thread>", "notes:<folder>") */
@@ -88,6 +90,8 @@ export type View = {
   ww?: number
   /** the Codex diff open under its card */
   crewDiff?: { key: string; text: string } | null
+  /** whether Claude gets the crew status line beside the user's prompts */
+  statusLine?: boolean
 }
 
 const TABS: { tab: Tab; label: string; key: string }[] = [
@@ -1484,6 +1488,7 @@ function Actions(E: Els, v: View, act: Acts) {
       </Text>
       {setting('set-theme', 't  theme', 'nebula · ember · synthwave', p.name, act.theme)}
       {setting('set-cat', 'a  cat', 'on · off', v.scene === 'off' ? 'off' : 'on', act.scene)}
+      {setting('set-status', '   crew news for Claude', 'a line beside your prompts · on · off', v.statusLine === false ? 'off' : 'on', act.toggleStatusLine)}
       {Guide(E, v, act)}
     </Box>
   )

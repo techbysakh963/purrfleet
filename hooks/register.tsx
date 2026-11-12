@@ -36,7 +36,7 @@ import { toBase64 } from './scenes'
 import { PALETTES, paletteOf } from './theme'
 import type { Palette } from './theme'
 import { fleetReport } from './brief'
-import { inbox, moodOf } from './inbox'
+import { inbox, moodOf, statusNews } from './inbox'
 import { deliveryLine, newCodexWorktrees, parseNumstat, parseWorktrees } from './delivery'
 import type { Depth, Part } from './crew'
 import { isUnread } from './inbox'
@@ -75,6 +75,9 @@ const crewShowAll = atom({ plugin: 'fleet', key: 'crewShowAll' } as const, false
 const crewAllTurns = atom({ plugin: 'fleet', key: 'crewAllTurns' } as const, null)
 const crewInputGen = atom({ plugin: 'fleet', key: 'crewInputGen' } as const, 0)
 const crewDiff = atom({ plugin: 'fleet', key: 'crewDiff' } as const, null)
+const statusLine = atom({ plugin: 'fleet', key: 'statusLine' } as const, true)
+// what the last status line (or a crew_read / fleet_read) already told Claude
+let toldKey = ''
 
 // Module variables start over on a reload; everything drawn lives in $.state.
 let self = ''
@@ -1021,6 +1024,7 @@ async function answerCrewRead($: EngineInterface, e: Args): Promise<Answer> {
       blocks.push(digest(t, await fullTurn($, t.name, u), t0) + deliveryNote(u.delivery))
       await markRead($, t.name, u.n)
     }
+    toldKey = statusNews(await read($, threads), await read($, notebooks)).key
     return { result: [UNTRUSTED, '', blocks.join('\n\n')].join('\n') }
   }
   const name = optStr(e.thread)
@@ -1325,6 +1329,7 @@ async function answerFleetRead($: EngineInterface, e: Args): Promise<Answer> {
     scope: e.scope === 'project' ? 'project' : 'all',
     cwd: sessionCwd,
   })
+  toldKey = statusNews(await read($, threads), all).key
   // a briefing moves the "since" marker on, unless asked not to
   if (e.mark !== false) await $.store.set('briefAt', now())
   return { result: text }
@@ -1606,6 +1611,8 @@ function acts($: EngineInterface): Acts {
         void findThread($, name).then(t => (t ? markRead($, name, t.turns[t.turns.length - 1]?.n) : undefined))
       }
     },
+    toggleStatusLine: () =>
+      void update($, statusLine, x => !x).then(async () => $.store.set('statusLine', await read($, statusLine))),
     deliveryView: (name, n) => void viewDelivery($, name, n),
     deliveryAccept: (name, n) => void acceptDelivery($, name, n),
     deliveryDiscard: (name, n) => void discardDelivery($, name, n),
@@ -1643,6 +1650,7 @@ export const register: Register = on => {
     // the tool list is the same bytes every session: models are checked when used, not listed
     void loadModels($)
     // the look you picked last time, kept across sessions
+    if ((await $.store.get('statusLine')) === false) await update($, statusLine, () => false)
     const savedTheme = await $.store.get('theme')
     const savedScene = await $.store.get('scene')
     if (typeof savedTheme === 'string') await update($, theme, () => savedTheme)
@@ -1688,6 +1696,17 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'crew' }, async ($, e) => ({ text: await crewCommand($, e.args) }))
+
+  // When crew results changed since Claude last looked, one line rides along with the
+  // user's next prompt (only the model reads it): no tool call needed to notice them.
+  on('prompt.submit', async ($, e, next) => {
+    const isTyped = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
+    if (!isTyped || e.command || e.isMeta || e.text.startsWith('[FLEET') || !(await read($, statusLine))) return next(e)
+    const news = statusNews(await read($, threads), await read($, notebooks))
+    if (!news.key || news.key === toldKey) return next(e)
+    toldKey = news.key
+    return next({ ...e, context: [...(e.context ?? []), news.text] })
+  })
 
   on('command.run', { command: 'fleet' }, async ($, e) => {
     if (/^\s*help\b/i.test(e.args)) {
@@ -1859,6 +1878,7 @@ export const register: Register = on => {
               },
               notebooks: await read($, notebooks),
               crewDiff: await read($, crewDiff),
+              statusLine: await read($, statusLine),
             },
             acts($),
           )}

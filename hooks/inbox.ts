@@ -95,3 +95,28 @@ export const moodOf = (items: readonly Item[]): 'alarm' | 'work' | 'sleep' => {
   const s = segments(items)
   return s.some(x => x.state === 'need' || x.state === 'failed') ? 'alarm' : s.some(x => x.state === 'work') ? 'work' : 'sleep'
 }
+
+/**
+ * The line FLEET puts beside the user's prompt when crew results changed since Claude
+ * last looked: fixed words, thread names and counts only, never a helper's own words.
+ * `key` fingerprints what it reports, so the same news is never attached twice.
+ */
+export function statusNews(threads: readonly CrewThread[], notebooks: Readonly<Record<string, readonly CrewNote[]>>): { key: string; text: string } {
+  const parts: string[] = []
+  const keys: string[] = []
+  for (const t of threads) {
+    for (const u of t.turns) {
+      if (!isUnread(u)) continue
+      keys.push(`${t.name}#${u.n}:${u.status}`)
+      parts.push(u.status === 'failed' ? `× ${t.name}#${u.n} (${t.agent}) failed` : `◆ ${t.name}#${u.n} (${t.agent}) answered`)
+    }
+  }
+  const pending = Object.values(notebooks).reduce((n, list) => n + list.filter(x => x.pending).length, 0)
+  if (pending) {
+    keys.push(`notes:${pending}`)
+    parts.push(`${pending} notebook suggestion${pending === 1 ? '' : 's'}`)
+  }
+  if (parts.length === 0) return { key: '', text: '' }
+  const shown = parts.length > 6 ? [...parts.slice(0, 6), `${parts.length - 6} more`] : parts
+  return { key: keys.sort().join('|'), text: `[FLEET] since you last looked: ${shown.join(' · ')}. crew_read {"new": true} reads them.` }
+}

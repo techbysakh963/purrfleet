@@ -195,6 +195,8 @@ declare module 'claude-code' {
       notebooks: Record<string, CrewNote[]>
       /** the diff open in the Crew tab: "thread#n" and its text */
       crewDiff: { key: string; text: string } | null
+      /** a one-line crew update beside the user's prompt, for Claude only */
+      statusLine: boolean
     }
   }
 }

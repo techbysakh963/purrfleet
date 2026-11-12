@@ -85,6 +85,11 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   helper Claude started by mistake. `crew_note`, `crew_save`, `vault_search` and `crew_stop` are
   deferred tools, loaded on demand, so they cost nothing in requests that don't use them. A new
   `fleet-delegate` skill says when a helper pays for itself.
+- **Crew news for Claude** (v0.15): when a helper answered or failed, or notes are waiting, since
+  Claude last looked, one line rides along with your next typed prompt, which only the model reads
+  (`[FLEET] since you last looked: ◆ review-ui#3 (agy) answered · …`). Fixed words, thread names and
+  counts only; never a helper's own text; never twice for the same news; never on slash commands.
+  Actions → Settings turns it off.
 - Codex changes: after a Codex edit turn, the thread shows a card with the files it changed
   (+/− per file), **view diff**, **accept into your tree** (asks first; applies with `git apply`,
   never commits) and **discard** (deletes Codex's worktree). Until you decide, it stays on Live.
