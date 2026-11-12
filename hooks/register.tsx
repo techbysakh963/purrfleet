@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
-import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
+import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Delivery, Session, Snapshot, Tab } from '../types'
 import { isBusy, needsYou } from './fmt'
 import type { Mood } from './cat'
 import { catCells } from './cat'
@@ -30,6 +30,7 @@ import { PALETTES, paletteOf } from './theme'
 import type { Palette } from './theme'
 import { fleetReport } from './brief'
 import { inbox } from './inbox'
+import { deliveryLine, newCodexWorktree, parseNumstat, parseWorktrees } from './delivery'
 import { findingMarkdown, findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf } from './vault'
 import { Band, Pane, ordered } from './views'
 import type { Acts } from './views'
@@ -64,6 +65,7 @@ const toured = atom({ plugin: 'fleet', key: 'toured' } as const, true)
 const crewShowAll = atom({ plugin: 'fleet', key: 'crewShowAll' } as const, false)
 const crewAllTurns = atom({ plugin: 'fleet', key: 'crewAllTurns' } as const, null)
 const crewInputGen = atom({ plugin: 'fleet', key: 'crewInputGen' } as const, 0)
+const crewDiff = atom({ plugin: 'fleet', key: 'crewDiff' } as const, null)
 
 // Module variables start over on a reload; everything drawn lives in $.state.
 let self = ''
@@ -228,6 +230,96 @@ async function openPath($: EngineInterface, path: string): Promise<void> {
   await $.process.run(['xdg-open', path], { timeoutMs: 5000 }).catch(() => $.ui.toast(`Couldn't open ${path}`))
 }
 
+
+// ── Codex deliveries: edits wait in Codex's worktree until you accept them ────
+
+const git = ($: EngineInterface, args: readonly string[], stdin?: string) =>
+  $.process.run(['git', ...args], { timeoutMs: 30_000, ...(stdin === undefined ? {} : { stdin }) })
+
+async function worktreesOf($: EngineInterface, cwd: string): Promise<string[]> {
+  const r = await git($, ['-C', cwd, 'worktree', 'list', '--porcelain']).catch(() => undefined)
+  return r && r.exitCode === 0 ? parseWorktrees(r.stdout) : []
+}
+
+/** Everything Codex changed in its worktree, staged there so new files count too. */
+async function stagedIn($: EngineInterface, path: string, what: 'numstat' | 'patch'): Promise<string | undefined> {
+  if ((await git($, ['-C', path, 'add', '-A'])).exitCode !== 0) return undefined
+  const r = await git($, ['-C', path, 'diff', '--cached', what === 'numstat' ? '--numstat' : '--binary'])
+  return r.exitCode === 0 ? r.stdout : undefined
+}
+
+async function deliveryOf($: EngineInterface, cwd: string, before: readonly string[]): Promise<Delivery | undefined> {
+  const home = (await $.env.get('HOME')) ?? ''
+  const path = newCodexWorktree(before, await worktreesOf($, cwd), home)
+  if (!path) return undefined
+  const stat = await stagedIn($, path, 'numstat')
+  return { path, files: stat === undefined ? [] : parseNumstat(stat), state: 'pending' }
+}
+
+const deliveryAt = async ($: EngineInterface, name: string, n: number) => {
+  const t = await findThread($, name)
+  const u = t?.turns.find(x => x.n === n)
+  return t && u?.delivery ? { t, d: u.delivery } : undefined
+}
+
+async function setDelivery($: EngineInterface, name: string, n: number, change: Partial<Delivery>): Promise<void> {
+  await patchThread($, name, x => ({
+    ...x,
+    turns: x.turns.map(u => (u.n === n && u.delivery ? { ...u, delivery: { ...u.delivery, ...change } } : u)),
+  }))
+  await persist($)
+}
+
+/** Shows (or hides) the whole diff under the delivery card. */
+async function viewDelivery($: EngineInterface, name: string, n: number): Promise<void> {
+  const key = `${name}#${n}`
+  if ((await read($, crewDiff))?.key === key) return void (await update($, crewDiff, () => null))
+  const at = await deliveryAt($, name, n)
+  if (!at) return
+  const patch = await stagedIn($, at.d.path, 'patch')
+  const text = patch === undefined ? '(the worktree is gone or git failed to read it)' : patch.trim() || '(no changes)'
+  await update($, crewDiff, () => ({ key, text: text.length > 60_000 ? `${text.slice(0, 60_000)}\n…(cut)` : text }))
+}
+
+/** Applies Codex's changes to your tree, after you confirm; then its worktree goes. */
+async function acceptDelivery($: EngineInterface, name: string, n: number): Promise<void> {
+  const at = await deliveryAt($, name, n)
+  if (!at || at.d.state !== 'pending') return
+  const answer = await $.ui.ask(`Apply ${deliveryLine(at.d)} from codex › ${name} to ${at.t.cwd}?`, {
+    header: 'FLEET crew',
+    options: ['Apply to my tree', 'Cancel'],
+  })
+  if (!answer.startsWith('Apply')) return
+  const patch = await stagedIn($, at.d.path, 'patch')
+  if (patch === undefined) return setDelivery($, name, n, { note: "couldn't read the worktree; it may be gone" })
+  if (!patch.trim()) return setDelivery($, name, n, { note: 'nothing to apply' })
+  const check = await git($, ['-C', at.t.cwd, 'apply', '--check', '-'], patch)
+  if (check.exitCode !== 0) {
+    const why = check.stderr.trim().split('\n')[0] ?? 'git apply refused'
+    $.ui.toast(`Crew · ${name}: not applied, ${why}`)
+    return setDelivery($, name, n, { note: `not applied: ${why}` })
+  }
+  const done = await git($, ['-C', at.t.cwd, 'apply', '-'], patch)
+  if (done.exitCode !== 0) return setDelivery($, name, n, { note: `not applied: ${done.stderr.trim().split('\n')[0] ?? ''}` })
+  await git($, ['-C', at.t.cwd, 'worktree', 'remove', '--force', at.d.path]).catch(() => undefined)
+  $.ui.toast(`Crew · ${name}: applied ${deliveryLine(at.d)} to your tree (not committed)`)
+  await update($, crewDiff, cur => (cur?.key === `${name}#${n}` ? null : cur))
+  await setDelivery($, name, n, { state: 'accepted', note: undefined })
+}
+
+/** Throws Codex's changes away with its worktree, after you confirm. */
+async function discardDelivery($: EngineInterface, name: string, n: number): Promise<void> {
+  const at = await deliveryAt($, name, n)
+  if (!at || at.d.state !== 'pending') return
+  const answer = await $.ui.ask(`Discard ${deliveryLine(at.d)} from codex › ${name}? Its worktree is deleted.`, {
+    header: 'FLEET crew',
+    options: ['Discard', 'Keep it'],
+  })
+  if (!answer.startsWith('Discard')) return
+  await git($, ['-C', at.t.cwd, 'worktree', 'remove', '--force', at.d.path]).catch(() => undefined)
+  await update($, crewDiff, cur => (cur?.key === `${name}#${n}` ? null : cur))
+  await setDelivery($, name, n, { state: 'discarded', note: undefined })
+}
 
 // ── crew: named, ongoing conversations with Codex and Antigravity ────────────
 
@@ -414,8 +506,14 @@ async function runTurn(
   const notes = (await read($, notebooks))[t.cwd] ?? []
   const nb = notebookDelta(t.sentNotes, notes, !t.session)
   if (await isStopped()) return
+  // a Codex edit turn makes its own git worktree; which one is only visible from git
+  const before = isCodexEdit ? await worktreesOf($, t.cwd) : []
   const res = await execTurn($, t, brief(t, by, task, context, seed, nb.text, nb.isDelta), n, false, isMine)
   if (!isMine()) return
+  if (isCodexEdit) {
+    const delivery = await deliveryOf($, t.cwd, before).catch(() => undefined)
+    if (delivery) await patchThread($, name, x => ({ ...x, turns: x.turns.map(u => (u.n === n ? { ...u, delivery } : u)) }))
+  }
   await archiveAnswer($, name, n, res.answer)
   // the helper has these notes only once the turn really went through
   if (res.ok) await patchThread($, name, x => ({ ...x, sentNotes: nb.sent }))
@@ -670,6 +768,11 @@ async function answerCrewRead($: EngineInterface, e: Args): Promise<Answer> {
   const turn = typeof e.turn === 'number' ? t.turns.find(u => u.n === e.turn) : t.turns[t.turns.length - 1]
   if (!turn) return { result: threadLine(t) }
   void markRead($, t.name, turn.n)
+  const d = turn.delivery
+  const delivered = d
+    ? `\n\nCHANGES (${d.state}): ${deliveryLine(d)} in Codex's worktree ${d.path}${d.state === 'pending' ? '. Inspect them there (read-only); only the user accepts or discards them, in the Crew tab.' : '.'}`
+    : ''
+  if (delivered) return { result: report(t, e.full === true ? await fullTurn($, t.name, turn) : turn, e.full === true) + delivered }
   return { result: report(t, e.full === true ? await fullTurn($, t.name, turn) : turn, e.full === true) }
 }
 
@@ -1153,6 +1256,9 @@ function acts($: EngineInterface): Acts {
     showAllThreads: () => void update($, crewShowAll, x => !x),
     showAllTurns: name => void update($, crewAllTurns, cur => (cur === name ? null : name)),
     openNote: file => void openPath($, `obsidian://open?path=${encodeURIComponent(file)}`),
+    deliveryView: (name, n) => void viewDelivery($, name, n),
+    deliveryAccept: (name, n) => void acceptDelivery($, name, n),
+    deliveryDiscard: (name, n) => void discardDelivery($, name, n),
   }
 }
 
@@ -1398,6 +1504,7 @@ export const register: Register = on => {
                 notes: (await read($, notebooks))[target?.cwd ?? cFolder] ?? [],
               },
               notebooks: await read($, notebooks),
+              crewDiff: await read($, crewDiff),
             },
             acts($),
           )}

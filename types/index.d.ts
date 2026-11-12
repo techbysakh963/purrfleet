@@ -85,6 +85,16 @@ export type CrewNote = {
   pending?: boolean
 }
 
+/** What a Codex edit turn changed, waiting in its own git worktree until you accept or discard it. */
+export type Delivery = {
+  /** the worktree Codex edited in */
+  path: string
+  files: { path: string; added: number; removed: number }[]
+  state: 'pending' | 'accepted' | 'discarded'
+  /** why the last accept failed, if it did */
+  note?: string
+}
+
 /** One message to a crew thread and the helper's answer to it. */
 export type CrewTurn = {
   n: number
@@ -103,6 +113,8 @@ export type CrewTurn = {
   isHanded: boolean
   /** finished and nobody has looked yet: shown under TO READ (or NEEDS YOU when failed) */
   unread?: boolean
+  /** a Codex edit turn's changes, apart from your tree until you accept them */
+  delivery?: Delivery
   /** the turn that wrote a state brief before the thread was compacted */
   isCompaction?: boolean
 }
@@ -174,6 +186,8 @@ declare module 'claude-code' {
       toured: boolean
       crewAllTurns: string | null
       notebooks: Record<string, CrewNote[]>
+      /** the diff open in the Crew tab: "thread#n" and its text */
+      crewDiff: { key: string; text: string } | null
     }
   }
 }

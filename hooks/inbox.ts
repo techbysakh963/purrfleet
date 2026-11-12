@@ -38,8 +38,9 @@ export function inbox(
   for (const t of threads) {
     const last = t.turns[t.turns.length - 1]
     if (t.status === 'running') items.push({ kind: 'running', group: 'work', key: `r:${t.name}`, t, u: last })
-    // only the newest unread turn of a thread: one row per thread
-    const unread = [...t.turns].reverse().find(isUnread)
+    // only the newest unread turn of a thread: one row per thread. Codex changes
+    // waiting for accept or discard stay listed after they're read: they're a decision.
+    const unread = [...t.turns].reverse().find(u => isUnread(u) || u.delivery?.state === 'pending')
     if (unread) {
       items.push({ kind: 'turn', group: unread.status === 'failed' ? 'need' : 'read', key: `t:${t.name}`, t, u: unread })
     }

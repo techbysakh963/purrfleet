@@ -1,7 +1,8 @@
 import type { Elements } from 'claude-code'
 
-import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
+import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Delivery, Session, Snapshot, Tab } from '../types'
 import { NOTEBOOK_CAP, modeLabel, summaryOf } from './crew'
+import { deliveryLine } from './delivery'
 import { activity, ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, spark, tok, usd } from './fmt'
 import type { Group, Item } from './inbox'
 import { inbox, tally } from './inbox'
@@ -43,6 +44,10 @@ export type Acts = {
   openThread: (thread: string) => void
   /** jump to a project's notebook in the Crew tab */
   openNotebook: (folder: string) => void
+  /** a Codex delivery: show its diff, apply it to your tree, or throw it away */
+  deliveryView: (thread: string, turn: number) => void
+  deliveryAccept: (thread: string, turn: number) => void
+  deliveryDiscard: (thread: string, turn: number) => void
 }
 
 export type View = {
@@ -73,6 +78,8 @@ export type View = {
   notebook: { folder: string; file: string; notes: readonly CrewNote[] }
   /** every project's notebook: pending suggestions show up on Live */
   notebooks: Readonly<Record<string, readonly CrewNote[]>>
+  /** the Codex diff open under its card */
+  crewDiff?: { key: string; text: string } | null
 }
 
 const TABS: { tab: Tab; label: string; key: string }[] = [
@@ -458,11 +465,14 @@ function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Ac
     })
   }
   const failed = x.u.status === 'failed'
+  const d = x.u.delivery
   return GridRow(E, v, {
     key: `inbox-${x.key}`,
     m: mark(v, failed ? 'failed' : 'read'),
     who,
-    what: failed ? `failed: ${x.u.log[x.u.log.length - 1] ?? (summaryOf(x.u.answer) || 'no answer')}` : summaryOf(x.u.answer) || 'answered',
+    what: d?.state === 'pending' && !failed
+      ? `changes to review: ${deliveryLine(d)}`
+      : failed ? `failed: ${x.u.log[x.u.log.length - 1] ?? (summaryOf(x.u.answer) || 'no answer')}` : summaryOf(x.u.answer) || 'answered',
     age: age(now - (x.u.ended ?? now)),
     press: () => act.openThread(x.t.name),
   })
@@ -775,6 +785,7 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
                   </Text>
                 ))
             : []),
+          ...(last.delivery ? DeliveryCard(E, v, t, last.n, last.delivery, act) : []),
           <Text color={p.dim} wrap="truncate-end">
             {meta}
           </Text>,
@@ -800,6 +811,64 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
         ])}
     </Box>
   )
+}
+
+/**
+ * What a Codex edit turn changed, as rail lines: the files, the diff on demand, and
+ * accept or discard. Nothing reaches your tree until you accept.
+ */
+function DeliveryCard(E: Els, v: View, t: CrewThread, n: number, d: Delivery, act: Acts): Node[] {
+  const { Text } = E
+  const { p } = v
+  const key = `${t.name}#${n}`
+  const isOpen = v.crewDiff?.key === key
+  const state =
+    d.state === 'pending' ? 'waiting in its own worktree' : d.state === 'accepted' ? 'applied to your tree (not committed)' : 'discarded'
+  const lines: Node[] = [
+    Labeled(
+      E,
+      v,
+      'changes',
+      <Text>
+        <Text color={d.state === 'pending' ? mark(v, 'read').color : p.dim}>{deliveryLine(d)}</Text>
+        <Text color={p.dim}> · {state}</Text>
+      </Text>,
+    ),
+    ...d.files.slice(0, 8).map(f =>
+      Labeled(
+        E,
+        v,
+        '',
+        <Text>
+          <Text color={p.text}>{f.path} </Text>
+          <Text color={p.ok}>+{f.added}</Text>
+          <Text color={p.bad}> −{f.removed}</Text>
+        </Text>,
+      ),
+    ),
+    d.files.length > 8 ? Labeled(E, v, '', `… and ${d.files.length - 8} more`) : null,
+    d.note ? Labeled(E, v, 'note', <Text color={p.warn}>{d.note}</Text>) : null,
+  ].filter(x => x !== null)
+  if (isOpen && v.crewDiff) {
+    for (const line of v.crewDiff.text.split('\n').slice(0, 400)) {
+      const color = /^\+(?!\+\+)/.test(line) ? p.ok : /^-(?!--)/.test(line) ? p.bad : /^@@/.test(line) ? p.cyan : p.dim
+      lines.push(
+        <Text color={color} wrap="truncate-end">
+          {line || ' '}
+        </Text>,
+      )
+    }
+  }
+  if (d.state === 'pending') {
+    lines.push(
+      ActionLine(E, v, [
+        { key: `dv-${key}`, label: isOpen ? 'hide diff' : 'view diff', press: () => act.deliveryView(t.name, n) },
+        { key: `da-${key}`, label: 'accept into your tree', color: p.ok, press: () => act.deliveryAccept(t.name, n) },
+        { key: `dd-${key}`, label: 'discard', color: p.bad, press: () => act.deliveryDiscard(t.name, n) },
+      ]),
+    )
+  }
+  return lines
 }
 
 /** The crew's two memory layers for the project in view: the notebook, then the vault. */
@@ -1210,6 +1279,7 @@ const GUIDE: { title: string; rows: [string, string][] }[] = [
     rows: [
       ['read-only', 'helpers only read, unless you allow edits (Claude must ask you first)'],
       ['worktree', 'Codex edits happen in a separate git worktree, apart from your files'],
+      ['changes', 'its card lists the files: view diff · accept into your tree (asks first, never commits) · discard'],
       ['folders', 'helpers work only in projects you have open; any other folder asks you'],
     ],
   },

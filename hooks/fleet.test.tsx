@@ -8,6 +8,7 @@ import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { fleetReport } from './brief'
 import { inbox, tally } from './inbox'
+import { deliveryLine, newCodexWorktree, parseNumstat, parseWorktrees } from './delivery'
 import { age, fitWho, sections } from './views'
 import { PALETTES } from './theme'
 import { findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf, safeName } from './vault'
@@ -645,4 +646,42 @@ test('the grid: answers keep their shape, helper names are cut thread-first, age
   expect(fitWho('codex › a-very-long-thread-name', 16).startsWith('codex › ')).toBe(true)
   expect(fitWho('codex › a-very-long-thread-name', 16).length).toBeLessThanOrEqual(16)
   for (const s of [5, 59, 61, 3599, 7200, 90_000, 9_000_000]) expect(age(s).length).toBeLessThanOrEqual(4)
+})
+
+test('Codex deliveries: the new worktree is found, its changes counted, and they wait on Live until decided', async ($, on) => {
+  const porcelain = 'worktree /p\nHEAD abc\nbranch refs/heads/main\n\nworktree /h/.codex/worktrees/7/p\nHEAD abc\ndetached\n'
+  expect(parseWorktrees(porcelain)).toEqual(['/p', '/h/.codex/worktrees/7/p'])
+  expect(newCodexWorktree(['/p'], parseWorktrees(porcelain), '/h')).toBe('/h/.codex/worktrees/7/p')
+  expect(newCodexWorktree(['/p', '/h/.codex/worktrees/7/p'], parseWorktrees(porcelain), '/h')).toBeUndefined()
+  expect(newCodexWorktree(['/p'], ['/p', '/elsewhere/wt'], '/h')).toBeUndefined() // not Codex's: never touched
+  const files = parseNumstat('1\t0\ta.txt\n12\t3\tsrc/b c.ts\n-\t-\timg.png\n')
+  expect(files).toEqual([
+    { path: 'a.txt', added: 1, removed: 0 },
+    { path: 'src/b c.ts', added: 12, removed: 3 },
+    { path: 'img.png', added: 0, removed: 0 },
+  ])
+  expect(deliveryLine({ files })).toBe('3 files · +13 −3')
+  expect(deliveryLine({ files: [] })).toBe('no changes')
+
+  const delivery = { path: '/h/.codex/worktrees/7/p', files, state: 'pending' as const }
+  const t = crewThread('fix-auth', { mode: 'edit', turns: [doneTurn(1, { unread: false, delivery })] })
+  // read but undecided: still on Live
+  expect(inbox([], [t], {}).map(x => x.key)).toContain('t:fix-auth')
+  const decided = crewThread('fix-auth', { mode: 'edit', turns: [doneTurn(1, { unread: false, delivery: { ...delivery, state: 'accepted' } })] })
+  expect(inbox([], [decided], {}).length).toBe(0)
+
+  on('state.get', (_, e, next) => {
+    if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: SNAP }, version: 1 } }
+    if (e.key === 'tab') return { value: { value: 'crew', version: 1 } }
+    if (e.key === 'toured') return { value: { value: true, version: 1 } }
+    if (e.key === 'crewSel') return { value: { value: 'fix-auth', version: 1 } }
+    if (e.key === 'threads') return { value: { value: { shape: 'threads-1', value: [t] }, version: 1 } }
+    return next(e)
+  })
+  const crew = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
+  expect(await crew.find({ type: 'Text', text: /3 files · \+13 −3/ })).toBeDefined()
+  expect(await crew.find({ type: 'Text', text: /waiting in its own worktree/ })).toBeDefined()
+  expect(await crew.find({ key: 'da-fix-auth#1' })).toBeDefined() // accept
+  expect(await crew.find({ key: 'dd-fix-auth#1' })).toBeDefined() // discard
+  await crew.unmount()
 })

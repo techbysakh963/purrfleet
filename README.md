@@ -60,6 +60,10 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   first, so Claude reads summaries and pulls full answers on demand. Threads compact themselves into
   a state brief after 10 turns, or after one turn that processed over 600k tokens, and continue fresh. Read-only by default;
   edits need your approval (Codex edits in its own git worktree).
+- Codex changes: after a Codex edit turn, the thread shows a card with the files it changed
+  (+/− per file), **view diff**, **accept into your tree** (asks first; applies with `git apply`,
+  never commits) and **discard** (deletes Codex's worktree). Until you decide, it stays on Live.
+  `crew_read` tells Claude where the worktree is, so it can inspect the changes; only you decide.
 - **Shared notebook**: per project folder, a short list of durable facts (about 1.5k tokens at
   most) that every helper message carries, so Claude, Codex and Antigravity share what matters
   without re-sending history. Helpers add `NOTE:` lines; Claude curates with `crew_note`.
