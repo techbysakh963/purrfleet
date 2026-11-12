@@ -160,7 +160,7 @@ export function Pane(E: Els, v: View, act: Acts) {
           <Text color={p.dim}>a </Text>
           <Text color={p.cyan}>◎ {v.scene}</Text>
         </Button>
-        <Text color={p.dim}>ctrl+x tab: keys</Text>
+        <Text color={p.dim}>ctrl+x tab: focus the pane</Text>
       </Box>
     </Box>
   )
@@ -210,7 +210,12 @@ function Card(E: Els, v: View, s: Session, act: Acts) {
         {s.added ? <Text color={p.ok}>+{s.added} </Text> : ''}
         {s.removed ? <Text color={p.bad}>−{s.removed}</Text> : ''}
       </Text>
-      {tool ? (
+      {needsYou(s) ? (
+        <Text color={look.color} wrap="wrap">
+          {look.glyph} {activity(s)}
+        </Text>
+      ) : null}
+      {tool && !needsYou(s) ? (
         <Text wrap="truncate-end">
           <Text color={p.accent}>› </Text>
           <Text color={p.cyan} weight="bold">
@@ -265,7 +270,9 @@ function Row(E: Els, v: View, s: Session, act: Acts) {
     <Button key={`s-${s.sid}`} plain onPress={() => act.select(s.sid)}>
       <Text color={look.color}>{look.glyph} </Text>
       <Text color={quiet ? p.dim : p.text}>{cut(s.name, 13).padEnd(14)}</Text>
-      <Text color={needsYou(s) ? p.warn : quiet ? p.dim : p.cyan}>{cut(activity(s), room).padEnd(room)}</Text>
+      <Text color={s.phase === 'error' ? p.bad : needsYou(s) ? p.warn : quiet ? p.dim : p.cyan}>
+        {cut(activity(s), room).padEnd(room)}
+      </Text>
       {s.agents.length ? <Text color={p.violet}> ◇{s.agents.length}</Text> : ''}
       <Text color={p.dim}> {ago(v.snap.now - s.phaseSince)}</Text>
     </Button>
@@ -300,7 +307,7 @@ function Live(E: Els, v: View, act: Acts) {
   const { Box, Text } = E
   const { p } = v
   // the rows come first; the cat sits beside them when there is room, else below
-  const isBeside = v.hero !== null && v.width >= 70
+  const isBeside = v.hero !== null && v.width >= 90 // narrower, the rows need the room
   const rowsView = isBeside ? { ...v, width: v.width - CAT_COLS - 2 } : v
   const rows = ordered(v.snap.sessions).map(s =>
     s.sid === v.selected ? Card(E, rowsView, s, act) : Row(E, rowsView, s, act),
@@ -309,7 +316,6 @@ function Live(E: Els, v: View, act: Acts) {
   return (
     <Box flexDirection="column">
       {FleetStatus(E, v)}
-      <Text color={p.border}>{'─'.repeat(Math.max(10, v.width))}</Text>
       {isBeside ? (
         <Box flexDirection="row">
           <Box flexDirection="column" flexGrow={1} flexShrink={1}>
@@ -405,7 +411,7 @@ function Feed(E: Els, v: View, act: Acts) {
       <Text wrap="truncate-end">
         <Text color={p.dim}>last 10 min </Text>
         <Text color={p.text}>{recentCount}</Text>
-        <Text color={p.dim}> calls</Text>
+        <Text color={p.dim}> tool calls</Text>
         {[...tally]
           .sort((a, b) => b[1] - a[1])
           .map(([k, n]) => {
@@ -487,7 +493,7 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
         {tokens ? ` · ${tok(tokens)} processed` : ''}
         {t.compactions ? ` · compacted ${t.compactions}×` : ''}
       </Text>
-      <Text color={t.by === 'claude' ? p.violet : p.gold}> ‹{t.by === 'claude' ? 'Claude' : 'you'}›</Text>
+      <Text color={t.by === 'claude' ? p.violet : p.gold}> · started by {t.by === 'claude' ? 'Claude' : 'you'}</Text>
     </Button>
   )
   if (!isOpen) {
@@ -1013,6 +1019,12 @@ export function Band(E: Els, snap: Snapshot, p: Palette, info: BandInfo = { age:
     <Box flexDirection="row">
       <Text color={p.accent}>◆ </Text>
       {Grad(E, 'FLEET', p.accent, p.cyan, true)}
+      {need.length > 0 ? (
+        // the reason to look at the band comes first, before it can be cut off
+        <Text color={need.some(s => s.phase === 'error') ? p.bad : p.warn} weight="bold">
+          {'  '}▲ {need.map(s => s.name).join(', ')} {need.length === 1 ? 'needs' : 'need'} you
+        </Text>
+      ) : null}
       <Text>
         {'  '}
         {snap.sessions.map(s => (
@@ -1047,14 +1059,6 @@ export function Band(E: Els, snap: Snapshot, p: Palette, info: BandInfo = { age:
           </Text>
         ) : null}
       </Text>
-      {need.length > 0 ? (
-        <Text>
-          {Sep(E, p)}
-          <Text color={p.warn} weight="bold">
-            ▲ {need.map(s => s.name).join(', ')} {need.length === 1 ? 'needs' : 'need'} you
-          </Text>
-        </Text>
-      ) : null}
     </Box>
   )
 }

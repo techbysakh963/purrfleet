@@ -35,9 +35,9 @@ export const PALETTES: Palette[] = [
     cyan: '#4fd1ff',
     violet: '#b48cff',
     ok: '#3ddc97',
-    warn: '#ffc24b',
+    warn: '#ffa53d', // needs-you: a strong amber
     bad: '#ff5c7a',
-    gold: '#ffd166',
+    gold: '#e9d58f', // money: a pale gold, clearly not the warning
     dim: '#6b7394',
     text: '#e6e9f5',
     border: '#3a3f66',
@@ -53,9 +53,9 @@ export const PALETTES: Palette[] = [
     cyan: '#5eead4',
     violet: '#f0a6ff',
     ok: '#7ee08a',
-    warn: '#ffc247',
+    warn: '#ffa940',
     bad: '#ff5a5a',
-    gold: '#ffd27a',
+    gold: '#eadbab',
     dim: '#8a7468',
     text: '#f5ebe4',
     border: '#5a3a2c',
@@ -73,7 +73,7 @@ export const PALETTES: Palette[] = [
     ok: '#4ade80',
     warn: '#fde047',
     bad: '#fb7185',
-    gold: '#fde047',
+    gold: '#f6b86b', // money: a warm amber, never the warning yellow
     dim: '#7c6a93',
     text: '#f5e9ff',
     border: '#4b2a66',
