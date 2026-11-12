@@ -157,6 +157,36 @@ def hud_state(sid):
     return out
 
 
+AGENT_QUIET = 600  # an agent whose session folder has been silent this long has ended
+
+
+def newest_mtime(folder, limit=400):
+    """The newest modification time of any file under folder (subagent and workflow transcripts)."""
+    best, seen = 0.0, 0
+    for root, _, fs in os.walk(folder):
+        for g in fs:
+            seen += 1
+            if seen > limit:
+                return best
+            try:
+                best = max(best, os.path.getmtime(os.path.join(root, g)))
+            except OSError:
+                pass
+    return best
+
+
+def live_agents(agents, session_dir, now):
+    """The HUD hook can miss an agent's stop (workflow subagents especially), leaving it
+    'running' for hours. An agent counts only while it is young or its session's
+    subagent/workflow transcripts are still being written."""
+    old = [a for a in agents if now - a["since"] > AGENT_QUIET]
+    if not old:
+        return agents
+    if now - newest_mtime(session_dir) < AGENT_QUIET:
+        return agents
+    return [a for a in agents if now - a["since"] <= AGENT_QUIET]
+
+
 def git_head(cwd):
     """Branch name from .git/HEAD, walking up; no subprocess."""
     d = cwd
@@ -564,7 +594,8 @@ def build():
             "status": s.get("status", ""), "phase": phase,
             "phaseSince": h["phaseSince"] or int((s.get("statusUpdatedAt") or 0) / 1000),
             "startedAt": int((s.get("startedAt") or 0) / 1000),
-            "tools": h["tools"], "agents": h["agents"], "calls": h["calls"],
+            "tools": h["tools"], "agents": live_agents(h["agents"], os.path.join(CLAUDE, "projects", slug(s.get("cwd", "")), sid), now),
+            "calls": h["calls"],
             "model": short_model(e.get("model", "")), "ctx": e.get("ctx", 0),
             "cost": round(c, 4), "tokens": toks, "transcript": main_t,
             "branch": branch, "added": added, "removed": removed,

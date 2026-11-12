@@ -54,8 +54,7 @@ export type View = {
   self: string
   p: Palette
   scene: string
-  /** pixel art, drawn only where the surface has a Raster (the terminal) */
-  aurora: Node | null
+  /** the cat: pixel art, drawn only where the surface has a Raster (the terminal) */
   hero: Node | null
   threads: readonly CrewThread[]
   crewSel: string | null
@@ -84,6 +83,31 @@ const TABS: { tab: Tab; label: string; key: string }[] = [
   { tab: 'system', label: 'System', key: '5' },
   { tab: 'actions', label: 'Actions', key: '6' },
 ]
+
+/**
+ * FLEET's one visual grammar: each mark means one thing, everywhere.
+ *   ▲ needs you   × failed   ◆ to read   ● working   ○ quiet
+ */
+export function mark(v: { p: Palette }, state: 'need' | 'error' | 'failed' | 'read' | 'work' | 'quiet'): { glyph: string; color: string } {
+  const { p } = v
+  switch (state) {
+    case 'need':
+      return { glyph: '▲', color: p.warn }
+    case 'error':
+      return { glyph: '▲', color: p.bad }
+    case 'failed':
+      return { glyph: '×', color: p.bad }
+    case 'read':
+      return { glyph: '◆', color: p.cyan }
+    case 'work':
+      return { glyph: '●', color: p.accent }
+    default:
+      return { glyph: '○', color: p.dim }
+  }
+}
+
+const sessionMark = (v: { p: Palette }, s: Session) =>
+  mark(v, s.phase === 'error' ? 'error' : needsYou(s) ? 'need' : isBusy(s) ? 'work' : 'quiet')
 
 /** The colour a session keeps everywhere: its legend dot, its band dot, its feed name. */
 export const sessionColor = (s: Session, p: Palette): string =>
@@ -119,47 +143,40 @@ export function Pane(E: Els, v: View, act: Acts) {
   const { Box, Text, Button } = E
   const { p } = v
   const count = tally(inbox(v.snap.sessions, v.threads, v.notebooks))
-  const waiting = count.need
   const unread = v.threads.filter(t => t.turns.some(u => u.unread)).length
-  const busy = v.snap.sessions.filter(isBusy).length
-  const agents = v.snap.sessions.reduce((n, s) => n + s.agents.length, 0)
   const crewBusy = v.threads.filter(t => t.status === 'running').length
+  const need = mark(v, 'need')
+  const work = mark(v, 'work')
+  const read = mark(v, 'read')
 
   return (
     <Box flexDirection="column">
-      {v.aurora ?? <Text>{Grad(E, '━'.repeat(Math.max(10, v.width)), p.accent, p.cyan)}</Text>}
       <Box flexDirection="row" justifyContent="space-between">
-        <Text>
-          <Text color={p.accent}>◆ </Text>
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
           {Grad(E, 'FLEET', p.accent, p.cyan, true)}
-        </Text>
-        <Text>
-          <Text color={p.accent}>◉ </Text>
-          <Text color={p.text}>{busy}</Text>
-          <Text color={p.dim}>/{v.snap.sessions.length} busy</Text>
-          {Sep(E, p)}
-          <Text color={p.violet}>◇ </Text>
-          <Text color={p.text}>{agents}</Text>
-          <Text color={p.dim}> agents</Text>
-          {Sep(E, p)}
-          <Text color={p.gold}>{usd(v.snap.cost.today)}</Text>
-        </Text>
-      </Box>
-      <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
-        {TABS.map(t => (
-          <Button key={`tab-${t.tab}`} plain hotkey={t.key} onPress={() => act.tab(t.tab)}>
-            {t.tab === v.tab ? (
-              <Text color={p.accent} weight="bold">
-                ◆ {t.label}
-              </Text>
-            ) : (
-              <Text color={p.dim}>◇ {t.label}</Text>
-            )}
-            {t.tab === 'live' && waiting > 0 ? <Text color={p.warn} weight="bold"> ▲{waiting}</Text> : ''}
-            {t.tab === 'crew' && crewBusy > 0 ? <Text color={p.accent}> ◉{crewBusy}</Text> : ''}
-            {t.tab === 'crew' && unread > 0 ? <Text color={p.cyan}> ◆{unread}</Text> : ''}
+          {TABS.map(t => (
+            <Button key={`tab-${t.tab}`} plain hotkey={t.key} onPress={() => act.tab(t.tab)}>
+              {t.tab === v.tab ? (
+                <Text color={p.text} weight="bold" underline>
+                  {t.label}
+                </Text>
+              ) : (
+                <Text color={p.dim}>{t.label}</Text>
+              )}
+              {t.tab === 'live' && count.need > 0 ? <Text color={need.color}> {need.glyph}{count.need}</Text> : ''}
+              {t.tab === 'crew' && crewBusy > 0 ? <Text color={work.color}> {work.glyph}{crewBusy}</Text> : ''}
+              {t.tab === 'crew' && unread > 0 ? <Text color={read.color}> {read.glyph}{unread}</Text> : ''}
+            </Button>
+          ))}
+        </Box>
+        <Box flexDirection="row" columnGap={2}>
+          <Button key="cycle-theme" plain hotkey="t" onPress={act.theme}>
+            <Text color={p.dim}>t theme</Text>
           </Button>
-        ))}
+          <Button key="cycle-scene" plain hotkey="a" onPress={act.scene}>
+            <Text color={p.dim}>a cat</Text>
+          </Button>
+        </Box>
       </Box>
       <Text color={p.border}>{'─'.repeat(Math.max(10, v.width))}</Text>
       {v.toured ? null : Tour(E, v, act)}
@@ -169,17 +186,6 @@ export function Pane(E: Els, v: View, act: Acts) {
       {v.tab === 'cost' && CostView(E, v)}
       {v.tab === 'system' && SystemView(E, v)}
       {v.tab === 'actions' && Actions(E, v, act)}
-      <Box flexDirection="row" columnGap={2} marginTop={1}>
-        <Button key="cycle-theme" plain hotkey="t" onPress={act.theme}>
-          <Text color={p.dim}>t </Text>
-          <Text color={p.accent}>● {p.name}</Text>
-        </Button>
-        <Button key="cycle-scene" plain hotkey="a" onPress={act.scene}>
-          <Text color={p.dim}>a </Text>
-          <Text color={p.cyan}>◎ {v.scene}</Text>
-        </Button>
-        <Text color={p.dim}>ctrl+x tab: focus the pane</Text>
-      </Box>
     </Box>
   )
 }
@@ -192,13 +198,14 @@ function Card(E: Els, v: View, s: Session, act: Acts) {
   const tool = s.tools[s.tools.length - 1]
   const isSel = s.sid === v.selected
   const w = Math.max(30, v.width - 4)
-  const border = needsYou(s) ? look.color : isSel ? p.accent : isBusy(s) ? p.violet : p.border
+  const m = sessionMark(v, s)
+  const border = needsYou(s) ? m.color : isBusy(s) ? p.accent : p.border
 
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={border} paddingX={1}>
       <Box flexDirection="row" justifyContent="space-between">
         <Button key={`s-${s.sid}`} plain onPress={() => act.select(s.sid)}>
-          <Text color={look.color}>{look.glyph} </Text>
+          <Text color={m.color}>{m.glyph} </Text>
           <Text color={p.text} weight="bold">
             {cut(s.name, Math.max(10, w - 24))}
           </Text>
@@ -245,7 +252,7 @@ function Card(E: Els, v: View, s: Session, act: Acts) {
       {s.agents.map((a, i) => (
         <Text wrap="truncate-end">
           <Text color={p.border}>{i === s.agents.length - 1 ? '└─' : '├─'}</Text>
-          <Text color={p.violet}>◇ {a.type}</Text>
+          <Text color={p.violet}>{a.type}</Text>
           <Text color={p.dim}>
             {' '}
             {ago(v.snap.now - a.since)}
@@ -271,19 +278,19 @@ export const ordered = (sessions: readonly Session[]): Session[] =>
 function Row(E: Els, v: View, s: Session, act: Acts) {
   const { Text, Button } = E
   const { p } = v
-  const look = phaseLook(s.phase, p)
+  const m = sessionMark(v, s)
   const quiet = !needsYou(s) && !isBusy(s)
-  const tail = `${s.agents.length ? ` ◇${s.agents.length}` : ''} ${ago(v.snap.now - s.phaseSince)}`
+  const tail = `${s.agents.length ? ` +${s.agents.length} agent${s.agents.length === 1 ? '' : 's'}` : ''} ${ago(v.snap.now - s.phaseSince)}`
   const room = Math.max(8, v.width - 16 - tail.length - 2)
 
   return (
     <Button key={`s-${s.sid}`} plain onPress={() => act.select(s.sid)}>
-      <Text color={look.color}>{look.glyph} </Text>
+      <Text color={m.color}>{m.glyph} </Text>
       <Text color={quiet ? p.dim : p.text}>{cut(s.name, 13).padEnd(14)}</Text>
       <Text color={s.phase === 'error' ? p.bad : needsYou(s) ? p.warn : quiet ? p.dim : p.cyan}>
         {cut(activity(s), room).padEnd(room)}
       </Text>
-      {s.agents.length ? <Text color={p.violet}> ◇{s.agents.length}</Text> : ''}
+      {s.agents.length ? <Text color={p.dim}> +{s.agents.length} agent{s.agents.length === 1 ? '' : 's'}</Text> : ''}
       <Text color={p.dim}> {ago(v.snap.now - s.phaseSince)}</Text>
     </Button>
   )
@@ -301,7 +308,7 @@ function Tour(E: Els, v: View, act: Acts) {
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={p.accent} paddingX={1} marginBottom={1}>
       <Text color={p.accent} weight="bold">
-        ◆ welcome to FLEET
+        welcome to FLEET
       </Text>
       {cards.map(([title, body]) => (
         <Text wrap="wrap">
@@ -310,7 +317,7 @@ function Tour(E: Els, v: View, act: Acts) {
         </Text>
       ))}
       <Button key="tour-done" plain onPress={act.finishTour}>
-        <Text color={p.ok}>◆ got it</Text>
+        <Text color={p.ok}>got it</Text>
         <Text color={p.dim}> · /fleet help shows the full guide any time</Text>
       </Button>
     </Box>
@@ -321,11 +328,21 @@ function Tour(E: Els, v: View, act: Acts) {
 function FleetStatus(E: Els, v: View, count: Record<Group, number>) {
   const { Text } = E
   const { p } = v
-  if (!count.need && !count.read && !count.work) return <Text color={p.dim}>○ all quiet · the cat is napping</Text>
   const parts: Node[] = []
-  if (count.need) parts.push(<Text color={p.warn} weight="bold">▲ {count.need} need{count.need === 1 ? 's' : ''} you</Text>)
-  if (count.read) parts.push(<Text color={p.cyan}>◆ {count.read} to read</Text>)
-  if (count.work) parts.push(<Text color={p.accent}>◉ {count.work} working</Text>)
+  const add = (state: Parameters<typeof mark>[1], text: string, bold = false) => {
+    const m = mark(v, state)
+    parts.push(
+      <Text color={m.color} weight={bold ? 'bold' : 'regular'}>
+        {m.glyph} {text}
+      </Text>,
+    )
+  }
+  if (count.need) add('need', `${count.need} need${count.need === 1 ? 's' : ''} you`, true)
+  if (count.read) add('read', `${count.read} to read`)
+  if (count.work) add('work', `${count.work} working`)
+  if (!count.need && !count.read && !count.work) add('quiet', 'all quiet · the cat is napping')
+  else if (count.quiet) add('quiet', `${count.quiet} quiet`)
+  parts.push(<Text color={p.gold}>{usd(v.snap.cost.today)} today</Text>)
   return (
     <Text wrap="truncate-end">
       {parts.flatMap((x, i) => (i ? [<Text color={p.dim}> · </Text>, x] : [x]))}
@@ -352,20 +369,21 @@ function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Ac
     )
   }
   if (x.kind === 'notes') {
-    return line(`inbox-${x.key}`, '◇', p.violet, 'notebook', `${x.count} helper suggestion${x.count === 1 ? '' : 's'} to approve · ${x.folder.replace(/^\/home\/[^/]+/, '~')}`, p.text, '', () =>
+    return line(`inbox-${x.key}`, mark(v, 'read').glyph, mark(v, 'read').color, 'notebook', `${x.count} helper suggestion${x.count === 1 ? '' : 's'} to approve · ${x.folder.replace(/^\/home\/[^/]+/, '~')}`, p.text, '', () =>
       act.openNotebook(x.folder),
     )
   }
   const who = `${x.t.agent}·${x.t.name}`
   if (x.kind === 'running') {
     const u = x.u
-    return line(`inbox-${x.key}`, '◉', p.violet, who, u?.log[u.log.length - 1] ?? 'working…', p.cyan, u ? ago(now - u.started) : '', () =>
+    return line(`inbox-${x.key}`, mark(v, 'work').glyph, mark(v, 'work').color, who, u?.log[u.log.length - 1] ?? 'working…', p.cyan, u ? ago(now - u.started) : '', () =>
       act.openThread(x.t.name),
     )
   }
   const failed = x.u.status === 'failed'
   const text = failed ? `failed: ${x.u.log[x.u.log.length - 1] ?? summaryOf(x.u.answer) ?? ''}` : summaryOf(x.u.answer) || 'answered'
-  return line(`inbox-${x.key}`, failed ? '×' : '◆', failed ? p.bad : p.cyan, who, text, failed ? p.bad : p.text, ago(now - (x.u.ended ?? now)), () =>
+  const m = mark(v, failed ? 'failed' : 'read')
+  return line(`inbox-${x.key}`, m.glyph, m.color, who, text, failed ? p.bad : p.text, ago(now - (x.u.ended ?? now)), () =>
     act.openThread(x.t.name),
   )
 }
@@ -381,7 +399,7 @@ function Live(E: Els, v: View, act: Acts) {
   const items = inbox(v.snap.sessions, v.threads, v.notebooks)
   const count = tally(items)
   // group headings only when there is more than one kind of thing to look at
-  const isGrouped = items.some(x => x.kind !== 'session') || count.need > 0
+  const isGrouped = new Set(items.map(x => x.group)).size > 1
   const rows: Node[] = []
   let last: Group | null = null
   for (const x of items) {
@@ -421,7 +439,7 @@ function Live(E: Els, v: View, act: Acts) {
           {v.hero ? <Box marginTop={1}>{v.hero}</Box> : null}
         </Box>
       )}
-      <Text color={p.dim}>press a session for its details, a crew row to open it · 6 for actions and the guide</Text>
+      <Text color={p.dim}>press a row to open it · ctrl+x tab focuses the pane · 6 for the guide</Text>
     </Box>
   )
 }
@@ -457,10 +475,10 @@ function bursts(items: readonly FeedItem[]): FeedItem[] {
 
 type Kind = { glyph: string; color: (p: Palette) => string; label: string }
 const KINDS: Record<string, Kind> = {
-  read: { glyph: '○', color: p => p.cyan, label: 'reads' },
+  read: { glyph: '·', color: p => p.cyan, label: 'reads' },
   write: { glyph: '■', color: p => p.gold, label: 'edits' },
   run: { glyph: '$', color: p => p.accent, label: 'commands' },
-  agent: { glyph: '◇', color: p => p.violet, label: 'agents' },
+  agent: { glyph: '+', color: p => p.violet, label: 'agents' },
   web: { glyph: '◎', color: p => p.ok, label: 'web' },
   ask: { glyph: '▲', color: p => p.warn, label: 'questions' },
   other: { glyph: '›', color: p => p.dim, label: 'other' },
@@ -530,12 +548,12 @@ function Feed(E: Els, v: View, act: Acts) {
     <Box flexDirection="column">
       <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
         <Button key="f-all" plain onPress={() => act.filter(null)}>
-          <Text color={v.feedFilter === null ? p.accent : p.dim}>{v.feedFilter === null ? '◆' : '◇'} all</Text>
+          <Text color={v.feedFilter === null ? p.text : p.dim} weight={v.feedFilter === null ? 'bold' : 'regular'} underline={v.feedFilter === null}>all</Text>
         </Button>
         {v.snap.sessions.map(s => (
           <Button key={`f-${s.sid}`} plain onPress={() => act.filter(s.sid)}>
-            <Text color={v.feedFilter === s.sid ? p.accent : p.dim}>
-              {v.feedFilter === s.sid ? '◆' : '◇'} {cut(s.name, 16)}
+            <Text color={v.feedFilter === s.sid ? p.text : p.dim} weight={v.feedFilter === s.sid ? 'bold' : 'regular'} underline={v.feedFilter === s.sid}>
+              {cut(s.name, 16)}
             </Text>
           </Button>
         ))}
@@ -590,12 +608,10 @@ function Feed(E: Els, v: View, act: Acts) {
 function turnLook(v: View, status: CrewTurn['status']) {
   const { p } = v
   return status === 'running'
-    ? { glyph: '◉', color: p.accent }
-    : status === 'done'
-      ? { glyph: '◆', color: p.ok }
-      : status === 'failed'
-        ? { glyph: '×', color: p.bad }
-        : { glyph: '■', color: p.dim }
+    ? mark(v, 'work')
+    : status === 'failed'
+      ? mark(v, 'failed')
+      : { glyph: '·', color: p.dim }
 }
 
 /** One thread as a row; the selected one opens into its whole conversation. */
@@ -604,7 +620,13 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
   const { p } = v
   const isOpen = t.name === v.crewSel
   const last = t.turns[t.turns.length - 1]
-  const look = turnLook(v, t.status === 'running' ? 'running' : t.status === 'failed' ? 'failed' : 'done')
+  const fresh = t.turns.some(u => u.unread)
+  const look =
+    t.status === 'running'
+      ? mark(v, 'work')
+      : fresh
+        ? mark(v, t.turns.some(u => u.unread && u.status === 'failed') ? 'failed' : 'read')
+        : mark(v, 'quiet')
   const tokens = last ? last.contextTokens + last.outputTokens : 0
   const w = Math.max(30, v.width - 4)
   const head = (
@@ -653,7 +675,7 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
       </Text>
       {t.brief ? (
         <Text color={p.dim} wrap="truncate-end">
-          ◇ carried-over brief: {cut(t.brief.replace(/\s+/g, ' '), w - 24)}
+          carried-over brief: {cut(t.brief.replace(/\s+/g, ' '), w - 24)}
         </Text>
       ) : null}
       {t.turns.length > 4 ? (
@@ -720,7 +742,7 @@ function ThreadView(E: Els, v: View, t: CrewThread, act: Acts) {
               ) : null}
               {u.answer ? (
                 <Button key={`copy-${t.name}-${u.n}`} plain onPress={() => act.copy(u.answer, `${t.name} answer`)}>
-                  <Text color={p.dim}>◇ copy</Text>
+                  <Text color={p.dim}>copy</Text>
                 </Button>
               ) : null}
               {u.contextTokens ? (
@@ -754,7 +776,7 @@ function Notebook(E: Els, v: View, act: Acts) {
       </Button>
       {isOpen && v.notebook.file ? (
         <Button key="notebook-obsidian" plain onPress={() => act.openNote(v.notebook.file)}>
-          <Text color={p.violet}>  ◇ open in Obsidian </Text>
+          <Text color={p.violet}>  open in Obsidian </Text>
           <Text color={p.dim}>{v.notebook.file.replace(/^\/home\/[^/]+/, '~')} · tick to approve, edit freely</Text>
         </Button>
       ) : null}
@@ -772,7 +794,7 @@ function Notebook(E: Els, v: View, act: Acts) {
             <Box flexDirection="row" columnGap={1}>
               {n.pending ? (
                 <Button key={`note-ok-${n.id}`} plain onPress={() => act.noteApprove(v.notebook.folder, n.id)}>
-                  <Text color={p.ok}>◆ keep</Text>
+                  <Text color={p.ok}>keep</Text>
                 </Button>
               ) : null}
               <Button key={`note-x-${n.id}`} plain onPress={() => act.noteRemove(v.notebook.folder, n.id)}>
@@ -795,6 +817,10 @@ function Crew(E: Els, v: View, act: Acts) {
   const { p } = v
   const list = [...v.threads].sort((a, b) => b.updated - a.updated)
   const target = v.threads.find(t => t.name === v.crewSel)
+  // what is new (running, unread, or open right now) shows; what you've seen folds away
+  const isFresh = (t: CrewThread) => t.status === 'running' || t.turns.some(u => u.unread) || t.name === v.crewSel
+  const fresh = list.filter(isFresh)
+  const earlier = list.filter(t => !isFresh(t))
 
   return (
     <Box flexDirection="column">
@@ -802,13 +828,13 @@ function Crew(E: Els, v: View, act: Acts) {
         {target ? (
           <Button key="crew-new" plain hotkey="n" onPress={act.crewNew}>
             <Text color={p.dim}>n </Text>
-            <Text color={p.accent}>◇ new thread instead</Text>
+            <Text color={p.accent}>new thread instead</Text>
           </Button>
         ) : (
           <Button key="crew-agent" plain hotkey="g" onPress={act.crewAgent}>
             <Text color={p.dim}>g </Text>
             <Text color={p.cyan} weight="bold">
-              ◆ {v.crewAgent}
+              {v.crewAgent}
             </Text>
           </Button>
         )}
@@ -822,7 +848,7 @@ function Crew(E: Els, v: View, act: Acts) {
         {target ? null : (
           <Button key="crew-mode" plain hotkey="m" onPress={act.crewMode}>
             <Text color={p.dim}>m </Text>
-            <Text color={v.crewMode === 'edit' ? p.warn : p.ok}>◇ {modeLabel(v.crewAgent, v.crewMode)}</Text>
+            <Text color={v.crewMode === 'edit' ? p.warn : p.ok}>{modeLabel(v.crewAgent, v.crewMode)}</Text>
           </Button>
         )}
       </Box>
@@ -837,12 +863,22 @@ function Crew(E: Els, v: View, act: Acts) {
         </Box>
       ) : (
         <Box flexDirection="column" marginTop={1}>
-          {(v.crewShowAll ? list : list.filter((t, i) => i < 8 || t.name === v.crewSel)).map(t => ThreadView(E, v, t, act))}
-          {list.length > 8 ? (
+          {fresh.length ? (
+            <Text color={p.text} weight="bold">
+              NEW
+            </Text>
+          ) : null}
+          {fresh.map(t => ThreadView(E, v, t, act))}
+          {earlier.length ? (
             <Button key="threads-all" plain onPress={act.showAllThreads}>
-              <Text color={p.cyan}>{v.crewShowAll ? '▾ show only the 8 newest threads' : `▸ show all ${list.length} threads`}</Text>
+              <Text color={p.dim}>{v.crewShowAll ? '▾ ' : '▸ '}</Text>
+              <Text color={p.dim} weight="bold">
+                EARLIER
+              </Text>
+              <Text color={p.dim}> · {earlier.length} thread{earlier.length === 1 ? '' : 's'} you've seen</Text>
             </Button>
           ) : null}
+          {v.crewShowAll ? earlier.map(t => ThreadView(E, v, t, act)) : null}
         </Box>
       )}
     </Box>
@@ -1043,7 +1079,7 @@ const GUIDE: { title: string; rows: [string, string][] }[] = [
     title: 'MEMORY',
     rows: [
       ['shared notebook', 'facts every helper message carries (about 1.5k tokens at most)'],
-      ['◆ approve', "a helper's suggested note stays pending until you or Claude approve it"],
+      ['keep', "a helper's suggested note stays pending until you or Claude approve it"],
       ['Obsidian vault', '~/Desktop/purrfleet-memory: notebook.md (tick to approve) and saved findings'],
     ],
   },
@@ -1083,7 +1119,7 @@ function Guide(E: Els, v: View, act: Acts) {
     <Box flexDirection="column" marginTop={1}>
       <Text>
         <Text color={p.accent} weight="bold">
-          ◆ HOW TO USE FLEET
+          HOW TO USE FLEET
         </Text>
         <Text color={p.dim}> · /fleet help opens this</Text>
       </Text>
@@ -1139,9 +1175,9 @@ function Actions(E: Els, v: View, act: Acts) {
             {s.cwd} · pid {s.pid}
           </Text>
           <Box flexDirection="row" flexWrap="wrap" columnGap={3} marginTop={1}>
-            {btn('a-id', 'c', '◇ copy id', p.cyan, () => act.copy(s.sid, 'session id'))}
-            {btn('a-dir', 'f', '◇ copy folder', p.cyan, () => act.copy(s.cwd, 'folder'))}
-            {btn('a-open', 'o', '◇ open transcript', p.violet, () => act.open(s.transcript))}
+            {btn('a-id', 'c', 'copy id', p.cyan, () => act.copy(s.sid, 'session id'))}
+            {btn('a-dir', 'f', 'copy folder', p.cyan, () => act.copy(s.cwd, 'folder'))}
+            {btn('a-open', 'o', 'open transcript', p.violet, () => act.open(s.transcript))}
             {s.sid === v.self ? null : btn('a-stop', 'x', '■ stop…', p.bad, () => act.stop(s))}
           </Box>
           <Text color={p.dim}>pick another session on the Live tab (1)</Text>
@@ -1162,7 +1198,6 @@ export function Band(E: Els, snap: Snapshot, p: Palette, info: BandInfo = { age:
 
   return (
     <Box flexDirection="row">
-      <Text color={p.accent}>◆ </Text>
       {Grad(E, 'FLEET', p.accent, p.cyan, true)}
       {need.length > 0 ? (
         // the reason to look at the band comes first, before it can be cut off
@@ -1177,10 +1212,10 @@ export function Band(E: Els, snap: Snapshot, p: Palette, info: BandInfo = { age:
         ))}
         <Text color={p.dim}> {snap.sessions.length} live</Text>
         {Sep(E, p)}
-        <Text color={p.accent}>◉ {busy}</Text>
+        <Text color={p.accent}>● {busy}</Text>
         <Text color={p.dim}> busy</Text>
         {Sep(E, p)}
-        <Text color={p.violet}>◇ {agents}</Text>
+        <Text color={p.violet}>+{agents}</Text>
         <Text color={p.dim}> agents</Text>
         {Sep(E, p)}
         <Text color={p.gold}>{usd(snap.cost.today)}</Text>
@@ -1188,7 +1223,7 @@ export function Band(E: Els, snap: Snapshot, p: Palette, info: BandInfo = { age:
         {info.crew.running ? (
           <Text>
             {Sep(E, p)}
-            <Text color={p.violet}>◇ crew {info.crew.running} running</Text>
+            <Text color={p.accent}>● crew {info.crew.running} running</Text>
           </Text>
         ) : null}
         {info.crew.failed ? (

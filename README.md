@@ -40,11 +40,13 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   you, crew turns that failed), TO READ (crew answers nobody has opened, notebook suggestions),
   WORKING (busy sessions, running crew threads), QUIET. Rows hold still inside a group. Press a
   session to expand it, a crew row to open it in Crew. A small cat beside them naps, works or
-  panics with the fleet. The band and `fleet_read` show the same list.
+  panics with the fleet. The band and `fleet_read` show the same list. Nothing starts expanded.
+- One mark per state, everywhere: ▲ needs you · × failed · ◆ to read · ● working · ○ quiet.
+  Buttons are plain words; the tab or filter you're on is bold and underlined.
 - Several windows: FLEET windows share their crew threads (merged, never overwritten) and send each
   desktop notification once for the whole machine.
 - **Feed**: every tool call across sessions, grouped, with a 10-minute summary.
-- **Crew**: named, ongoing threads with Codex (`codex exec` / `exec resume`) and Antigravity
+- **Crew**: NEW threads (running or unread) on top, the ones you have seen folded under EARLIER. Named, ongoing threads with Codex (`codex exec` / `exec resume`) and Antigravity
   (`agy -p` / `--conversation`), each with its own model, effort and mode. Claude talks to them
   through `crew_ask` / `crew_read`. Every message is wrapped in a brief that asks for a SUMMARY
   first, so Claude reads summaries and pulls full answers on demand. Threads compact themselves into

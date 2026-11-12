@@ -24,7 +24,7 @@ import {
   summaryOf,
   threadLine,
 } from './crew'
-import { auroraCells, toBase64 } from './scenes'
+import { toBase64 } from './scenes'
 import { PALETTES, paletteOf } from './theme'
 import type { Palette } from './theme'
 import { fleetReport } from './brief'
@@ -69,11 +69,10 @@ let self = ''
 let isPolling = false
 let alerted = new Set<string>()
 // What the frame loop paints: the Rasters the last drawing mounted, and its inputs.
-type Mounted = { kind: 'aurora' | 'cat'; cols: number; rows: number }
+type Mounted = { kind: 'cat'; cols: number; rows: number }
 let mounted = new Map<string, Mounted>()
 let palette: Palette = PALETTES[0]!
 let mood: Mood = 'sleep'
-let busyCount = 0
 let sessionCwd = ''
 // the Obsidian vault for long-term memory, and when FLEET last wrote each notebook note
 let vaultDir = ''
@@ -92,20 +91,11 @@ let runSeq = 0
 const now = (): number => Date.now() / 1000
 
 function frameOf(m: Mounted): string {
-  return toBase64(
-    m.kind === 'aurora'
-      ? auroraCells(now(), m.cols, palette, busyCount, Math.max(0, 1 - (Date.now() - dockedAt) / 2500))
-      : catCells(now(), m.cols, m.rows, mood, palette),
-  )
+  return toBase64(catCells(now(), m.cols, m.rows, mood, palette))
 }
 
 function remember(s: Snapshot): void {
   mood = s.sessions.some(needsYou) ? 'alarm' : s.sessions.some(isBusy) ? 'work' : 'sleep'
-  // the fleet docks when the last working session goes quiet: one gentle pulse
-  const isWorking = mood !== 'sleep'
-  if (wasWorking && !isWorking) dockedAt = Date.now()
-  wasWorking = isWorking
-  busyCount = s.sessions.filter(isBusy).length
 }
 
 async function poll($: EngineInterface): Promise<void> {
@@ -172,8 +162,6 @@ async function watchdog($: EngineInterface): Promise<void> {
 
 let isPainting = false
 let tick = 0
-let dockedAt = 0 // when the last work finished: the header pulses once
-let wasWorking = false
 
 async function paint($: EngineInterface): Promise<void> {
   if (isPainting) return // a slow frame is dropped, never stacked
@@ -187,7 +175,7 @@ async function paint($: EngineInterface): Promise<void> {
 
 async function paintOnce($: EngineInterface): Promise<void> {
   // a sleeping fleet barely moves: about 2 frames a second instead of 14
-  const isCalm = mood === 'sleep' && Date.now() - dockedAt > 3000
+  const isCalm = mood === 'sleep'
   if (isCalm && ++tick % 7 !== 0) return
   for (const [key, m] of [...mounted]) {
     const r = await $.ui.blit({ requestId: PANE, key, cells: frameOf(m) })
@@ -1251,9 +1239,6 @@ export const register: Register = on => {
         next.set(key, m)
         return <Raster key={key} columns={m.cols} rows={m.rows} cells={frameOf(m)} />
       }
-      const aurora = raster('aurora', { kind: 'aurora', cols: Math.max(10, width), rows: 1 })
-      // with the cat off, everything holds still: the ribbon is drawn once, not animated
-      if (sceneName === 'off') next.delete('aurora')
       // the cat sits beside the session legend; any stored value but 'off' means the cat
       // the Crew tab's pickers and input box: Input and Select, where the surface has them
       const { Input, Select } = E as Partial<Elements['terminal']>
@@ -1346,13 +1331,13 @@ export const register: Register = on => {
             {
               snap: s,
               tab: currentTab,
-              selected: sel === '' ? '' : sel && s.sessions.some(x => x.sid === sel) ? sel : (ordered(s.sessions)[0]?.sid ?? null),
+              // nothing starts expanded: you open the row you want
+              selected: sel && s.sessions.some(x => x.sid === sel) ? sel : null,
               feedFilter: await read($, feedFilter),
               width,
               self,
               p: palette,
               scene: sceneName === 'off' ? 'off' : 'cat',
-              aurora,
               hero,
               threads: cThreads,
               crewSel: target ? target.name : null,

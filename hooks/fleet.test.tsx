@@ -5,7 +5,7 @@ import { ago, bar, spark, usd } from './fmt'
 import { catCells } from './cat'
 import { argvFor, brief, lines, mergeThreads, needsCompaction, notebookDelta, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
 import type { CrewThread } from '../types'
-import { auroraCells, toBase64 } from './scenes'
+import { toBase64 } from './scenes'
 import { fleetReport } from './brief'
 import { inbox, tally } from './inbox'
 import { PALETTES } from './theme'
@@ -113,7 +113,11 @@ test('before the first scan the pane says it is scanning', async ($, on) => {
 
 test('with a snapshot the pane and band show sessions, agents and who needs you', async ($, on) => {
   on('state.get', (_, e, next) =>
-    e.key === 'snap' ? { value: { value: { shape: 'snap-2', value: SNAP }, version: 1 } } : next(e),
+    e.key === 'snap'
+      ? { value: { value: { shape: 'snap-2', value: SNAP }, version: 1 } }
+      : e.key === 'selected' // the card opens only for the row you pressed
+        ? { value: { value: 'sid-a', version: 1 } }
+        : next(e),
   )
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
@@ -436,7 +440,8 @@ test('the band shows crew counts and says when data is stale; old threads and tu
   expect(await band.find({ type: 'Text', text: /stale/ })).toBeDefined()
   await band.unmount()
   const crew = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await crew.find({ type: 'Text', text: /show all 10 threads/ })).toBeDefined()
+  expect(await crew.find({ type: 'Text', text: /^NEW$/ })).toBeDefined()
+  expect(await crew.find({ type: 'Text', text: /7 threads you've seen/ })).toBeDefined() // seen threads fold away
   expect(await crew.find({ type: 'Text', text: /show all 6 messages/ })).toBeDefined()
   expect(await crew.find({ type: 'Text', text: /data is \d+s old/ })).toBeDefined()
   await crew.unmount()
@@ -501,15 +506,6 @@ test('fleet_read: decisions first, finished crew work since the last briefing, t
   expect(text).toContain('(this session)')
   expect(fleetReport({ snap: { ...SNAP, now: now - 60 }, threads: [], since: 0, now, pendingNotes: 0, self: '' })).toContain('STALE')
   expect(fleetReport({ snap: null, threads: [], since: 0, now, pendingNotes: 0, self: '' })).toContain('no snapshot yet')
-})
-
-test('the docked pulse stays a valid colour', async () => {
-  for (const pulse of [0, 0.5, 1]) {
-    const cells = auroraCells(1, 40, PALETTES[0]!, 0, pulse)
-    for (let i = 0; i < cells.length; i += 3) {
-      expect(cells[i + 1]! <= 0xffffff && cells[i + 2]! <= 0xffffff).toBe(true)
-    }
-  }
 })
 
 test('the feed collapses bursts, the tour shows once, crew options stay folded until asked', async ($, on) => {
@@ -597,6 +593,7 @@ test('two windows: merging keeps both windows\' threads, the newer copy, my runn
 })
 
 test('Live shows crew answers to read and failures beside the sessions; fleet_read agrees', async ($, on) => {
+  // no row starts expanded, and each state has one mark
   const threads = [
     crewThread('review', { turns: [doneTurn(1, { unread: true, answer: 'SUMMARY: three findings' })] }),
     crewThread('broken', { status: 'failed', turns: [doneTurn(1, { status: 'failed', unread: true, log: ['sandbox denied'] })] }),
@@ -613,6 +610,10 @@ test('Live shows crew answers to read and failures beside the sessions; fleet_re
   expect(await live.find({ type: 'Text', text: /three findings/ })).toBeDefined()
   expect(await live.find({ type: 'Text', text: /failed: sandbox denied/ })).toBeDefined()
   expect(await live.find({ key: 'inbox-t:review' })).toBeDefined()
+  expect(await live.find({ key: 's-sid-a' })).toBeDefined()
+  expect(await live.find({ type: 'Text', text: /⌥ main/ })).toBeUndefined() // the card's details stay closed
+  expect(await live.find({ type: 'Text', text: /^× $/ })).toBeDefined()
+  expect(await live.find({ type: 'Text', text: /^◆ $/ })).toBeDefined()
   await live.unmount()
   const text = fleetReport({ snap: SNAP, threads, since: 0, now: NOW, pendingNotes: 0, self: '' })
   expect(text).toContain('TO READ (1')
