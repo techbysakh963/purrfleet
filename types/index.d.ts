@@ -79,6 +79,8 @@ export type CrewNote = {
   text: string
   by: 'claude' | 'codex' | 'agy' | 'you'
   at: number
+  /** a helper's offer: kept out of every brief until you or Claude approve it */
+  pending?: boolean
 }
 
 /** One message to a crew thread and the helper's answer to it. */

@@ -32,6 +32,7 @@ export type Acts = {
   crewFolder: (folder: string) => void
   crewOpen: (key: string) => void
   noteRemove: (folder: string, id: number) => void
+  noteApprove: (folder: string, id: number) => void
 }
 
 export type View = {
@@ -597,7 +598,8 @@ function Notebook(E: Els, v: View, act: Acts) {
       <Button key="notebook" plain onPress={() => act.crewOpen('notebook')}>
         <Text color={p.violet}>{isOpen ? '▾' : '▸'} shared notebook </Text>
         <Text color={p.dim}>
-          {notes.length} note{notes.length === 1 ? '' : 's'} · {v.notebook.folder.replace(/^\/home\/[^/]+/, '~')} · every helper gets it
+          {notes.length} note{notes.length === 1 ? '' : 's'}
+          {notes.some(n => n.pending) ? ` (${notes.filter(n => n.pending).length} pending)` : ''} · {v.notebook.folder.replace(/^\/home\/[^/]+/, '~')} · every helper gets it
         </Text>
       </Button>
       {isOpen && notes.length === 0 ? (
@@ -609,8 +611,14 @@ function Notebook(E: Els, v: View, act: Acts) {
               <Button key={`note-x-${n.id}`} plain onPress={() => act.noteRemove(v.notebook.folder, n.id)}>
                 <Text color={p.bad}>×</Text>
               </Button>
+              {n.pending ? (
+                <Button key={`note-ok-${n.id}`} plain onPress={() => act.noteApprove(v.notebook.folder, n.id)}>
+                  <Text color={p.ok}>◆ approve</Text>
+                </Button>
+              ) : null}
               <Text wrap="wrap">
                 <Text color={n.by === 'claude' ? p.violet : n.by === 'you' ? p.gold : p.cyan}>{n.by} </Text>
+                {n.pending ? <Text color={p.warn}>pending </Text> : ''}
                 <Text color={p.text}>{cut(n.text, w * 3)}</Text>
               </Text>
             </Box>
