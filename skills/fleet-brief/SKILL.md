@@ -7,7 +7,8 @@ description: Brief the user on their whole fleet of Claude Code sessions and Cod
 
 Give the user a short, decision-first picture of everything running on this machine, from FLEET.
 
-1. Call `mcp__fleet__fleet_read` (default arguments: it reports crew work finished since the last briefing and moves that marker on). If the user only wants a peek, pass `{"mark": false}`.
+1. Call `mcp__fleet__fleet_read` (default `detail: "brief"`: needs-you, new crew answers, what's working; it moves the "since last briefing" marker on). For a one-line check use `{"detail": "counts"}`; for only this project, `{"scope": "project"}`; to peek without moving the marker, `{"mark": false}`.
+   If TO READ lists crew answers that matter, read them all in one call with `mcp__fleet__crew_read {"new": true}`.
 2. If the data is marked STALE, say so first and don't present it as current.
 3. Answer in this order, skipping empty sections:
    - **Needs you**: each session waiting on the user, with the reason and how long it has waited. These are the decisions; put them first.

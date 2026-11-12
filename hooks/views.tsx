@@ -1,7 +1,7 @@
 import type { Elements } from 'claude-code'
 
 import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Delivery, Session, Snapshot, Tab } from '../types'
-import { NOTEBOOK_CAP, modeLabel, summaryOf } from './crew'
+import { NOTEBOOK_CAP, modeLabel, plain, sections, summaryOf } from './crew'
 import { deliveryLine } from './delivery'
 import { activity, ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, spark, tok, usd } from './fmt'
 import type { Group, Item } from './inbox'
@@ -268,8 +268,6 @@ export const age = (seconds: number): string => {
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86_400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86_400)}d`
 }
 
-/** Helper answers are markdown; on the grid, bold markers are noise. */
-const plain = (text: string): string => text.replace(/\*\*(.+?)\*\*/g, '$1').replace(/__(.+?)__/g, '$1')
 
 /** A labelled rail line: "session   opus · context 62% · …". */
 function Labeled(E: Els, v: View, label: string, value: Node | string, wrap = false) {
@@ -729,31 +727,6 @@ function Feed(E: Els, v: View, act: Acts) {
   )
 }
 
-
-/** An answer's own shape: its SUMMARY, KEY POINTS and CONFIDENCE sections, when it has them. */
-export function sections(answer: string): { summary: string; points: string[]; confidence: string } {
-  const out = { summary: '', points: [] as string[], confidence: '' }
-  let at: 'summary' | 'points' | 'confidence' | 'other' | null = null
-  for (const raw of answer.split('\n')) {
-    const line = raw.trim()
-    const head = line.match(/^\**(SUMMARY|KEY POINTS|CONFIDENCE|DETAILS|NOTES?)\**:\s*(.*)$/i)
-    if (head) {
-      const name = (head[1] ?? '').toUpperCase()
-      at = name === 'SUMMARY' ? 'summary' : name === 'KEY POINTS' ? 'points' : name === 'CONFIDENCE' ? 'confidence' : 'other'
-      const rest = head[2] ?? ''
-      if (rest && at === 'summary') out.summary = rest
-      if (rest && at === 'confidence') out.confidence = rest
-      if (rest && at === 'points') out.points.push(rest)
-      continue
-    }
-    if (!line) continue
-    if (at === 'summary') out.summary = `${out.summary} ${line}`.trim()
-    else if (at === 'points') out.points.push(line.replace(/^[-*•]\s*|^\d+[.)]\s*/, ''))
-    else if (at === 'confidence') out.confidence = `${out.confidence} ${line}`.trim()
-  }
-  if (!out.summary) out.summary = summaryOf(answer)
-  return out
-}
 
 const threadMark = (v: View, t: CrewThread): Mark =>
   t.status === 'running'

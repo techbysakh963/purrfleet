@@ -9,9 +9,14 @@ import {
   COMPACT_PROMPT,
   EFFORTS,
   argvFor,
+  NOTEBOOK_CAP,
   batchNotice,
   brief,
+  digest,
   editDecision,
+  grepAnswer,
+  receipt,
+  UNTRUSTED,
   capAnswer,
   lines,
   mergeThreads,
@@ -32,6 +37,8 @@ import type { Palette } from './theme'
 import { fleetReport } from './brief'
 import { inbox } from './inbox'
 import { deliveryLine, newCodexWorktrees, parseNumstat, parseWorktrees } from './delivery'
+import type { Depth, Part } from './crew'
+import { isUnread } from './inbox'
 import { findingMarkdown, findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf } from './vault'
 import { Band, Pane, ordered } from './views'
 import type { Acts } from './views'
@@ -487,6 +494,8 @@ type AskOpts = {
   context: string
   by: 'claude' | 'you'
   folder?: string
+  /** how long an answer to ask for */
+  depth?: Depth
 }
 
 /** Sends a message to a thread, opening it if it is new. Answers an error string, or the thread. */
@@ -579,7 +588,7 @@ async function claimAndSend($: EngineInterface, name: string, o: AskOpts): Promi
     }
     return next
   })
-  void runTurn($, name, turn.n, o.task, o.context, o.by)
+  void runTurn($, name, turn.n, o.task, o.context, o.by, o.depth)
   return thread
 }
 
@@ -590,6 +599,7 @@ async function runTurn(
   task: string,
   context: string,
   by: 'claude' | 'you',
+  depth: Depth = 'normal',
 ): Promise<void> {
   let t = await findThread($, name)
   if (!t) return
@@ -630,7 +640,7 @@ async function runTurn(
   // a Codex edit turn makes its own git worktree; which one is only visible from git
   const before = isCodexEdit ? await worktreesOf($, t.cwd) : []
   const start = isCodexEdit ? await repoAt($, t.cwd) : undefined
-  const res = await execTurn($, t, brief(t, by, task, context, seed, nb.text, nb.isDelta), n, false, isMine)
+  const res = await execTurn($, t, brief(t, by, task, context, seed, nb.text, nb.isDelta, depth), n, false, isMine)
   if (!isMine()) return
   if (isCodexEdit && start) {
     const delivery = await deliveryOf($, t.cwd, before, start).catch(() => undefined)
@@ -830,7 +840,7 @@ function singleNotice(list: readonly CrewThread[], name: string, n: number): str
   if (!t || !turn) return ''
   return turn.by === 'claude'
     ? `[FLEET crew] Thread "${name}" (${t.agent}) finished turn ${n} (${turn.status}). ` +
-        `Read it with crew_read {"thread": "${name}", "turn": ${n}} and check it before relying on it.`
+        `Read it with crew_read {"new": true} and check it before relying on it.`
     : `[FLEET crew] The user sent you turn ${n} of thread "${name}" (${t.agent}) to review. ` +
         `Read it with crew_read {"thread": "${name}", "turn": ${n}, "full": true}, then say what you'd keep.`
 }
@@ -849,11 +859,15 @@ type Args = Record<string, unknown>
 type Answer = { result: string } | { deny: string }
 const optStr = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v.trim() : undefined)
 
+let toldNotebook = false
+
 async function answerCrewAsk($: EngineInterface, e: Args): Promise<Answer> {
   const name = optStr(e.thread)
   const task = optStr(e.task)
   if (!name || !task) return { deny: 'crew_ask needs a thread name and a task.' }
+  const isBoth = e.agent === 'both'
   const agent = e.agent === 'agy' || e.agent === 'codex' ? e.agent : undefined
+  const depth: Depth = e.depth === 'brief' || e.depth === 'deep' ? e.depth : 'normal'
   const attached = await vaultNotes($, e.notes)
   if (typeof attached !== 'string') return attached
   let folder: string | undefined
@@ -863,8 +877,29 @@ async function answerCrewAsk($: EngineInterface, e: Args): Promise<Answer> {
     folder = res
   }
   const mode: CrewMode | undefined = e.mode === 'edit' ? 'edit' : e.mode === 'read' ? 'read' : undefined
-  const existing = await findThread($, slug(name))
-  if ((mode ?? existing?.mode) === 'edit' && existing?.mode !== 'edit') {
+  if (isBoth && mode === 'edit') return { deny: 'Edit mode takes one helper at a time; send to codex or agy.' }
+  // a model must be one the helper offers: the list lives here, not in every request's schema
+  const model = optStr(e.model)
+  if (model) {
+    if (isBoth) return { deny: 'Pick a model per helper: send to codex and agy separately, or leave model out.' }
+    const which = agent ?? (await findThread($, slug(name)))?.agent
+    const offered = which ? (await read($, crewModels))[which] : []
+    if (which && offered.length && !offered.includes(model)) {
+      return { deny: `Unknown model "${model}" for ${which}. It offers: ${offered.join(', ')}.` }
+    }
+  }
+  const context = [optStr(e.context) ?? '', attached].filter(Boolean).join('\n\n')
+  const angles = (e.tasks && typeof e.tasks === 'object' ? e.tasks : {}) as Record<string, unknown>
+  const targets: { thread: string; agent?: CrewAgent; task: string }[] = isBoth
+    ? (['codex', 'agy'] as const).map(a => ({
+        thread: `${slug(name)}-${a}`,
+        agent: a,
+        task: optStr(angles[a]) ? `${task}\n\nYour focus: ${optStr(angles[a])}` : task,
+      }))
+    : [{ thread: name, ...(agent ? { agent } : {}), task }]
+
+  const existing = isBoth ? undefined : await findThread($, slug(name))
+  if (!isBoth && (mode ?? existing?.mode) === 'edit' && existing?.mode !== 'edit') {
     // Claude never gets to let a helper change files on its own say-so
     const who = agent ?? existing?.agent ?? 'the helper'
     const where = existing?.cwd ?? folder ?? sessionCwd
@@ -882,29 +917,63 @@ async function answerCrewAsk($: EngineInterface, e: Args): Promise<Answer> {
       return { deny: `The user did not allow edits, so nothing was sent.${said}` }
     }
   }
-  const res = await sendToThread($, {
-    name,
-    task,
-    context: [optStr(e.context) ?? '', attached].filter(Boolean).join('\n\n'),
-    by: 'claude',
-    ...(folder ? { folder } : {}),
-    ...(agent ? { agent } : {}),
-    ...(optStr(e.model) ? { model: optStr(e.model) } : {}),
-    ...(optStr(e.effort) ? { effort: optStr(e.effort) } : {}),
-    ...(mode ? { mode } : {}),
-  })
-  if (typeof res === 'string') return { deny: res }
-  const turn = res.turns[res.turns.length - 1]
-  return {
-    result:
-      `Sent to thread "${res.name}" (${res.agent}${res.model !== 'default' ? ` ${res.model}` : ''}, ${modeLabel(res.agent, res.mode)}), ` +
-      `turn ${turn?.n ?? 1}. It answers in the background; you'll get a notice when it finishes, then crew_read gives its SUMMARY. ` +
-      `Meanwhile carry on with other work.`,
+  const sent: { name: string; n: number; agent: CrewAgent; mode: CrewMode }[] = []
+  const refused: string[] = []
+  for (const x of targets) {
+    const res = await sendToThread($, {
+      name: x.thread,
+      task: x.task,
+      context,
+      by: 'claude',
+      depth,
+      ...(folder ? { folder } : {}),
+      ...(x.agent ? { agent: x.agent } : {}),
+      ...(model ? { model } : {}),
+      ...(optStr(e.effort) ? { effort: optStr(e.effort) } : {}),
+      ...(mode ? { mode } : {}),
+    })
+    if (typeof res === 'string') refused.push(res)
+    else sent.push({ name: res.name, n: res.turns[res.turns.length - 1]?.n ?? 1, agent: res.agent, mode: res.mode })
   }
+  if (sent.length === 0) return { deny: refused.join(' ') }
+  // the first time, say the notebook travels with every message, so Claude needn't repeat it
+  let extra = refused.length ? ` · not sent: ${refused.join(' ')}` : ''
+  if (!toldNotebook) {
+    toldNotebook = true
+    const t0 = await findThread($, sent[0]!.name)
+    const facts = ((await read($, notebooks))[t0?.cwd ?? sessionCwd] ?? []).filter(n => !n.pending).length
+    if (facts) extra += `\nnotebook: ${facts} fact${facts === 1 ? '' : 's'} go with every message (crew_note lists them)`
+  }
+  return { result: receipt(sent, extra) }
 }
+
+/** The CHANGES line for a turn with a Codex delivery. */
+const deliveryNote = (d: Delivery | undefined): string =>
+  d
+    ? `\nCHANGES (${d.state}): ${deliveryLine(d)} in Codex's worktree ${d.path}${d.state === 'pending' ? '. Inspect them there (read-only); only the user accepts or discards them, in the Crew tab.' : '.'}`
+    : ''
 
 async function answerCrewRead($: EngineInterface, e: Args): Promise<Answer> {
   const list = await read($, threads)
+  const t0 = now()
+  // everything nobody has read yet, in one call
+  if (e.new === true) {
+    const due = list
+      .flatMap(t => t.turns.filter(isUnread).map(u => ({ t, u })))
+      .sort((a, b) => (a.u.ended ?? 0) - (b.u.ended ?? 0))
+    if (due.length === 0) {
+      const running = list.filter(t => t.status === 'running')
+      return {
+        result: `Nothing unread.${running.length ? ` ${running.length} running: ${running.map(t => `${t.name} (${t.agent}, ${Math.round(t0 - (t.turns[t.turns.length - 1]?.started ?? t0))}s)`).join(', ')}.` : ''}`,
+      }
+    }
+    const blocks: string[] = []
+    for (const { t, u } of due) {
+      blocks.push(digest(t, await fullTurn($, t.name, u), t0) + deliveryNote(u.delivery))
+      await markRead($, t.name, u.n)
+    }
+    return { result: [UNTRUSTED, '', blocks.join('\n\n')].join('\n') }
+  }
   const name = optStr(e.thread)
   if (!name) return { result: listing(list) }
   const t = list.find(x => x.name === slug(name))
@@ -912,15 +981,14 @@ async function answerCrewRead($: EngineInterface, e: Args): Promise<Answer> {
   const turn = typeof e.turn === 'number' ? t.turns.find(u => u.n === e.turn) : t.turns[t.turns.length - 1]
   if (!turn) return { result: threadLine(t) }
   void markRead($, t.name, turn.n)
-  const d = turn.delivery
-  const delivered = d
-    ? `\n\nCHANGES (${d.state}): ${deliveryLine(d)} in Codex's worktree ${d.path}${d.state === 'pending' ? '. Inspect them there (read-only); only the user accepts or discards them, in the Crew tab.' : '.'}`
-    : ''
-  if (delivered) return { result: report(t, e.full === true ? await fullTurn($, t.name, turn) : turn, e.full === true) + delivered }
-  return { result: report(t, e.full === true ? await fullTurn($, t.name, turn) : turn, e.full === true) }
+  const whole = await fullTurn($, t.name, turn)
+  if (optStr(e.grep)) {
+    return { result: [UNTRUSTED, `${t.name} · turn ${turn.n} · lines matching "${optStr(e.grep)}"`, grepAnswer(whole.answer, optStr(e.grep) ?? '')].join('\n') }
+  }
+  const part: Part = e.full === true ? 'full' : e.part === 'full' || e.part === 'summary' ? e.part : 'digest'
+  return { result: report(t, part === 'digest' ? whole : part === 'full' ? whole : turn, part, t0) + deliveryNote(turn.delivery) }
 }
 
-/** The models each helper offers: Codex's from its cache file, Antigravity's from `agy models`. */
 async function loadModels($: EngineInterface): Promise<void> {
   const home = (await $.env.get('HOME')) ?? ''
   const codex: string[] = []
@@ -950,22 +1018,35 @@ async function loadModels($: EngineInterface): Promise<void> {
 }
 
 async function registerCrewTools($: EngineInterface): Promise<void> {
-  const models = await read($, crewModels)
   await $.tool.register({
     name: 'crew_ask',
     description:
       'Send a message to a crew thread: an ongoing conversation with another coding agent on this machine, "codex" ' +
-      '(OpenAI Codex CLI) or "agy" (Google Antigravity CLI). Name threads by topic ("auth-review") and keep reusing them: ' +
-      'the helper remembers the whole thread, and FLEET compacts long threads into a state brief by itself. It returns at ' +
-      'once; the helper works in the background, and you get a notice when it is done (read it with crew_read). Helpers see only what you send ' +
-      'plus their thread, so make each task self-contained (goal, what you know, where to look, what you want back). ' +
-      'Read-only unless mode is "edit", which the user must approve. You are the lead: check what comes back.',
+      '(OpenAI Codex CLI) or "agy" (Google Antigravity CLI), or "both" for two threads <thread>-codex and <thread>-agy with ' +
+      'one task. Name threads by topic and reuse them: the helper remembers the thread. Returns at once with a one-line ' +
+      'receipt; you get one notice when it (or both) finish, then crew_read {"new": true}. Make each task self-contained ' +
+      '(goal, what you know, where to look, what you want back). Read-only unless mode is "edit", which the user must ' +
+      'approve. You are the lead: check what comes back.',
     inputSchema: {
       type: 'object',
       properties: {
         thread: { type: 'string', description: 'thread name by topic; an existing one continues, a new one opens' },
         task: { type: 'string', description: 'the message: a complete, self-contained instruction or follow-up' },
-        agent: { type: 'string', enum: ['codex', 'agy'], description: 'which helper; required to open a new thread' },
+        agent: {
+          type: 'string',
+          enum: ['codex', 'agy', 'both'],
+          description: 'which helper; required to open a new thread. both: <thread>-codex and <thread>-agy, same task',
+        },
+        tasks: {
+          type: 'object',
+          properties: { codex: { type: 'string' }, agy: { type: 'string' } },
+          description: 'with agent both: a different angle for each, added after the shared task',
+        },
+        depth: {
+          type: 'string',
+          enum: ['brief', 'normal', 'deep'],
+          description: 'answer length: brief = SUMMARY, KEY POINTS, CONFIDENCE only; normal (default) = DETAILS up to 400 words; deep = no cap',
+        },
         context: { type: 'string', description: 'optional facts, snippets or file paths the helper should start from' },
         folder: {
           type: 'string',
@@ -976,12 +1057,7 @@ async function registerCrewTools($: EngineInterface): Promise<void> {
           items: { type: 'string' },
           description: 'up to 4 notes from the purrfleet Obsidian vault (paths relative to it) to send with this message only',
         },
-        model: {
-          type: 'string',
-          description:
-            `optional model. codex: ${models.codex.slice(0, 10).join(', ') || 'its default'}. ` +
-            `agy: ${models.agy.slice(0, 10).join(', ') || 'its default'}.`,
-        },
+        model: { type: 'string', description: 'optional model id; an unknown one is refused with the list the helper offers' },
         effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: 'optional reasoning effort' },
         mode: { type: 'string', enum: ['read', 'edit'], description: 'read (default) or edit (asks the user first)' },
       },
@@ -1018,7 +1094,13 @@ async function registerCrewTools($: EngineInterface): Promise<void> {
     inputSchema: {
       type: 'object',
       properties: {
-        since_last: { type: 'boolean', description: 'report crew turns finished since the last briefing (default true)' },
+        detail: {
+          type: 'string',
+          enum: ['counts', 'brief', 'full'],
+          description: 'counts = one line; brief (default) = needs-you, new crew answers, running; full = adds idle sessions, folders, cost',
+        },
+        scope: { type: 'string', enum: ['project', 'all'], description: "project = this session's folder only; default all" },
+        since_last: { type: 'boolean', description: 'count crew turns finished since the last briefing (default true)' },
         mark: { type: 'boolean', description: 'move the last-briefing marker to now (default true)' },
       },
     },
@@ -1043,14 +1125,18 @@ async function registerCrewTools($: EngineInterface): Promise<void> {
   await $.tool.register({
     name: 'crew_read',
     description:
-      "Read a crew thread's latest answer: its SUMMARY by default (cheap), the whole answer with full: true. A turn number " +
-      'reads an earlier one. Without a thread, lists every thread with its status and last summary.',
+      'Read crew answers. Default: a digest (SUMMARY, KEY POINTS with path:line, CONFIDENCE) of the thread\'s latest turn. ' +
+      'new: true reads every answer nobody has read yet, all threads, in one call. part "full" gives the whole answer; grep ' +
+      'pulls only the lines that match from it. With no arguments, lists the threads.',
     inputSchema: {
       type: 'object',
       properties: {
         thread: { type: 'string' },
-        turn: { type: 'integer' },
-        full: { type: 'boolean' },
+        turn: { type: 'integer', description: 'an earlier turn; default the latest' },
+        new: { type: 'boolean', description: 'every unread finished turn, all threads; marks them read' },
+        part: { type: 'string', enum: ['digest', 'summary', 'full'], description: 'default digest' },
+        grep: { type: 'string', description: 'text to find in the full answer: matching lines with 2 around each, at most 40' },
+        full: { type: 'boolean', description: 'same as part "full"' },
       },
     },
     isDeferred: false,
@@ -1163,6 +1249,9 @@ async function answerFleetRead($: EngineInterface, e: Args): Promise<Answer> {
     pendingNotes: Object.values(all).reduce((n, list) => n + list.filter(x => x.pending).length, 0),
     notebooks: all,
     self,
+    detail: e.detail === 'counts' || e.detail === 'full' ? e.detail : 'brief',
+    scope: e.scope === 'project' ? 'project' : 'all',
+    cwd: sessionCwd,
   })
   // a briefing moves the "since" marker on, unless asked not to
   if (e.mark !== false) await $.store.set('briefAt', now())
@@ -1266,10 +1355,27 @@ async function answerCrewNote($: EngineInterface, e: Args): Promise<Answer> {
     if (typeof res !== 'string') return res
     folder = res
   }
-  if (optStr(e.add)) await addNotes($, folder, [optStr(e.add) ?? ''], 'claude')
-  if (typeof e.approve === 'number') await approveNote($, folder, e.approve)
-  if (typeof e.remove === 'number') await removeNote($, folder, e.remove)
+  const did: string[] = []
+  if (optStr(e.add)) {
+    await addNotes($, folder, [optStr(e.add) ?? ''], 'claude')
+    did.push('added')
+  }
+  if (typeof e.approve === 'number') {
+    await approveNote($, folder, e.approve)
+    did.push(`kept #${e.approve}`)
+  }
+  if (typeof e.remove === 'number') {
+    await removeNote($, folder, e.remove)
+    did.push(`removed #${e.remove}`)
+  }
   const notes = (await read($, notebooks))[folder] ?? []
+  if (did.length) {
+    // after a change, one line; the whole list only when asked for
+    const kept = notes.filter(n => !n.pending)
+    const used = kept.reduce((n, x) => n + x.text.length + 3, 0)
+    const pending = notes.length - kept.length
+    return { result: `${did.join(' · ')} · ${kept.length} fact${kept.length === 1 ? '' : 's'}, ${used.toLocaleString('en-US')} of ${NOTEBOOK_CAP.toLocaleString('en-US')} chars${pending ? ` · ${pending} pending` : ''}` }
+  }
   return {
     result:
       notes.length === 0
@@ -1462,8 +1568,8 @@ export const register: Register = on => {
       ),
     )
     await registerCrewTools($)
-    // refresh the model lists in the background, then describe them to Claude
-    void loadModels($).then(() => registerCrewTools($))
+    // the tool list is the same bytes every session: models are checked when used, not listed
+    void loadModels($)
     // the look you picked last time, kept across sessions
     const savedTheme = await $.store.get('theme')
     const savedScene = await $.store.get('scene')
