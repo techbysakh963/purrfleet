@@ -362,3 +362,47 @@ export const slug = (name: string): string =>
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 32) || 'thread'
+
+/**
+ * Two FLEET windows share one thread list in the store. Each keeps its own copy,
+ * so a plain save would let the last writer wipe the other's work. This merges
+ * the two: a thread this window is running stays as this window has it; any
+ * other thread takes the newer copy. A turn read in either window stays read.
+ * Past `cap` threads the oldest idle ones go, as when a thread is opened.
+ */
+export function mergeThreads(
+  mine: readonly CrewThread[],
+  stored: readonly CrewThread[],
+  owned: ReadonlySet<string>,
+  cap = 16,
+): CrewThread[] {
+  const theirs = new Map(stored.filter(t => t && typeof t.name === 'string').map(t => [t.name, t]))
+  const out: CrewThread[] = []
+  for (const t of mine) {
+    const other = theirs.get(t.name)
+    theirs.delete(t.name)
+    if (!other || owned.has(t.name)) {
+      out.push(other ? seenIn(t, other) : t)
+      continue
+    }
+    const [win, lose] = other.updated > t.updated ? [other, t] : [t, other]
+    out.push(seenIn(win, lose))
+  }
+  out.push(...theirs.values())
+  while (out.length > cap) {
+    let oldest = -1
+    out.forEach((t, i) => {
+      if (t.status !== 'running' && !owned.has(t.name) && (oldest < 0 || t.updated < out[oldest]!.updated)) oldest = i
+    })
+    if (oldest < 0) break
+    out.splice(oldest, 1)
+  }
+  return out
+}
+
+/** `t`, with every turn `other` has already marked read marked read too. */
+function seenIn(t: CrewThread, other: CrewThread): CrewThread {
+  const read = new Set(other.turns.filter(u => u.unread === false || (u.unread === undefined && u.status !== 'running')).map(u => `${u.n}:${u.started}`))
+  if (!t.turns.some(u => u.unread && read.has(`${u.n}:${u.started}`))) return t
+  return { ...t, turns: t.turns.map(u => (u.unread && read.has(`${u.n}:${u.started}`) ? { ...u, unread: false } : u)) }
+}

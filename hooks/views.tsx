@@ -3,6 +3,8 @@ import type { Elements } from 'claude-code'
 import type { CrewAgent, CrewMode, CrewNote, CrewThread, CrewTurn, Session, Snapshot, Tab } from '../types'
 import { modeLabel, summaryOf } from './crew'
 import { activity, ago, clock, ctxPct, cut, hms, isBusy, needsYou, phaseLook, spark, tok, usd } from './fmt'
+import type { Group, Item } from './inbox'
+import { inbox, tally } from './inbox'
 import type { Palette } from './theme'
 import { heat, ramp } from './theme'
 
@@ -37,6 +39,10 @@ export type Acts = {
   toggleOptions: () => void
   finishTour: () => void
   showAllTurns: (thread: string) => void
+  /** jump to a thread in the Crew tab (and mark its answers read) */
+  openThread: (thread: string) => void
+  /** jump to a project's notebook in the Crew tab */
+  openNotebook: (folder: string) => void
 }
 
 export type View = {
@@ -66,6 +72,8 @@ export type View = {
   toured: boolean
   crewAllTurns: string | null
   notebook: { folder: string; file: string; notes: readonly CrewNote[] }
+  /** every project's notebook: pending suggestions show up on Live */
+  notebooks: Readonly<Record<string, readonly CrewNote[]>>
 }
 
 const TABS: { tab: Tab; label: string; key: string }[] = [
@@ -110,7 +118,9 @@ const Sep = (E: Els, p: Palette) => <E.Text color={p.border}> │ </E.Text>
 export function Pane(E: Els, v: View, act: Acts) {
   const { Box, Text, Button } = E
   const { p } = v
-  const waiting = v.snap.sessions.filter(needsYou).length
+  const count = tally(inbox(v.snap.sessions, v.threads, v.notebooks))
+  const waiting = count.need
+  const unread = v.threads.filter(t => t.turns.some(u => u.unread)).length
   const busy = v.snap.sessions.filter(isBusy).length
   const agents = v.snap.sessions.reduce((n, s) => n + s.agents.length, 0)
   const crewBusy = v.threads.filter(t => t.status === 'running').length
@@ -147,6 +157,7 @@ export function Pane(E: Els, v: View, act: Acts) {
             )}
             {t.tab === 'live' && waiting > 0 ? <Text color={p.warn} weight="bold"> ▲{waiting}</Text> : ''}
             {t.tab === 'crew' && crewBusy > 0 ? <Text color={p.accent}> ◉{crewBusy}</Text> : ''}
+            {t.tab === 'crew' && unread > 0 ? <Text color={p.cyan}> ◆{unread}</Text> : ''}
           </Button>
         ))}
       </Box>
@@ -246,11 +257,14 @@ function Card(E: Els, v: View, s: Session, act: Acts) {
   )
 }
 
-/** Who to look at first: needs-you, then busy, then the rest; newest change first within each. */
+/**
+ * Who to look at first: needs-you, then busy, then the rest. Within each group the
+ * order holds still (oldest session first), so rows don't jump on every phase change.
+ */
 export const ordered = (sessions: readonly Session[]): Session[] =>
   [...sessions].sort((a, b) => {
     const rank = (s: Session) => (needsYou(s) ? 0 : isBusy(s) ? 1 : 2)
-    return rank(a) - rank(b) || b.phaseSince - a.phaseSince
+    return rank(a) - rank(b) || a.startedAt - b.startedAt || a.sid.localeCompare(b.sid)
   })
 
 /** One calm line per session; pressing it selects it (and expands it into its card). */
@@ -303,25 +317,56 @@ function Tour(E: Els, v: View, act: Acts) {
   )
 }
 
-/** What the whole fleet is up to, in one line. */
-function FleetStatus(E: Els, v: View) {
+/** What the whole fleet wants from you, in one line: the inbox's counts. */
+function FleetStatus(E: Els, v: View, count: Record<Group, number>) {
   const { Text } = E
   const { p } = v
-  const need = v.snap.sessions.filter(needsYou)
-  const busy = v.snap.sessions.filter(isBusy).length
-  if (need.length > 0) {
+  if (!count.need && !count.read && !count.work) return <Text color={p.dim}>○ all quiet · the cat is napping</Text>
+  const parts: Node[] = []
+  if (count.need) parts.push(<Text color={p.warn} weight="bold">▲ {count.need} need{count.need === 1 ? 's' : ''} you</Text>)
+  if (count.read) parts.push(<Text color={p.cyan}>◆ {count.read} to read</Text>)
+  if (count.work) parts.push(<Text color={p.accent}>◉ {count.work} working</Text>)
+  return (
+    <Text wrap="truncate-end">
+      {parts.flatMap((x, i) => (i ? [<Text color={p.dim}> · </Text>, x] : [x]))}
+    </Text>
+  )
+}
+
+const HEADS: Record<Group, string> = { need: 'NEEDS YOU', read: 'TO READ', work: 'WORKING', quiet: 'QUIET' }
+
+/** One line for a crew item in the inbox; pressing it opens it in the Crew tab. */
+function CrewRow(E: Els, v: View, x: Exclude<Item, { kind: 'session' }>, act: Acts) {
+  const { Text, Button } = E
+  const { p } = v
+  const now = v.snap.now
+  const line = (key: string, glyph: string, color: string, name: string, text: string, textColor: string, when: string, press: () => void) => {
+    const room = Math.max(8, v.width - 16 - when.length - 2)
     return (
-      <Text color={p.warn} weight="bold" wrap="truncate-end">
-        ▲ {need.map(s => s.name).join(', ')} {need.length === 1 ? 'needs' : 'need'} you
-      </Text>
+      <Button key={key} plain onPress={press}>
+        <Text color={color}>{glyph} </Text>
+        <Text color={p.text}>{cut(name, 13).padEnd(14)}</Text>
+        <Text color={textColor}>{cut(text.replace(/\s+/g, ' '), room).padEnd(room)}</Text>
+        <Text color={p.dim}> {when}</Text>
+      </Button>
     )
   }
-  return busy > 0 ? (
-    <Text color={p.accent}>
-      ◉ {busy} of {v.snap.sessions.length} working
-    </Text>
-  ) : (
-    <Text color={p.dim}>○ all quiet · the cat is napping</Text>
+  if (x.kind === 'notes') {
+    return line(`inbox-${x.key}`, '◇', p.violet, 'notebook', `${x.count} helper suggestion${x.count === 1 ? '' : 's'} to approve · ${x.folder.replace(/^\/home\/[^/]+/, '~')}`, p.text, '', () =>
+      act.openNotebook(x.folder),
+    )
+  }
+  const who = `${x.t.agent}·${x.t.name}`
+  if (x.kind === 'running') {
+    const u = x.u
+    return line(`inbox-${x.key}`, '◉', p.violet, who, u?.log[u.log.length - 1] ?? 'working…', p.cyan, u ? ago(now - u.started) : '', () =>
+      act.openThread(x.t.name),
+    )
+  }
+  const failed = x.u.status === 'failed'
+  const text = failed ? `failed: ${x.u.log[x.u.log.length - 1] ?? summaryOf(x.u.answer) ?? ''}` : summaryOf(x.u.answer) || 'answered'
+  return line(`inbox-${x.key}`, failed ? '×' : '◆', failed ? p.bad : p.cyan, who, text, failed ? p.bad : p.text, ago(now - (x.u.ended ?? now)), () =>
+    act.openThread(x.t.name),
   )
 }
 
@@ -333,13 +378,34 @@ function Live(E: Els, v: View, act: Acts) {
   // the rows come first; the cat sits beside them when there is room, else below
   const isBeside = v.hero !== null && v.width >= 90 // narrower, the rows need the room
   const rowsView = isBeside ? { ...v, width: v.width - CAT_COLS - 2 } : v
-  const rows = ordered(v.snap.sessions).map(s =>
-    s.sid === v.selected ? Card(E, rowsView, s, act) : Row(E, rowsView, s, act),
-  )
+  const items = inbox(v.snap.sessions, v.threads, v.notebooks)
+  const count = tally(items)
+  // group headings only when there is more than one kind of thing to look at
+  const isGrouped = items.some(x => x.kind !== 'session') || count.need > 0
+  const rows: Node[] = []
+  let last: Group | null = null
+  for (const x of items) {
+    if (isGrouped && x.group !== last) {
+      const color = x.group === 'need' ? p.warn : x.group === 'read' ? p.cyan : x.group === 'work' ? p.accent : p.dim
+      rows.push(
+        <Text color={color} weight="bold">
+          {HEADS[x.group]}
+        </Text>,
+      )
+      last = x.group
+    }
+    rows.push(
+      x.kind === 'session'
+        ? x.s.sid === v.selected
+          ? Card(E, rowsView, x.s, act)
+          : Row(E, rowsView, x.s, act)
+        : CrewRow(E, rowsView, x, act),
+    )
+  }
 
   return (
     <Box flexDirection="column">
-      {FleetStatus(E, v)}
+      {FleetStatus(E, v, count)}
       {isBeside ? (
         <Box flexDirection="row">
           <Box flexDirection="column" flexGrow={1} flexShrink={1}>
@@ -355,7 +421,7 @@ function Live(E: Els, v: View, act: Acts) {
           {v.hero ? <Box marginTop={1}>{v.hero}</Box> : null}
         </Box>
       )}
-      <Text color={p.dim}>press a row for its details · 6 for actions and the guide</Text>
+      <Text color={p.dim}>press a session for its details, a crew row to open it · 6 for actions and the guide</Text>
     </Box>
   )
 }
@@ -947,7 +1013,7 @@ const GUIDE: { title: string; rows: [string, string][] }[] = [
   {
     title: 'TABS',
     rows: [
-      ['1 Live', 'every Claude window; whoever needs you is on top; press a row for its card'],
+      ['1 Live', 'everything that wants you: NEEDS YOU · TO READ · WORKING · QUIET; press a row to open it'],
       ['2 Feed', 'every tool call across sessions, grouped, with a 10-minute tally'],
       ['3 Crew', 'conversations with Codex and Antigravity that Claude (or you) start'],
       ['4 Cost', "today's and this week's estimated spend, by model and session"],
@@ -1086,7 +1152,7 @@ function Actions(E: Els, v: View, act: Acts) {
   )
 }
 
-export type BandInfo = { age: number; isStale: boolean; crew: { running: number; failed: number } }
+export type BandInfo = { age: number; isStale: boolean; crew: { running: number; failed: number; toRead?: number } }
 
 export function Band(E: Els, snap: Snapshot, p: Palette, info: BandInfo = { age: 0, isStale: false, crew: { running: 0, failed: 0 } }) {
   const { Box, Text } = E
@@ -1129,6 +1195,12 @@ export function Band(E: Els, snap: Snapshot, p: Palette, info: BandInfo = { age:
           <Text>
             {Sep(E, p)}
             <Text color={p.bad}>× {info.crew.failed} failed</Text>
+          </Text>
+        ) : null}
+        {info.crew.toRead ? (
+          <Text>
+            {Sep(E, p)}
+            <Text color={p.cyan}>◆ {info.crew.toRead} to read</Text>
           </Text>
         ) : null}
         {info.isStale ? (

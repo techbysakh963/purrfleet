@@ -101,6 +101,8 @@ export type CrewTurn = {
   outputTokens: number
   /** a finished turn Claude has been told about */
   isHanded: boolean
+  /** finished and nobody has looked yet: shown under TO READ (or NEEDS YOU when failed) */
+  unread?: boolean
   /** the turn that wrote a state brief before the thread was compacted */
   isCompaction?: boolean
 }

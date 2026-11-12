@@ -36,8 +36,13 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   hand work to a helper).
 - `/fleet` opens or closes the pane. The band above the prompt is always on.
 - `ctrl+x tab` gives the pane the keyboard: `1`–`6` switch tabs, `t` cycles the theme, `a` toggles the cat.
-- **Live**: a one-line fleet status, then one calm row per session (needs-you on top; press one
-  to expand it) with a small cat beside them that naps, works or panics with the fleet.
+- **Live**: one attention list for the whole fleet, in groups: NEEDS YOU (sessions waiting on
+  you, crew turns that failed), TO READ (crew answers nobody has opened, notebook suggestions),
+  WORKING (busy sessions, running crew threads), QUIET. Rows hold still inside a group. Press a
+  session to expand it, a crew row to open it in Crew. A small cat beside them naps, works or
+  panics with the fleet. The band and `fleet_read` show the same list.
+- Several windows: FLEET windows share their crew threads (merged, never overwritten) and send each
+  desktop notification once for the whole machine.
 - **Feed**: every tool call across sessions, grouped, with a 10-minute summary.
 - **Crew**: named, ongoing threads with Codex (`codex exec` / `exec resume`) and Antigravity
   (`agy -p` / `--conversation`), each with its own model, effort and mode. Claude talks to them

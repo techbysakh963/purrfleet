@@ -3,10 +3,11 @@ import { expect, test } from 'claude-code/testing'
 import type { Snapshot } from '../types'
 import { ago, bar, spark, usd } from './fmt'
 import { catCells } from './cat'
-import { argvFor, brief, lines, needsCompaction, notebookDelta, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
+import { argvFor, brief, lines, mergeThreads, needsCompaction, notebookDelta, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
 import type { CrewThread } from '../types'
 import { auroraCells, toBase64 } from './scenes'
 import { fleetReport } from './brief'
+import { inbox, tally } from './inbox'
 import { PALETTES } from './theme'
 import { findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf, safeName } from './vault'
 
@@ -353,8 +354,8 @@ test('the guide in Actions shows every section, wrapped rather than cut, even na
       expect(await ui.find({ type: 'Text', text: new RegExp(title) })).toBeDefined()
     }
     // a long row arrives whole: wrapped by the surface, never cut short
-    const row = await ui.find({ type: 'Text', text: /every Claude window; whoever needs you is on top/ })
-    expect(row?.text).toBe('every Claude window; whoever needs you is on top; press a row for its card')
+    const row = await ui.find({ type: 'Text', text: /everything that wants you: NEEDS YOU/ })
+    expect(row?.text).toBe('everything that wants you: NEEDS YOU · TO READ · WORKING · QUIET; press a row to open it')
     await ui.unmount()
   }
 })
@@ -389,7 +390,8 @@ test('Live: the fleet status, then the rows; the cat beside them when wide, belo
     e.key === 'snap' ? { value: { value: { shape: 'snap-2', value: SNAP }, version: 1 } } : next(e),
   )
   const wide = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 100 } })
-  expect(await wide.find({ type: 'Text', text: /argus needs you/ })).toBeDefined()
+  expect(await wide.find({ type: 'Text', text: /1 needs you/ })).toBeDefined()
+  expect(await wide.find({ type: 'Text', text: /^NEEDS YOU$/ })).toBeDefined()
   expect(await wide.find({ key: 's-sid-a' })).toBeDefined()
   expect(await wide.find({ key: 'hero' })).toBeDefined()
   await wide.unmount()
@@ -417,7 +419,7 @@ test('the band shows crew counts and says when data is stale; old threads and tu
   const turn = (n: number) => ({ n, by: 'you' as const, ask: `q${n}`, status: 'done' as const, started: 0, answer: `SUMMARY: a${n}`, log: [], contextTokens: 1, outputTokens: 1, isHanded: true })
   const thread = (i: number, status: 'idle' | 'running' | 'failed' = 'idle') => ({
     name: `t${i}`, agent: 'codex' as const, model: 'default', effort: 'default', mode: 'read' as const, cwd: '/p', by: 'you' as const,
-    session: 's', status, turns: i === 0 ? [1, 2, 3, 4, 5, 6].map(turn) : [turn(1)], compactions: 0, brief: '', created: 0, updated: 10 - i,
+    session: 's', status, turns: i === 0 ? [1, 2, 3, 4, 5, 6].map(turn) : status === 'failed' ? [{ ...turn(1), status: 'failed' as const, unread: true }] : [turn(1)], compactions: 0, brief: '', created: 0, updated: 10 - i,
   })
   const list = [thread(0), thread(1, 'running'), thread(2, 'failed'), ...[3, 4, 5, 6, 7, 8, 9].map(i => thread(i))]
   let tab = 'crew'
@@ -537,4 +539,82 @@ test('the feed collapses bursts, the tour shows once, crew options stay folded u
   const open = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await open.find({ key: 'crew-model' })).toBeDefined()
   await open.unmount()
+})
+
+const crewThread = (name: string, over: Partial<CrewThread> = {}): CrewThread => ({
+  name, agent: 'codex', model: 'default', effort: 'default', mode: 'read', cwd: '/p', by: 'you',
+  session: 's', status: 'idle', compactions: 0, brief: '', created: 0, updated: 10, turns: [], ...over,
+})
+const doneTurn = (n: number, over: Partial<CrewThread['turns'][number]> = {}) => ({
+  n, by: 'you' as const, ask: 'q', status: 'done' as const, started: n, ended: NOW - 60, answer: `SUMMARY: answer ${n}`,
+  log: [], contextTokens: 1, outputTokens: 1, isHanded: false, ...over,
+})
+
+test('the inbox: needs-you first (failed crew too), then to read, working, quiet; stable inside a group', async () => {
+  const threads = [
+    crewThread('review', { turns: [doneTurn(1, { unread: true })] }),
+    crewThread('broken', { status: 'failed', turns: [doneTurn(1, { status: 'failed', unread: true })] }),
+    crewThread('seen', { turns: [doneTurn(1, { unread: false })] }),
+    crewThread('legacy', { turns: [doneTurn(1)] }),
+    crewThread('busy', { status: 'running', turns: [doneTurn(1, { status: 'running' })] }),
+  ]
+  const items = inbox(SNAP.sessions, threads, { '/p': [{ id: 1, text: 'x', by: 'codex', at: 0, pending: true }] })
+  const keys = items.map(x => `${x.group}:${x.key}`)
+  expect(keys.indexOf('need:t:broken')).toBeGreaterThan(-1)
+  expect(keys.indexOf('read:t:review')).toBeGreaterThan(keys.indexOf('need:t:broken'))
+  expect(keys).toContain('read:n:/p')
+  expect(keys).toContain('work:r:busy')
+  expect(keys.some(k => k.includes('seen') || k.includes('legacy'))).toBe(false)
+  const groups = items.map(x => x.group)
+  expect([...groups].sort((a, b) => ['need', 'read', 'work', 'quiet'].indexOf(a) - ['need', 'read', 'work', 'quiet'].indexOf(b))).toEqual(groups)
+  expect(tally(items).read).toBe(2)
+  // a phase change doesn't reorder sessions within their group
+  const a = inbox(SNAP.sessions, [], {}).map(x => x.key)
+  const b = inbox(SNAP.sessions.map(x => ({ ...x, phaseSince: x.phaseSince + 1000 })), [], {}).map(x => x.key)
+  expect(b).toEqual(a)
+})
+
+test('two windows: merging keeps both windows\' threads, the newer copy, my running one, and reads anywhere', async () => {
+  const mine = [
+    crewThread('a', { updated: 5, turns: [doneTurn(1, { unread: true })] }),
+    crewThread('run', { status: 'running', updated: 1 }),
+  ]
+  const stored = [
+    crewThread('a', { updated: 4, turns: [doneTurn(1, { unread: false })] }), // older, but read there
+    crewThread('run', { status: 'idle', updated: 9 }), // newer, but this window owns it
+    crewThread('b', { updated: 3 }), // opened in the other window
+  ]
+  const out = mergeThreads(mine, stored, new Set(['run']))
+  expect(out.map(t => t.name).sort()).toEqual(['a', 'b', 'run'])
+  expect(out.find(t => t.name === 'a')?.turns[0]?.unread).toBe(false)
+  expect(out.find(t => t.name === 'run')?.status).toBe('running')
+  expect(mergeThreads([crewThread('a', { updated: 1 })], [crewThread('a', { updated: 2, model: 'm2' })], new Set())[0]?.model).toBe('m2')
+  // the cap still holds, never dropping a running thread
+  const many = Array.from({ length: 20 }, (_, i) => crewThread(`t${i}`, { updated: i, status: i === 0 ? 'running' : 'idle' }))
+  const capped = mergeThreads(many, [], new Set())
+  expect(capped.length).toBe(16)
+  expect(capped.some(t => t.name === 't0')).toBe(true)
+})
+
+test('Live shows crew answers to read and failures beside the sessions; fleet_read agrees', async ($, on) => {
+  const threads = [
+    crewThread('review', { turns: [doneTurn(1, { unread: true, answer: 'SUMMARY: three findings' })] }),
+    crewThread('broken', { status: 'failed', turns: [doneTurn(1, { status: 'failed', unread: true, log: ['sandbox denied'] })] }),
+  ]
+  on('state.get', (_, e, next) => {
+    if (e.key === 'snap') return { value: { value: { shape: 'snap-2', value: SNAP }, version: 1 } }
+    if (e.key === 'tab') return { value: { value: 'live', version: 1 } }
+    if (e.key === 'toured') return { value: { value: true, version: 1 } }
+    if (e.key === 'threads') return { value: { value: { shape: 'threads-1', value: threads }, version: 1 } }
+    return next(e)
+  })
+  const live = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await live.find({ type: 'Text', text: /^TO READ$/ })).toBeDefined()
+  expect(await live.find({ type: 'Text', text: /three findings/ })).toBeDefined()
+  expect(await live.find({ type: 'Text', text: /failed: sandbox denied/ })).toBeDefined()
+  expect(await live.find({ key: 'inbox-t:review' })).toBeDefined()
+  await live.unmount()
+  const text = fleetReport({ snap: SNAP, threads, since: 0, now: NOW, pendingNotes: 0, self: '' })
+  expect(text).toContain('TO READ (1')
+  expect(text).toContain('broken · codex · turn 1 FAILED')
 })

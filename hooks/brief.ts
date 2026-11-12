@@ -2,9 +2,10 @@
 // shaped for a briefing. Decisions first, then what finished since the last
 // briefing, then what is still running. Pure: snapshot and threads in, text out.
 
-import type { CrewThread, Snapshot } from '../types'
+import type { CrewNote, CrewThread, Snapshot } from '../types'
 import { UNTRUSTED, summaryOf } from './crew'
 import { activity, ago, isBusy, needsYou, usd } from './fmt'
+import { inbox } from './inbox'
 
 export type BriefInput = {
   snap: Snapshot | null
@@ -13,6 +14,8 @@ export type BriefInput = {
   since: number
   now: number
   pendingNotes: number
+  /** every project's notebook, for the inbox (optional: older callers pass only the count) */
+  notebooks?: Readonly<Record<string, readonly CrewNote[]>>
   self: string
 }
 
@@ -33,13 +36,27 @@ export function fleetReport(b: BriefInput): string {
       (b.since ? ` · "new" means since the last briefing ${ago(b.now - b.since)} ago` : ''),
   )
 
+  // the same inbox the pane's Live tab shows
+  const items = inbox(s.sessions, b.threads, b.notebooks ?? {})
   const need = s.sessions.filter(needsYou)
-  out.push('', `NEEDS YOU (${need.length})`)
-  if (need.length === 0) out.push('- nothing is waiting on the user')
+  const failedUnread = items.flatMap(x => (x.kind === 'turn' && x.group === 'need' ? [x] : []))
+  out.push('', `NEEDS YOU (${need.length + failedUnread.length})`)
+  if (need.length + failedUnread.length === 0) out.push('- nothing is waiting on the user')
   for (const x of need) {
     out.push(
       `- ${clean(x.name, 60)}${x.sid === b.self ? ' (this session)' : ''}: ${clean(activity(x))} · ${ago(b.now - x.phaseSince)} · ${clean(x.cwd, 120)}`,
     )
+  }
+  for (const { t, u } of failedUnread) {
+    out.push(`- crew ${clean(t.name, 40)} · ${t.agent} · turn ${u.n} FAILED ${ago(b.now - (u.ended ?? b.now))} ago: ${clean(u.log[u.log.length - 1] ?? '') || '(no log)'}`)
+  }
+
+  const toRead = items.flatMap(x => (x.kind === 'turn' && x.group === 'read' ? [x] : []))
+  if (toRead.length) {
+    out.push('', `TO READ (${toRead.length} crew answer${toRead.length === 1 ? '' : 's'} nobody has opened)`)
+    for (const { t, u } of toRead) {
+      out.push(`- ${clean(t.name, 40)} · ${t.agent} · turn ${u.n}: ${clean(summaryOf(u.answer), 220) || '(no answer)'}`)
+    }
   }
 
   const finished = b.threads
@@ -70,8 +87,6 @@ export function fleetReport(b: BriefInput): string {
 
   const idle = s.sessions.filter(x => !isBusy(x) && !needsYou(x))
   if (idle.length) out.push('', `IDLE: ${idle.map(x => clean(x.name, 60)).join(', ')}`)
-  const failed = b.threads.filter(t => t.status === 'failed')
-  if (failed.length) out.push(`CREW FAILED: ${failed.map(t => clean(t.name, 40)).join(', ')}`)
 
   out.push(
     '',
