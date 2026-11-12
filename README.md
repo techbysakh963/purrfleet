@@ -72,7 +72,7 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   (`agy -p` / `--conversation`), each with its own model, effort and mode. Claude talks to them
   through `crew_ask` / `crew_read`. Every message is wrapped in a brief that asks for a SUMMARY
   first, so Claude reads summaries and pulls full answers on demand. Threads compact themselves into
-  a state brief after 10 turns, or after one turn that processed over 600k tokens, and continue fresh. Read-only by default;
+  a state brief after 10 turns, or after three or more turns once one processed over 600k tokens, and continue fresh. FLEET builds that brief itself from the stored SUMMARY and KEY POINTS when it can, so it costs no extra helper turn (a Codex edit turn used to pay one). Read-only by default;
   edits need your approval (Codex edits in its own git worktree).
 - **Claude's tools, built to be cheap.** `crew_ask` takes `agent: "both"` (two threads, one task,
   an angle each through `tasks`) and `depth` (brief · normal · deep) and answers with a one-line
@@ -81,6 +81,10 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   `fleet_read` has `detail` (counts · brief · full) and `scope: "project"`, and lists each crew
   turn once. `crew_note` answers a change in one line. The tool list no longer embeds model
   names, so it is the same every session; an unknown model is refused with the real list.
+  `vault_search` finds past findings in the vault (every word, with line numbers); `crew_stop` stops a
+  helper Claude started by mistake. `crew_note`, `crew_save`, `vault_search` and `crew_stop` are
+  deferred tools, loaded on demand, so they cost nothing in requests that don't use them. A new
+  `fleet-delegate` skill says when a helper pays for itself.
 - Codex changes: after a Codex edit turn, the thread shows a card with the files it changed
   (+/− per file), **view diff**, **accept into your tree** (asks first; applies with `git apply`,
   never commits) and **discard** (deletes Codex's worktree). Until you decide, it stays on Live.

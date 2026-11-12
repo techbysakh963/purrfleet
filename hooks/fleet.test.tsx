@@ -3,7 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Snapshot } from '../types'
 import { ago, bar, spark, usd } from './fmt'
 import { catCells } from './cat'
-import { argvFor, batchNotice, brief, digest, editDecision, grepAnswer, receipt, sections, lines, mergeThreads, needsCompaction, notebookDelta, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
+import { argvFor, batchNotice, brief, digest, editDecision, grepAnswer, localBrief, receipt, sections, lines, mergeThreads, needsCompaction, notebookDelta, notebookText, notesIn, parseLine, report, slug, summaryOf } from './crew'
 import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { fleetReport } from './brief'
@@ -11,7 +11,7 @@ import { inbox, moodOf, segments, tally } from './inbox'
 import { deliveryLine, newCodexWorktrees, parseNumstat, parseWorktrees } from './delivery'
 import { age, fitWho } from './views'
 import { PALETTES, contrast } from './theme'
-import { findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf, safeName } from './vault'
+import { findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectOf, safeName, searchNotes } from './vault'
 
 const NOW = 1_794_434_000
 
@@ -265,7 +265,7 @@ test('the shared notebook: helpers offer NOTE lines, every brief carries it, cap
   expect(brief(t, 'you', 'go', '')).toContain('NOTE:')
 })
 
-test('threads compact after many turns or one very heavy one, not on an ordinary review', async () => {
+test('threads compact after many turns, or heavy use over a few turns, not on an ordinary review', async () => {
   const turn = (n: number, ctx: number) => ({
     n, by: 'you' as const, ask: 'q', status: 'done' as const, started: 0, answer: 'a', log: [], contextTokens: ctx, outputTokens: 1, isHanded: false,
   })
@@ -274,7 +274,8 @@ test('threads compact after many turns or one very heavy one, not on an ordinary
     session: 's', status: 'idle', compactions: 0, brief: '', created: 0, updated: 0, turns: [],
   }
   expect(needsCompaction({ ...base, turns: [turn(1, 23_000), turn(2, 306_000)] })).toBe(false)
-  expect(needsCompaction({ ...base, turns: [turn(1, 700_000)] })).toBe(true)
+  expect(needsCompaction({ ...base, turns: [turn(1, 700_000)] })).toBe(false) // one heavy turn alone is not enough
+  expect(needsCompaction({ ...base, turns: [turn(1, 1000), turn(2, 1000), turn(3, 700_000)] })).toBe(true)
   expect(needsCompaction({ ...base, turns: Array.from({ length: 10 }, (_, i) => turn(i + 1, 1000)) })).toBe(true)
 })
 
@@ -868,4 +869,34 @@ test('no two drawn buttons share a hotkey, on any tab, with a row open', async (
     expect(`${name}: ${dupes.join(',')}`).toBe(`${name}: `)
     await ui.unmount()
   }
+})
+
+test('helpers spend less: a local state brief, a stricter compaction rule, cleaner notebook intake', async () => {
+  const shaped = (n: number) => doneTurn(n, { ask: `question ${n}`, answer: `SUMMARY: answer ${n}.\nKEY POINTS:\n- a.ts:${n}\nCONFIDENCE: high` })
+  const t = crewThread('t', { session: 's', turns: [shaped(1), shaped(2)] })
+  const b = localBrief(t)
+  expect(b).toContain('answer 1.')
+  expect(b).toContain('answer 2.')
+  expect(b).toContain('a.ts:2')
+  expect(localBrief(crewThread('u', { turns: [doneTurn(1, { answer: 'no shape' })] }))).toBe('')
+  // one heavy turn alone no longer compacts the thread
+  const heavy = crewThread('h', { session: 's', turns: [doneTurn(1, { contextTokens: 700_000 })] })
+  expect(needsCompaction(heavy)).toBe(false)
+  expect(needsCompaction({ ...heavy, turns: [doneTurn(1), doneTurn(2), doneTurn(3, { contextTokens: 700_000 })] })).toBe(true)
+  expect(notesIn('NOTE: - tests run with claude plugin test .')).toEqual(['tests run with claude plugin test .'])
+  expect(notesIn('NOTE: FLEET enforces strict SUMMARY:/KEY POINTS: answer formats')).toEqual([])
+})
+
+test('vault_search finds notes by all their words, with line numbers, never notebook.md', async () => {
+  const files = [
+    { path: 'p/2026-11-12 agy review.md', text: '---\nfleet: finding\nagent: agy\n---\n# review\nthe headline wraps under 84 columns\nother' },
+    { path: 'p/2026-11-13 study.md', text: '---\nfleet: finding\n---\nOne headline for the band.\nIt never wraps.' },
+    { path: 'p/notebook.md', text: 'the headline wraps here too' },
+    { path: 'p/other.md', text: 'nothing relevant' },
+  ]
+  const hits = searchNotes(files, 'headline wraps')
+  expect(hits.map(h => h.path)).toEqual(['p/2026-11-12 agy review.md', 'p/2026-11-13 study.md'])
+  expect(hits[0]!.agent).toBe('agy')
+  expect(hits[0]!.lines[0]).toEqual({ n: 6, text: 'the headline wraps under 84 columns' })
+  expect(searchNotes(files, '   ')).toEqual([])
 })

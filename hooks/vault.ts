@@ -118,3 +118,35 @@ export const findingPath = (vault: string, cwd: string, title: string, now: numb
 
 /** Is `path` (already resolved) inside the vault? */
 export const isInside = (vault: string, path: string): boolean => path === vault || path.startsWith(`${vault}/`)
+
+export type VaultHit = { path: string; fleet: string; agent: string; lines: { n: number; text: string }[] }
+
+/**
+ * Notes where every word of `query` appears (any case), with up to two matching
+ * lines each. notebook.md is skipped: it already travels with every helper message.
+ */
+export function searchNotes(files: readonly { path: string; text: string }[], query: string, limit = 5): VaultHit[] {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean)
+  if (words.length === 0) return []
+  const hits: (VaultHit & { best: number })[] = []
+  for (const f of files) {
+    if (/(^|\/)notebook\.md$/.test(f.path)) continue
+    const low = f.text.toLowerCase()
+    if (!words.every(w => low.includes(w))) continue
+    const fm = f.text.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? ''
+    const lines = f.text
+      .split('\n')
+      .map((text, i) => ({ n: i + 1, text }))
+      .filter(l => words.some(w => l.text.toLowerCase().includes(w)) && !/^---$|^[a-z]+:/.test(l.text))
+      .sort((a, b) => words.filter(w => b.text.toLowerCase().includes(w)).length - words.filter(w => a.text.toLowerCase().includes(w)).length)
+      .slice(0, 2)
+      .map(l => ({ n: l.n, text: l.text.trim().slice(0, 160) }))
+    const best = Math.max(0, ...lines.map(l => words.filter(w => l.text.toLowerCase().includes(w)).length))
+    hits.push({ path: f.path, fleet: fm.match(/^fleet:\s*(\S+)/m)?.[1] ?? '', agent: fm.match(/^agent:\s*(\S+)/m)?.[1] ?? '', lines, best })
+  }
+  // a line with every word first, then more matching lines, then the newest (notes are named by date)
+  return hits
+    .sort((a, b) => b.best - a.best || b.lines.length - a.lines.length || b.path.localeCompare(a.path))
+    .slice(0, Math.max(1, Math.min(10, limit)))
+    .map(({ best: _best, ...h }) => h)
+}

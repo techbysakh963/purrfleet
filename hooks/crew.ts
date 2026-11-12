@@ -23,7 +23,29 @@ export const COMPACT_AT_PROCESSED = 600_000
 export function needsCompaction(t: CrewThread): boolean {
   const since = t.turns.filter(u => u.status === 'done' && !u.isCompaction && u.n > (t.compactedAt ?? 0)).length
   const last = [...t.turns].reverse().find(u => u.status === 'done')
-  return since >= COMPACT_AFTER_TURNS || (last?.contextTokens ?? 0) > COMPACT_AT_PROCESSED
+  // "processed" sums every request in a turn, so one tool-heavy turn can pass 600k while the
+  // conversation itself is small: that path also needs a few turns since the last compaction
+  return since >= COMPACT_AFTER_TURNS || ((last?.contextTokens ?? 0) > COMPACT_AT_PROCESSED && since >= 3)
+}
+
+/**
+ * A state brief FLEET builds from the thread's own stored turns: each turn's ask,
+ * SUMMARY and KEY POINTS. It costs no helper tokens, where asking the helper to
+ * write one costs a whole extra turn. Empty when no earlier answer has the shape.
+ */
+export function localBrief(t: CrewThread, max = 4000): string {
+  const turns = t.turns.filter(u => u.status === 'done' && !u.isCompaction && /SUMMARY:/i.test(u.answer))
+  if (turns.length === 0) return ''
+  const lines = ['State brief (built by FLEET from this thread\'s earlier turns):']
+  if (t.brief) lines.push(`Before that: ${t.brief.replace(/\s+/g, ' ').slice(0, 800)}`)
+  for (const u of turns.slice(-6)) {
+    const sec = sections(u.answer)
+    lines.push(`Turn ${u.n} · asked: ${u.ask.replace(/\s+/g, ' ').slice(0, 300)}`)
+    lines.push(`  found: ${sec.summary.slice(0, 400)}`)
+    for (const pt of sec.points.slice(0, 6)) lines.push(`  - ${pt.slice(0, 240)}`)
+  }
+  const text = lines.join('\n')
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }
 
 // ── the shared notebook ──────────────────────────────────────────────────────
@@ -94,8 +116,9 @@ export function notebookDelta(
 /** The NOTE: lines a helper offered for the notebook, at most three, each short. */
 export function notesIn(answer: string): string[] {
   return [...answer.matchAll(/^\s*[-*]?\s*NOTE:\s*(.+)$/gim)]
-    .map(m => (m[1] ?? '').replace(/\*\*/g, '').trim())
-    .filter(Boolean)
+    .map(m => (m[1] ?? '').replace(/\*\*/g, '').replace(/^[-*•]\s+/, '').trim())
+    // a note that restates FLEET's own answer rules is no fact about the project
+    .filter(n => n && !/\b(SUMMARY|KEY POINTS|CONFIDENCE|answer format|read-only)\b/i.test(n))
     .slice(0, 3)
     .map(n => (n.length > 220 ? `${n.slice(0, 219)}…` : n))
 }
