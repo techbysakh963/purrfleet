@@ -626,23 +626,29 @@ function Notebook(E: Els, v: View, act: Acts) {
           <Text color={p.dim}>{v.notebook.file.replace(/^\/home\/[^/]+/, '~')} · tick to approve, edit freely</Text>
         </Button>
       ) : null}
+      {isOpen ? (
+        <Text color={p.dim} wrap="wrap">
+          {'  '}Short facts sent with every message to Codex and agy. Helpers suggest them; a suggestion waits until you
+          approve it. Keep only facts that stay true; delete anything outdated.
+        </Text>
+      ) : null}
       {isOpen && notes.length === 0 ? (
         <Text color={p.dim}>  empty: helpers add NOTE: lines, and Claude pins facts with crew_note</Text>
       ) : null}
       {isOpen
         ? notes.map(n => (
             <Box flexDirection="row" columnGap={1}>
-              <Button key={`note-x-${n.id}`} plain onPress={() => act.noteRemove(v.notebook.folder, n.id)}>
-                <Text color={p.bad}>×</Text>
-              </Button>
               {n.pending ? (
                 <Button key={`note-ok-${n.id}`} plain onPress={() => act.noteApprove(v.notebook.folder, n.id)}>
-                  <Text color={p.ok}>◆ approve</Text>
+                  <Text color={p.ok}>◆ keep</Text>
                 </Button>
               ) : null}
+              <Button key={`note-x-${n.id}`} plain onPress={() => act.noteRemove(v.notebook.folder, n.id)}>
+                <Text color={p.bad}>{n.pending ? '× reject' : '× delete'}</Text>
+              </Button>
               <Text wrap="wrap">
                 <Text color={n.by === 'claude' ? p.violet : n.by === 'you' ? p.gold : p.cyan}>{n.by} </Text>
-                {n.pending ? <Text color={p.warn}>pending </Text> : ''}
+                {n.pending ? <Text color={p.warn}>suggests </Text> : <Text color={p.dim}>· </Text>}
                 <Text color={p.text}>{cut(n.text, w * 3)}</Text>
               </Text>
             </Box>
