@@ -146,6 +146,10 @@ export type CrewThread = {
   sentNotes?: { id: number; text: string }[]
   /** the state brief a compaction carried into the fresh conversation */
   brief: string
+  /** the window running this thread now: its session id, when its run began, its last heartbeat */
+  lease?: { sid: string; since: number; at: number }
+  /** another window asked the owner to stop this thread (epoch seconds) */
+  stopAsked?: number
   created: number
   updated: number
 }

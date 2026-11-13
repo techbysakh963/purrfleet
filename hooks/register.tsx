@@ -43,6 +43,7 @@ import type { Palette } from './theme'
 import { fleetReport } from './brief'
 import { inbox, moodOf, statusNews } from './inbox'
 import { deliveryLine, newCodexWorktrees, parseNumstat, parseWorktrees } from './delivery'
+import { mayClaim, ownership, settleOrphans, stopsAskedOf } from './coord'
 import type { Depth, Part } from './crew'
 import { isUnread } from './inbox'
 import { findingMarkdown, findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectDir, projectOf, searchNotes } from './vault'
@@ -159,6 +160,11 @@ async function alertOnNew($: EngineInterface, sessions: Session[]): Promise<void
   }
   alerted = fresh
   if (due.length === 0) return
+  await withStoreLock($, () => claimAlerts($, due))
+}
+
+/** Under the store lock: notify each session once per machine, recording the claim before the next window looks. */
+async function claimAlerts($: EngineInterface, due: readonly Session[]): Promise<void> {
   const saved = await $.store.get('alerted').catch(() => undefined)
   const claimed: Record<string, number> = saved && typeof saved === 'object' ? { ...(saved as Record<string, number>) } : {}
   const t = now()
@@ -471,16 +477,84 @@ const storedThreads = async ($: EngineInterface): Promise<CrewThread[]> => {
  * Other FLEET windows save to the same store, so this merges with what they wrote
  * instead of overwriting it.
  */
-async function persist($: EngineInterface): Promise<void> {
-  const stored = await storedThreads($)
-  await update($, threads, list => mergeThreads(list, stored, new Set(owner.keys())))
-  await $.store.set('threads', trimmed(await read($, threads)))
+// ── the coordinator: one lock for the shared store, one owner per running turn ──
+
+let lockDir = '' // ~/.cache/purrfleet/store.lock: a directory, made atomically by mkdir
+const LOCK_STALE_MS = 10_000 // a lock older than this was left by a window that died holding it
+const LOCK_WAIT_MS = 3_000
+
+/**
+ * Runs `fn` while holding the store lock, so a read, merge and write of shared state
+ * can't interleave with another window's. mkdir either creates the directory or
+ * fails: two windows can never both get it. A lock left behind by a crashed window
+ * expires after 10 s. If the lock can't be had in 3 s, `fn` still runs (the merge
+ * keeps that rare case safe enough) rather than freezing the pane.
+ */
+async function withStoreLock<T>($: EngineInterface, fn: () => Promise<T>): Promise<T> {
+  let held = false
+  if (lockDir) {
+    const deadline = Date.now() + LOCK_WAIT_MS
+    while (!held) {
+      const r = await $.process.run(['mkdir', lockDir], { timeoutMs: 2_000 }).catch(() => undefined)
+      if (r?.exitCode === 0) {
+        held = true
+        break
+      }
+      const st = await $.fs.stat(lockDir).catch(() => undefined)
+      if (st && Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+        await $.process.run(['rmdir', lockDir], { timeoutMs: 2_000 }).catch(() => undefined)
+        continue
+      }
+      if (Date.now() > deadline) break
+      await $.clock.sleep(25 + Math.floor(Math.random() * 25))
+    }
+  }
+  try {
+    return await fn()
+  } finally {
+    if (held) await $.process.run(['rmdir', lockDir], { timeoutMs: 2_000 }).catch(() => undefined)
+  }
 }
 
-/** Picks up what other windows did: threads they opened or ran, turns read there. */
-async function pullThreads($: EngineInterface): Promise<void> {
+/** Read, merge, settle and write the shared thread list. Call only while holding the lock. */
+async function syncThreadsLocked($: EngineInterface, write: boolean): Promise<void> {
   const stored = await storedThreads($)
-  if (stored.length) await update($, threads, list => mergeThreads(list, stored, new Set(owner.keys())))
+  const mine = new Set(owner.keys())
+  await update($, threads, list => settleOrphans(mergeThreads(list, stored, mine), self, now(), mine))
+  if (write) await $.store.set('threads', trimmed(await read($, threads)))
+}
+
+/**
+ * Threads outlive the session (their helpers' own conversations do too), trimmed.
+ * Other FLEET windows save to the same store, so this merges with what they wrote,
+ * under the store lock, instead of overwriting it.
+ */
+async function persist($: EngineInterface): Promise<void> {
+  await withStoreLock($, () => syncThreadsLocked($, true))
+}
+
+/**
+ * Every few seconds: pick up what other windows did, renew the lease on each turn
+ * this window runs (so others know it's alive), act on stop requests from other
+ * windows, and settle threads whose owner window is gone.
+ */
+async function pullThreads($: EngineInterface): Promise<void> {
+  const mineRunning = (await read($, threads)).filter(t => t.status === 'running' && owner.has(t.name)).map(t => t.name)
+  await withStoreLock($, async () => {
+    if (mineRunning.length) {
+      const t = now()
+      await update($, threads, list =>
+        list.map(x => (mineRunning.includes(x.name) && x.lease ? { ...x, lease: { ...x.lease, at: t }, updated: t } : x)),
+      )
+    }
+    await syncThreadsLocked($, true)
+  })
+  for (const name of stopsAskedOf(await read($, threads), self)) {
+    if (running.has(name) || owner.has(name)) {
+      $.ui.toast(`Crew · ${name}: stopped from another FLEET window`)
+      await stopThread($, name)
+    }
+  }
 }
 
 /** A finished turn was looked at (opened here, or read by Claude): it leaves TO READ. */
@@ -524,11 +598,26 @@ async function sendToThread($: EngineInterface, o: AskOpts): Promise<CrewThread 
   }
 }
 
+/**
+ * Opens or continues a thread. The check and the claim happen under the store lock,
+ * against what every window has saved, so two windows can never both start one.
+ */
 async function claimAndSend($: EngineInterface, name: string, o: AskOpts): Promise<CrewThread | string> {
+  const claimed = await withStoreLock($, async () => {
+    await syncThreadsLocked($, false)
+    const res = await claimLocked($, name, o)
+    if (typeof res !== 'string') await $.store.set('threads', trimmed(await read($, threads)))
+    return res
+  })
+  if (typeof claimed === 'string') return claimed
+  void runTurn($, name, claimed.turn.n, o.task, o.context, o.by, o.depth)
+  return claimed.thread
+}
+
+async function claimLocked($: EngineInterface, name: string, o: AskOpts): Promise<{ thread: CrewThread; turn: CrewTurn } | string> {
   const existing = await findThread($, name)
-  if (existing?.status === 'running') {
-    return `Thread "${name}" is still answering its last message. Wait for it (crew_read) or use another thread.`
-  }
+  const may = mayClaim(existing, self, now())
+  if (may !== true) return may
   if (existing && o.agent && existing.agent !== o.agent) {
     return `Thread "${name}" talks to ${existing.agent}, not ${o.agent}. Pick another thread name for ${o.agent}.`
   }
@@ -573,7 +662,12 @@ async function claimAndSend($: EngineInterface, name: string, o: AskOpts): Promi
     mode: o.mode ?? base.mode,
     status: 'running',
     updated: now(),
+    // this window owns the run; other windows see the lease and leave it alone
+    lease: { sid: self, since: now(), at: now() },
   }
+  delete thread.stopAsked
+  // mine from this moment: a sync before runTurn takes over must not see an orphan
+  owner.set(name, 0)
   const turn: CrewTurn = {
     n: (base.turns[base.turns.length - 1]?.n ?? 0) + 1,
     by: o.by,
@@ -598,8 +692,7 @@ async function claimAndSend($: EngineInterface, name: string, o: AskOpts): Promi
     }
     return next
   })
-  void runTurn($, name, turn.n, o.task, o.context, o.by, o.depth)
-  return thread
+  return { thread, turn }
 }
 
 async function runTurn(
@@ -669,8 +762,9 @@ async function runTurn(
     const mine = x.turns.find(u => u.n === n)
     // a stopped turn, or one a newer turn has replaced, does not get to set the thread's status
     if (!mine || mine.status === 'stopped' || x.turns[x.turns.length - 1]?.n !== n) return x
+    const { lease: _lease, stopAsked: _stop, ...rest } = x
     return {
-      ...x,
+      ...rest,
       status: res.ok ? 'idle' : 'failed',
       updated: now(),
       turns: x.turns.map(u => (u.n !== n ? u : { ...u, status: res.ok ? 'done' : 'failed', ended: now(), unread: true })),
@@ -785,17 +879,32 @@ async function execTurn(
   return { ok: code === 0 && !isFatal, answer: final ?? answer }
 }
 
-async function stopThread($: EngineInterface, name: string): Promise<void> {
+async function stopThread($: EngineInterface, name: string): Promise<'stopped' | 'asked' | 'idle'> {
+  const t = await findThread($, name)
+  // another window runs it: leave a stop request; that window stops it within seconds
+  if (t && ownership(t, self, now()) === 'theirs') {
+    await patchThread($, name, x => ({ ...x, stopAsked: now(), updated: now() }))
+    await persist($)
+    $.ui.toast(`Crew · ${name}: asked the FLEET window running it to stop`)
+    return 'asked'
+  }
+  if (t?.status !== 'running' && !running.has(name)) return 'idle'
   // revoke the run and take its child before the thread looks idle to anyone
   owner.delete(name)
   const child = running.get(name)
   running.delete(name)
-  await patchThread($, name, x => ({
-    ...x,
-    status: 'idle',
-    turns: x.turns.map(u => (u.status === 'running' ? { ...u, status: 'stopped', ended: now() } : u)),
-  }))
+  await patchThread($, name, x => {
+    const { lease: _lease, stopAsked: _stop, ...rest } = x
+    return {
+      ...rest,
+      status: 'idle',
+      updated: now(),
+      turns: x.turns.map(u => (u.status === 'running' ? { ...u, status: 'stopped', ended: now() } : u)),
+    }
+  })
   await child?.return?.(undefined)
+  await persist($)
+  return 'stopped'
 }
 
 // Claude-started turns that finished while a sibling this window runs for Claude
@@ -1059,10 +1168,11 @@ async function answerCrewStop($: EngineInterface, e: Args): Promise<Answer> {
   const t = await findThread($, name)
   if (!t) return { deny: `No thread "${name}".` }
   if (t.status !== 'running') return { result: `${name} is not running.` }
-  if (!running.has(name) && !owner.has(name)) return { deny: `${name} runs in another FLEET window; stop it there.` }
   const n = t.turns[t.turns.length - 1]?.n
-  await stopThread($, name)
-  return { result: `stopped ${name}#${n}` }
+  const how = await stopThread($, name)
+  return {
+    result: how === 'asked' ? `${name}#${n} runs in another FLEET window; asked it to stop (within seconds)` : how === 'stopped' ? `stopped ${name}#${n}` : `${name} is not running.`,
+  }
 }
 
 /** The CHANGES line for a turn with a Codex delivery. */
@@ -1376,6 +1486,7 @@ async function openVault($: EngineInterface): Promise<void> {
   const saved = await $.store.get('vault')
   const home = (await $.env.get('HOME')) ?? ''
   answersDir = `${home}/.cache/purrfleet/answers`
+  lockDir = `${home}/.cache/purrfleet/store.lock`
   vaultDir = typeof saved === 'string' && saved ? saved : `${home}/Desktop/purrfleet-memory`
   if (!(await $.fs.exists(`${vaultDir}/.obsidian`))) {
     await $.fs.write(`${vaultDir}/.obsidian/app.json`, '{}\n')
@@ -1749,17 +1860,8 @@ export const register: Register = on => {
     const savedNotes = (await $.store.get('notebooks')) as Record<string, CrewNote[]> | undefined
     if (savedNotes && typeof savedNotes === 'object') await update($, notebooks, () => savedNotes)
     await openVault($).catch(() => undefined)
-    await update($, threads, list =>
-      list.map(t =>
-        t.status !== 'running'
-          ? t
-          : {
-              ...t,
-              status: 'idle',
-              turns: t.turns.map(u => (u.status === 'running' ? { ...u, status: 'stopped', ended: now() } : u)),
-            },
-      ),
-    )
+    // a turn this window was running died with the reload; another live window's run is kept
+    await update($, threads, list => settleOrphans(list, self, now(), new Set()))
     await registerCrewTools($)
     // the tool list is the same bytes every session: models are checked when used, not listed
     void loadModels($)

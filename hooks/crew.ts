@@ -411,11 +411,11 @@ export function mergeThreads(
     const other = theirs.get(t.name)
     theirs.delete(t.name)
     if (!other || owned.has(t.name)) {
-      out.push(other ? seenIn(t, other) : t)
+      out.push(other ? askedStop(seenIn(t, other), other) : t)
       continue
     }
     const [win, lose] = other.updated > t.updated ? [other, t] : [t, other]
-    out.push(seenIn(win, lose))
+    out.push(askedStop(seenIn(win, lose), lose))
   }
   out.push(...theirs.values())
   while (out.length > cap) {
@@ -427,6 +427,11 @@ export function mergeThreads(
     out.splice(oldest, 1)
   }
   return out
+}
+
+/** A stop request made in any window survives the merge, even when the owner's copy wins. */
+function askedStop(t: CrewThread, other: CrewThread): CrewThread {
+  return (other.stopAsked ?? 0) > (t.stopAsked ?? 0) ? { ...t, stopAsked: other.stopAsked } : t
 }
 
 /**

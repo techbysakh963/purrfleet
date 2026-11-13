@@ -65,8 +65,13 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
 - Notices: threads Claude started that finish together reach Claude as one notice (it waits up to
   3 minutes for a slow sibling). A failed crew turn sends a desktop notification whoever started it;
   your own successful turns show a toast.
-- Several windows: FLEET windows share their crew threads (merged, never overwritten) and send each
-  desktop notification once for the whole machine.
+- **Several windows** (the coordinator, v0.17): FLEET windows share their crew threads through one
+  lock (`~/.cache/purrfleet/store.lock`, made atomically with mkdir; a lock left by a crashed window
+  expires after 10 s), so a save is read, merge and write in one go and never loses another window's
+  work. A running turn has one owner, the window that started its helper, with a lease it renews
+  every few seconds: other windows can't start that thread again, never reset it, and a stop pressed
+  elsewhere reaches the owner within seconds. A run whose window is gone (no heartbeat for 45 s) is
+  settled as stopped. Each desktop notification is claimed under the same lock, once per machine.
 - **Feed**: every tool call across sessions, grouped, with a 10-minute summary.
 - **Crew**: NEW threads (running or unread) on top, the ones you have seen folded under EARLIER. Named, ongoing threads with Codex (`codex exec` / `exec resume`) and Antigravity
   (`agy -p` / `--conversation`), each with its own model, effort and mode. Claude talks to them

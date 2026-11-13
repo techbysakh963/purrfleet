@@ -8,6 +8,7 @@ import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { fleetReport } from './brief'
 import { inbox, moodOf, segments, statusNews, tally } from './inbox'
+import { LEASE_TTL, mayClaim, ownership, settleOrphans, stopsAskedOf } from './coord'
 import { deliveryLine, newCodexWorktrees, parseNumstat, parseWorktrees } from './delivery'
 import { age, fitWho } from './views'
 import { PALETTES, contrast } from './theme'
@@ -933,4 +934,34 @@ test('crew_review: a fixed brief with the diff, F lines parsed, two reviewers me
   expect(block).toContain('3 findings (1 raised by both)')
   expect(block).toContain('F1 [high] src/auth/refresh.ts:88 (codex, agy)')
   expect(findingsIn('no findings here', 'codex')).toEqual([])
+})
+
+
+test('coordinator: one owner per running turn; a live remote run is left alone; dead ones settle; stops travel', async () => {
+  const run = (name: string, sid: string, at: number, extra: Partial<CrewThread> = {}) =>
+    crewThread(name, { status: 'running', lease: { sid, since: at - 5, at }, turns: [doneTurn(1, { status: 'running' })], ...extra })
+  const now = 10_000
+  const theirs = run('a', 'other', now - 5)
+  const dead = run('b', 'other', now - LEASE_TTL - 1)
+  const mine = run('c', 'me', now)
+  expect(ownership(theirs, 'me', now)).toBe('theirs')
+  expect(ownership(dead, 'me', now)).toBe('dead')
+  expect(ownership(mine, 'me', now)).toBe('mine')
+  expect(ownership(crewThread('d', { status: 'running' }), 'me', now)).toBe('dead') // no lease: an old, pre-lease run
+  // another window's live run can't be started again here; a dead one can
+  expect(mayClaim(theirs, 'me', now)).toContain('another FLEET window')
+  expect(mayClaim(dead, 'me', now)).toBe(true)
+  expect(mayClaim(undefined, 'me', now)).toBe(true)
+  // settling: the live remote run stays; the dead one and my own lost run stop
+  const settled = settleOrphans([theirs, dead, mine], 'me', now, new Set())
+  expect(settled.map(t => t.status)).toEqual(['running', 'idle', 'idle'])
+  expect(settled[1]!.turns[0]!.status).toBe('stopped')
+  expect(settled[1]!.lease).toBeUndefined()
+  expect(settleOrphans([mine], 'me', now, new Set(['c']))[0]!.status).toBe('running') // still running here
+  // a stop asked from another window reaches the owner through the merge, even when the owner's copy wins
+  const asked = { ...mine, stopAsked: now + 1 }
+  const merged = mergeThreads([mine], [asked], new Set(['c']))[0]!
+  expect(merged.stopAsked).toBe(now + 1)
+  expect(stopsAskedOf([merged], 'me')).toEqual(['c'])
+  expect(stopsAskedOf([merged], 'someone-else')).toEqual([])
 })
