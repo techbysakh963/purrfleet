@@ -43,7 +43,8 @@ import type { Palette } from './theme'
 import { fleetReport } from './brief'
 import { inbox, moodOf, statusNews } from './inbox'
 import { deliveryLine, newCodexWorktrees, parseNumstat, parseWorktrees } from './delivery'
-import { mayClaim, ownership, settleOrphans, stopsAskedOf } from './coord'
+import type { Notebooks, Tombs } from './coord'
+import { lostLeases, mayClaim, mergeNotebooks, mergeTombs, ownership, settleOrphans, stopsAskedOf } from './coord'
 import type { Depth, Part } from './crew'
 import { isUnread } from './inbox'
 import { findingMarkdown, findingPath, isInside, notebookMarkdown, notebookPath, parseNotebook, projectDir, projectOf, searchNotes } from './vault'
@@ -82,8 +83,9 @@ const crewAllTurns = atom({ plugin: 'fleet', key: 'crewAllTurns' } as const, nul
 const crewInputGen = atom({ plugin: 'fleet', key: 'crewInputGen' } as const, 0)
 const crewDiff = atom({ plugin: 'fleet', key: 'crewDiff' } as const, null)
 const statusLine = atom({ plugin: 'fleet', key: 'statusLine' } as const, true)
-// what the last status line (or a crew_read / fleet_read) already told Claude
-let toldKey = ''
+// what the last status line (or a crew_read / fleet_read) already told Claude; in $.state,
+// so a /reload-plugins doesn't make FLEET repeat news Claude already has
+const statusTold = atom({ plugin: 'fleet', key: 'statusTold' } as const, '')
 
 // Module variables start over on a reload; everything drawn lives in $.state.
 let self = ''
@@ -137,10 +139,7 @@ async function poll($: EngineInterface): Promise<void> {
     await update($, snap, () => next)
     await update($, error, () => null)
     await alertOnNew($, next.sessions)
-    if (++pollCount % 4 === 0) {
-      await syncFromVault($)
-      await pullThreads($)
-    }
+    if (++pollCount % 4 === 0) await syncFromVault($)
   } catch (e) {
     await update($, error, () => `collector failed: ${String(e).slice(0, 300)}`)
   } finally {
@@ -160,7 +159,10 @@ async function alertOnNew($: EngineInterface, sessions: Session[]): Promise<void
   }
   alerted = fresh
   if (due.length === 0) return
-  await withStoreLock($, () => claimAlerts($, due))
+  await withStoreLock($, () => claimAlerts($, due)).catch(() => {
+    // couldn't claim: forget these so the next poll tries again
+    for (const s of due) alerted.delete(`${s.sid}:${s.phase}:${s.phaseSince}`)
+  })
 }
 
 /** Under the store lock: notify each session once per machine, recording the claim before the next window looks. */
@@ -413,7 +415,7 @@ async function acceptDelivery($: EngineInterface, name: string, n: number): Prom
     }
     const done = await git($, ['-C', at.d.root, 'apply', '-'], patch.out)
     if (done.exitCode !== 0) return setDelivery($, name, n, { note: `not applied: ${done.stderr.trim().split('\n')[0] ?? ''}` })
-    const gone = await git($, ['-C', at.d.root, 'worktree', 'remove', '--force', at.d.path]).catch(() => undefined)
+    const gone = await removeWorktree($, at.d.root, at.d.path)
     $.ui.toast(`Crew · ${name}: applied ${deliveryLine(at.d)} to your tree (not committed)`)
     await update($, crewDiff, cur => (cur?.key === key ? null : cur))
     await setDelivery($, name, n, {
@@ -423,6 +425,16 @@ async function acceptDelivery($: EngineInterface, name: string, n: number): Prom
   } finally {
     deciding.delete(key)
   }
+}
+
+/** git removes the worktree but not Codex's numbered folder around it: remove that too, if empty. */
+async function removeWorktree($: EngineInterface, root: string, path: string) {
+  const r = await git($, ['-C', root, 'worktree', 'remove', '--force', path]).catch(() => undefined)
+  const parent = path.slice(0, path.lastIndexOf('/'))
+  if (r?.exitCode === 0 && /\/\.codex\/worktrees\/[^/]+$/.test(parent)) {
+    await $.process.run(['rmdir', parent], { timeoutMs: 2_000 }).catch(() => undefined)
+  }
+  return r
 }
 
 /** Throws Codex's changes away with its worktree, after you confirm. */
@@ -440,7 +452,7 @@ async function discardDelivery($: EngineInterface, name: string, n: number): Pro
     if (answer !== 'Discard') return
     const now2 = await deliveryAt($, name, n)
     if (!now2 || now2.d.state !== 'pending') return
-    const gone = await git($, ['-C', at.d.root, 'worktree', 'remove', '--force', at.d.path]).catch(() => undefined)
+    const gone = await removeWorktree($, at.d.root, at.d.path)
     await update($, crewDiff, cur => (cur?.key === key ? null : cur))
     if (gone?.exitCode !== 0) {
       return setDelivery($, name, n, { note: `couldn't delete the worktree: ${gone?.stderr.trim().split('\n')[0] ?? 'git failed'}` })
@@ -467,8 +479,9 @@ const trimmed = (list: readonly CrewThread[]): CrewThread[] =>
     turns: t.turns.slice(-12).map(u => ({ ...u, answer: u.answer.slice(0, 6000), log: u.log.slice(-6) })),
   }))
 
+/** What every window saved. A failed read throws: it is never mistaken for an empty store. */
 const storedThreads = async ($: EngineInterface): Promise<CrewThread[]> => {
-  const saved = await $.store.get('threads').catch(() => undefined)
+  const saved = await $.store.get('threads')
   return Array.isArray(saved) ? (saved as CrewThread[]) : []
 }
 
@@ -479,46 +492,73 @@ const storedThreads = async ($: EngineInterface): Promise<CrewThread[]> => {
  */
 // ── the coordinator: one lock for the shared store, one owner per running turn ──
 
+const SYNC_MS = 5_000
+let isSyncing = false
 let lockDir = '' // ~/.cache/purrfleet/store.lock: a directory, made atomically by mkdir
 const LOCK_STALE_MS = 10_000 // a lock older than this was left by a window that died holding it
 const LOCK_WAIT_MS = 3_000
 
+class LockBusy extends Error {}
+
 /**
  * Runs `fn` while holding the store lock, so a read, merge and write of shared state
- * can't interleave with another window's. mkdir either creates the directory or
- * fails: two windows can never both get it. A lock left behind by a crashed window
- * expires after 10 s. If the lock can't be had in 3 s, `fn` still runs (the merge
- * keeps that rare case safe enough) rather than freezing the pane.
+ * can't interleave with another window's.
+ *   - mkdir either creates the directory or fails: two windows never both get it.
+ *     The holder writes its token inside; it releases only a lock holding its token.
+ *   - a lock older than 10 s was left by a dead window. It is broken by an atomic
+ *     rename (only one breaker can win), and only if its token is still the one
+ *     judged stale; a fresh lock caught by mistake is put back.
+ *   - if the lock can't be had within 3 s, LockBusy is thrown: nothing shared is
+ *     read-modified-written without it. Callers retry later (sync) or say "busy" (claims).
  */
 async function withStoreLock<T>($: EngineInterface, fn: () => Promise<T>): Promise<T> {
+  if (!lockDir) return fn()
+  const token = `${self || 'x'}:${Date.now()}:${Math.random().toString(36).slice(2)}`
+  const run = (argv: string[]) => $.process.run(argv, { timeoutMs: 2_000 }).catch(() => undefined)
+  const deadline = Date.now() + LOCK_WAIT_MS
   let held = false
-  if (lockDir) {
-    const deadline = Date.now() + LOCK_WAIT_MS
-    while (!held) {
-      const r = await $.process.run(['mkdir', lockDir], { timeoutMs: 2_000 }).catch(() => undefined)
-      if (r?.exitCode === 0) {
-        held = true
-        break
-      }
-      const st = await $.fs.stat(lockDir).catch(() => undefined)
-      if (st && Date.now() - st.mtimeMs > LOCK_STALE_MS) {
-        await $.process.run(['rmdir', lockDir], { timeoutMs: 2_000 }).catch(() => undefined)
-        continue
-      }
-      if (Date.now() > deadline) break
-      await $.clock.sleep(25 + Math.floor(Math.random() * 25))
+  while (!held && Date.now() <= deadline) {
+    if ((await run(['mkdir', lockDir]))?.exitCode === 0) {
+      await $.fs.write(`${lockDir}/token`, token).catch(() => undefined)
+      held = true
+      break
     }
+    const st = await $.fs.stat(lockDir).catch(() => undefined)
+    if (st && Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+      const seen = (await $.fs.read(`${lockDir}/token`).catch(() => '')).trim()
+      const grave = `${lockDir}.dead-${token.replace(/[^a-z0-9]/gi, '')}`
+      if ((await run(['mv', '-T', lockDir, grave]))?.exitCode === 0) {
+        const got = (await $.fs.read(`${grave}/token`).catch(() => '')).trim()
+        // caught a lock someone took a moment ago: give it back if the name is free
+        if (got !== seen) await run(['mv', '-T', '--no-clobber', grave, lockDir])
+        await run(['rm', '-rf', grave])
+      }
+      continue
+    }
+    await $.clock.sleep(25 + Math.floor(Math.random() * 25))
   }
+  if (!held) throw new LockBusy('another FLEET window holds the store lock')
   try {
     return await fn()
   } finally {
-    if (held) await $.process.run(['rmdir', lockDir], { timeoutMs: 2_000 }).catch(() => undefined)
+    // release only our own lock: a holder that overran never deletes its successor's
+    const mine = (await $.fs.read(`${lockDir}/token`).catch(() => '')).trim() === token
+    if (mine) await run(['rm', '-rf', lockDir])
   }
 }
 
 /** Read, merge, settle and write the shared thread list. Call only while holding the lock. */
 async function syncThreadsLocked($: EngineInterface, write: boolean): Promise<void> {
   const stored = await storedThreads($)
+  // presumed dead and taken over by another window: give the run up, never overwrite the new owner
+  for (const name of lostLeases(await read($, threads), stored, self, new Set(owner.keys()))) {
+    owner.delete(name)
+    const child = running.get(name)
+    running.delete(name)
+    void child?.return?.(undefined)
+    await update($, threads, list => list.filter(t => t.name !== name))
+    $.ui.toast(`Crew · ${name}: another FLEET window took this run over; stopped it here`)
+  }
   const mine = new Set(owner.keys())
   await update($, threads, list => settleOrphans(mergeThreads(list, stored, mine), self, now(), mine))
   if (write) await $.store.set('threads', trimmed(await read($, threads)))
@@ -530,7 +570,8 @@ async function syncThreadsLocked($: EngineInterface, write: boolean): Promise<vo
  * under the store lock, instead of overwriting it.
  */
 async function persist($: EngineInterface): Promise<void> {
-  await withStoreLock($, () => syncThreadsLocked($, true))
+  // busy or a failed read: nothing written now; the next sync (every 5 s) writes this window's state
+  await withStoreLock($, () => syncThreadsLocked($, true)).catch(() => undefined)
 }
 
 /**
@@ -540,7 +581,7 @@ async function persist($: EngineInterface): Promise<void> {
  */
 async function pullThreads($: EngineInterface): Promise<void> {
   const mineRunning = (await read($, threads)).filter(t => t.status === 'running' && owner.has(t.name)).map(t => t.name)
-  await withStoreLock($, async () => {
+  const isSynced = await withStoreLock($, async () => {
     if (mineRunning.length) {
       const t = now()
       await update($, threads, list =>
@@ -548,7 +589,10 @@ async function pullThreads($: EngineInterface): Promise<void> {
       )
     }
     await syncThreadsLocked($, true)
-  })
+    await syncNotebooksLocked($)
+    return true
+  }).catch(() => false)
+  if (!isSynced) return
   for (const name of stopsAskedOf(await read($, threads), self)) {
     if (running.has(name) || owner.has(name)) {
       $.ui.toast(`Crew · ${name}: stopped from another FLEET window`)
@@ -605,10 +649,23 @@ async function sendToThread($: EngineInterface, o: AskOpts): Promise<CrewThread 
 async function claimAndSend($: EngineInterface, name: string, o: AskOpts): Promise<CrewThread | string> {
   const claimed = await withStoreLock($, async () => {
     await syncThreadsLocked($, false)
+    const before = await read($, threads)
     const res = await claimLocked($, name, o)
-    if (typeof res !== 'string') await $.store.set('threads', trimmed(await read($, threads)))
+    if (typeof res === 'string') return res
+    try {
+      await $.store.set('threads', trimmed(await read($, threads)))
+    } catch (err) {
+      // the claim never reached the store: undo it here, so no phantom run is left behind
+      owner.delete(name)
+      await update($, threads, () => before)
+      return `Couldn't save the claim on "${name}": ${String(err).slice(0, 160)}. Try again.`
+    }
     return res
-  })
+  }).catch((err: unknown) =>
+    err instanceof LockBusy
+      ? `Another FLEET window is saving right now; try "${name}" again in a moment.`
+      : `Couldn't read the shared crew state: ${String(err).slice(0, 160)}. Try again.`,
+  )
   if (typeof claimed === 'string') return claimed
   void runTurn($, name, claimed.turn.n, o.task, o.context, o.by, o.depth)
   return claimed.thread
@@ -695,7 +752,43 @@ async function claimLocked($: EngineInterface, name: string, o: AskOpts): Promis
   return { thread, turn }
 }
 
+/**
+ * runTurn, guarded: if it throws, the turn is marked failed and the run released,
+ * so a crash can never leave a "zombie" run whose lease is renewed forever.
+ */
 async function runTurn(
+  $: EngineInterface,
+  name: string,
+  n: number,
+  task: string,
+  context: string,
+  by: 'claude' | 'you',
+  depth: Depth = 'normal',
+): Promise<void> {
+  try {
+    await runTurnInner($, name, n, task, context, by, depth)
+  } catch (err) {
+    const t = await findThread($, name)
+    const u = t?.turns.find(x => x.n === n)
+    if (!t || !u || u.status !== 'running') return
+    owner.delete(name)
+    const child = running.get(name)
+    running.delete(name)
+    void child?.return?.(undefined)
+    await patchThread($, name, x => {
+      const { lease: _lease, stopAsked: _stop, ...rest } = x
+      return {
+        ...rest,
+        status: 'failed',
+        updated: now(),
+        turns: x.turns.map(v => (v.n === n ? { ...v, status: 'failed', ended: now(), unread: true, log: [...v.log, `FLEET: ${String(err).slice(0, 200)}`] } : v)),
+      }
+    })
+    await persist($)
+  }
+}
+
+async function runTurnInner(
   $: EngineInterface,
   name: string,
   n: number,
@@ -883,7 +976,8 @@ async function stopThread($: EngineInterface, name: string): Promise<'stopped' |
   const t = await findThread($, name)
   // another window runs it: leave a stop request; that window stops it within seconds
   if (t && ownership(t, self, now()) === 'theirs') {
-    await patchThread($, name, x => ({ ...x, stopAsked: now(), updated: now() }))
+    // only the request travels; `updated` stays, so this stale copy never outranks the owner's
+    await patchThread($, name, x => ({ ...x, stopAsked: now() }))
     await persist($)
     $.ui.toast(`Crew · ${name}: asked the FLEET window running it to stop`)
     return 'asked'
@@ -1211,7 +1305,13 @@ async function answerCrewRead($: EngineInterface, e: Args): Promise<Answer> {
       if (done.has(t.name)) continue
       // a review pair (<topic>-codex and <topic>-agy) whose answers carry F lines reads as one merged list
       const pair = t.name.match(/^(.*)-(codex|agy)$/)
-      const mate = pair ? due.find(x => x.t.name === `${pair[1]}-${pair[2] === 'codex' ? 'agy' : 'codex'}`) : undefined
+      const mateName = pair ? `${pair[1]}-${pair[2] === 'codex' ? 'agy' : 'codex'}` : ''
+      // the other half: unread too, or already read (the slower reviewer often lands later)
+      const mateThread = pair ? list.find(x => x.name === mateName) : undefined
+      const mateTurn = mateThread?.turns[mateThread.turns.length - 1]
+      const mate =
+        due.find(x => x.t.name === mateName) ??
+        (mateThread && mateTurn && mateTurn.status === 'done' && Math.abs(mateTurn.started - u.started) < 600 ? { t: mateThread, u: mateTurn } : undefined)
       if (pair && mate) {
         const a = await fullTurn($, t.name, u)
         const b = await fullTurn($, mate.t.name, mate.u)
@@ -1237,7 +1337,8 @@ async function answerCrewRead($: EngineInterface, e: Args): Promise<Answer> {
       await markRead($, t.name, u.n)
       done.add(t.name)
     }
-    toldKey = statusNews(await read($, threads), await read($, notebooks)).key
+    const told = statusNews(await read($, threads), await read($, notebooks)).key
+    await update($, statusTold, () => told)
     return { result: [UNTRUSTED, '', blocks.join('\n\n')].join('\n') }
   }
   const name = optStr(e.thread)
@@ -1459,9 +1560,22 @@ async function registerCrewTools($: EngineInterface): Promise<void> {
 // ── the vault: Obsidian as long-term memory ──────────────────────────────────
 
 /** Saves the notebooks, and mirrors this folder's notebook to the vault as an Obsidian note. */
+/** Merges this window's notebooks with what every window saved. Call only while holding the lock. */
+async function syncNotebooksLocked($: EngineInterface): Promise<void> {
+  const storedNotes = ((await $.store.get('notebooks')) ?? {}) as Notebooks
+  const storedTombs = ((await $.store.get('noteTombs')) ?? {}) as Tombs
+  const tombs = mergeTombs(storedTombs, pendingTombs)
+  const merged = mergeNotebooks(await read($, notebooks), storedNotes, tombs)
+  await update($, notebooks, () => merged)
+  await $.store.set('notebooks', merged)
+  await $.store.set('noteTombs', tombs)
+  pendingTombs = {}
+}
+
 async function saveNotebook($: EngineInterface, folder: string): Promise<void> {
+  // under the lock and merged: two windows adding notes at once both keep theirs
+  await withStoreLock($, () => syncNotebooksLocked($)).catch(() => undefined)
   const all = await read($, notebooks)
-  await $.store.set('notebooks', all)
   if (!vaultDir) return
   const text = notebookMarkdown(folder, all[folder] ?? [], now())
   await $.fs
@@ -1487,8 +1601,14 @@ async function syncFromVault($: EngineInterface): Promise<void> {
     const parsed = parseNotebook(text, now())
     const before = JSON.stringify((all[folder] ?? []).map(n => [n.id, n.text, !!n.pending]))
     if (JSON.stringify(parsed.map(n => [n.id, n.text, !!n.pending])) === before) continue
-    await update($, notebooks, cur => ({ ...cur, [folder]: parsed.slice(-50) }))
-    await $.store.set('notebooks', await read($, notebooks))
+    // lines you deleted in Obsidian become tombstones, so another window's copy can't bring them back
+    const kept = new Set(parsed.map(n => n.id))
+    const gone = (all[folder] ?? []).filter(n => !kept.has(n.id)).map(n => n.id)
+    if (gone.length) pendingTombs = mergeTombs(pendingTombs, { [folder]: gone })
+    // your edit is the newest: stamp it so the merge prefers it
+    const t = now()
+    await update($, notebooks, cur => ({ ...cur, [folder]: parsed.slice(-50).map(n => ({ ...n, at: t })) }))
+    await withStoreLock($, () => syncNotebooksLocked($)).catch(() => undefined)
   }
 }
 
@@ -1498,6 +1618,7 @@ async function openVault($: EngineInterface): Promise<void> {
   const home = (await $.env.get('HOME')) ?? ''
   answersDir = `${home}/.cache/purrfleet/answers`
   lockDir = `${home}/.cache/purrfleet/store.lock`
+  await $.process.run(['mkdir', '-p', `${home}/.cache/purrfleet`], { timeoutMs: 2_000 }).catch(() => undefined)
   vaultDir = typeof saved === 'string' && saved ? saved : `${home}/Desktop/purrfleet-memory`
   if (!(await $.fs.exists(`${vaultDir}/.obsidian`))) {
     await $.fs.write(`${vaultDir}/.obsidian/app.json`, '{}\n')
@@ -1565,7 +1686,8 @@ async function answerFleetRead($: EngineInterface, e: Args): Promise<Answer> {
     scope: e.scope === 'project' ? 'project' : 'all',
     cwd: sessionCwd,
   })
-  toldKey = statusNews(await read($, threads), all).key
+  const told = statusNews(await read($, threads), all).key
+  await update($, statusTold, () => told)
   // a briefing moves the "since" marker on, unless asked not to
   if (e.mark !== false) await $.store.set('briefAt', now())
   return { result: text }
@@ -1656,7 +1778,11 @@ async function editNote($: EngineInterface, folder: string, id: number): Promise
   await saveNotebook($, folder)
 }
 
+// deletions not yet written to the shared tombstones
+let pendingTombs: Tombs = {}
+
 async function removeNote($: EngineInterface, folder: string, id: number): Promise<void> {
+  pendingTombs = mergeTombs(pendingTombs, { [folder]: [id] })
   await update($, notebooks, all => ({ ...all, [folder]: (all[folder] ?? []).filter(n => n.id !== id) }))
   await saveNotebook($, folder)
 }
@@ -1870,6 +1996,10 @@ export const register: Register = on => {
     if ((await $.store.get('toured')) === true) await update($, toured, () => true)
     const savedNotes = (await $.store.get('notebooks')) as Record<string, CrewNote[]> | undefined
     if (savedNotes && typeof savedNotes === 'object') await update($, notebooks, () => savedNotes)
+    // the lock path first: if the vault fails to open, locking must still be on
+    const homeDir = (await $.env.get('HOME')) ?? ''
+    if (homeDir) lockDir = `${homeDir}/.cache/purrfleet/store.lock`
+    await $.process.run(['mkdir', '-p', `${homeDir}/.cache/purrfleet`], { timeoutMs: 2_000 }).catch(() => undefined)
     await openVault($).catch(() => undefined)
     // a turn this window was running died with the reload; another live window's run is kept
     await update($, threads, list => settleOrphans(list, self, now(), new Set()))
@@ -1899,6 +2029,9 @@ export const register: Register = on => {
     $.clock.every(FRAME_MS, () => void (mounted.size > 0 ? paint($) : undefined))
     // the watchdog: a collector that stopped answering is said out loud, not left looking current
     $.clock.every(5000, () => void watchdog($))
+    // the coordinator's own beat: leases renewed and other windows' work picked up even
+    // when the collector is failing or slow
+    $.clock.every(SYNC_MS, () => void (isSyncing ? undefined : ((isSyncing = true), pullThreads($).finally(() => (isSyncing = false)))))
     // the pane opens only on /fleet; the band above the prompt is always there
 
     return started
@@ -1931,8 +2064,8 @@ export const register: Register = on => {
     const isTyped = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
     if (!isTyped || e.command || e.isMeta || e.text.startsWith('[FLEET') || !(await read($, statusLine))) return next(e)
     const news = statusNews(await read($, threads), await read($, notebooks))
-    if (!news.key || news.key === toldKey) return next(e)
-    toldKey = news.key
+    if (!news.key || news.key === (await read($, statusTold))) return next(e)
+    await update($, statusTold, () => news.key)
     return next({ ...e, context: [...(e.context ?? []), news.text] })
   })
 

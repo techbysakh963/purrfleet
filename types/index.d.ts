@@ -201,6 +201,8 @@ declare module 'claude-code' {
       crewDiff: { key: string; text: string } | null
       /** a one-line crew update beside the user's prompt, for Claude only */
       statusLine: boolean
+      /** the crew news Claude was last given (or read itself), so it isn't repeated */
+      statusTold: string
     }
   }
 }

@@ -431,6 +431,12 @@ export function mergeThreads(
 
 /** A stop request made in any window survives the merge, even when the owner's copy wins. */
 function askedStop(t: CrewThread, other: CrewThread): CrewThread {
+  // once the thread has stopped, the request is spent: drop it rather than carry it forever
+  if (t.status !== 'running') {
+    if (t.stopAsked === undefined) return t
+    const { stopAsked: _spent, ...rest } = t
+    return rest
+  }
   return (other.stopAsked ?? 0) > (t.stopAsked ?? 0) ? { ...t, stopAsked: other.stopAsked } : t
 }
 

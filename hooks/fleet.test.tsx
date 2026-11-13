@@ -8,7 +8,7 @@ import type { CrewThread } from '../types'
 import { toBase64 } from './scenes'
 import { fleetReport } from './brief'
 import { inbox, moodOf, segments, statusNews, tally } from './inbox'
-import { LEASE_TTL, mayClaim, ownership, settleOrphans, stopsAskedOf } from './coord'
+import { LEASE_TTL, lostLeases, mayClaim, mergeNotebooks, mergeTombs, ownership, settleOrphans, stopsAskedOf } from './coord'
 import { deliveryLine, newCodexWorktrees, parseNumstat, parseWorktrees } from './delivery'
 import { age, fitWho } from './views'
 import { PALETTES, contrast } from './theme'
@@ -964,4 +964,27 @@ test('coordinator: one owner per running turn; a live remote run is left alone; 
   expect(merged.stopAsked).toBe(now + 1)
   expect(stopsAskedOf([merged], 'me')).toEqual(['c'])
   expect(stopsAskedOf([merged], 'someone-else')).toEqual([])
+})
+
+test('coordinator v2: a window presumed dead gives a taken-over run up; notebooks merge across windows', async () => {
+  const run = (sid: string, since: number) => crewThread('r', { status: 'running', lease: { sid, since, at: since } })
+  // A (me) was presumed dead; B took over later: A must give it up
+  expect(lostLeases([run('me', 100)], [run('B', 200)], 'me', new Set(['r']))).toEqual(['r'])
+  // the stored copy is mine, or B's lease is older than mine: nothing lost
+  expect(lostLeases([run('me', 100)], [run('me', 100)], 'me', new Set(['r']))).toEqual([])
+  expect(lostLeases([run('me', 300)], [run('B', 200)], 'me', new Set(['r']))).toEqual([])
+  // not owned here: not this window's business
+  expect(lostLeases([run('me', 100)], [run('B', 200)], 'me', new Set())).toEqual([])
+
+  const note = (id: number, text: string, at: number, pending?: boolean) => ({ id, text, by: 'codex' as const, at, ...(pending ? { pending: true } : {}) })
+  // both windows added a note: both kept
+  const a = { '/p': [note(1, 'from A', 10)] }
+  const b = { '/p': [note(2, 'from B', 11)] }
+  expect(mergeNotebooks(a, b, {})['/p']!.map(n => n.text)).toEqual(['from A', 'from B'])
+  // a deletion (tombstone) beats a stale copy that still has the note
+  expect(mergeNotebooks(a, { '/p': [note(1, 'from A', 10), note(3, 'deleted', 5)] }, { '/p': [3] })['/p']!.map(n => n.id)).toEqual([1])
+  // a later edit wins; approving is never undone by a stale pending copy
+  expect(mergeNotebooks({ '/p': [note(1, 'new text', 20)] }, { '/p': [note(1, 'old text', 10)] }, {})['/p']![0]!.text).toBe('new text')
+  expect(mergeNotebooks({ '/p': [note(1, 'x', 10, true)] }, { '/p': [note(1, 'x', 10)] }, {})['/p']![0]!.pending).toBeUndefined()
+  expect(mergeTombs({ '/p': [1] }, { '/p': [1, 2], '/q': [9] })).toEqual({ '/p': [1, 2], '/q': [9] })
 })

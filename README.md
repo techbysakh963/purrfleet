@@ -72,6 +72,12 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   every few seconds: other windows can't start that thread again, never reset it, and a stop pressed
   elsewhere reaches the owner within seconds. A run whose window is gone (no heartbeat for 45 s) is
   settled as stopped. Each desktop notification is claimed under the same lock, once per machine.
+  Hardened after a two-helper review (v0.18): the lock carries a token (a slow holder never frees its
+  successor's lock; a stale one is broken by atomic rename), nothing shared is written without it (a
+  claim says "busy" instead), a failed store read never counts as empty, a window presumed dead gives
+  a run back to whoever took it over, the heartbeat has its own 5 s timer, a crash in a turn releases
+  it, and notebooks merge across windows with tombstones for deletions.
+  `node dev/coord-harness.js` replays every race and failure against the real code.
 - **Feed**: every tool call across sessions, grouped, with a 10-minute summary.
 - **Crew**: NEW threads (running or unread) on top, the ones you have seen folded under EARLIER. Named, ongoing threads with Codex (`codex exec` / `exec resume`) and Antigravity
   (`agy -p` / `--conversation`), each with its own model, effort and mode. Claude talks to them

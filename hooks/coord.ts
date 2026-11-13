@@ -7,7 +7,7 @@
 //   - a thread left "running" by a dead owner is settled as stopped, by anyone.
 // Pure rules only; the lock and the store calls live in register.tsx.
 
-import type { CrewThread } from '../types'
+import type { CrewNote, CrewThread } from '../types'
 
 /** Seconds without a heartbeat after which an owner window counts as gone. */
 export const LEASE_TTL = 45
@@ -56,3 +56,53 @@ export function mayClaim(t: CrewThread | undefined, self: string, now: number): 
 /** Threads this window owns that another window asked to stop. */
 export const stopsAskedOf = (list: readonly CrewThread[], self: string): string[] =>
   list.filter(t => t.status === 'running' && t.lease?.sid === self && (t.stopAsked ?? 0) > (t.lease?.since ?? 0)).map(t => t.name)
+
+/**
+ * Threads this window thinks it owns but whose stored copy now carries another
+ * window's lease: this window was presumed dead (no heartbeat) and someone took over.
+ * It must give the thread up, not overwrite the new owner.
+ */
+export function lostLeases(local: readonly CrewThread[], stored: readonly CrewThread[], self: string, owned: ReadonlySet<string>): string[] {
+  const theirs = new Map(stored.map(t => [t.name, t]))
+  return local
+    .filter(t => owned.has(t.name))
+    .filter(t => {
+      const s = theirs.get(t.name)
+      return !!s?.lease && s.lease.sid !== self && s.lease.since >= (t.lease?.since ?? 0)
+    })
+    .map(t => t.name)
+}
+
+// ── the notebook across windows ──────────────────────────────────────────────
+
+
+export type Notebooks = Record<string, CrewNote[]>
+/** Deleted note ids per folder, so a deletion in one window isn't undone by another's copy. */
+export type Tombs = Record<string, number[]>
+
+/**
+ * Two windows' notebooks as one: every note either has, minus the deleted ones.
+ * The same note in both: the later edit wins (`at`); at the same time, kept beats
+ * pending (approving is never undone by a stale copy).
+ */
+export function mergeNotebooks(local: Readonly<Notebooks>, stored: Readonly<Notebooks>, tombs: Readonly<Tombs>): Notebooks {
+  const out: Notebooks = {}
+  for (const folder of new Set([...Object.keys(stored), ...Object.keys(local)])) {
+    const dead = new Set(tombs[folder] ?? [])
+    const byId = new Map<number, CrewNote>()
+    for (const n of [...(stored[folder] ?? []), ...(local[folder] ?? [])]) {
+      if (dead.has(n.id)) continue
+      const had = byId.get(n.id)
+      if (!had || n.at > had.at || (n.at === had.at && had.pending && !n.pending)) byId.set(n.id, n)
+    }
+    out[folder] = [...byId.values()].sort((a, b) => a.id - b.id).slice(-50)
+  }
+  return out
+}
+
+/** Tombstones from both sides, capped per folder. */
+export function mergeTombs(a: Readonly<Tombs>, b: Readonly<Tombs>): Tombs {
+  const out: Tombs = {}
+  for (const f of new Set([...Object.keys(a), ...Object.keys(b)])) out[f] = [...new Set([...(a[f] ?? []), ...(b[f] ?? [])])].slice(-200)
+  return out
+}
