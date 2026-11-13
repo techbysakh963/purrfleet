@@ -40,7 +40,7 @@ Then start the loop with the `loop` skill, no interval (self-paced): `work the n
 
 | Moment | Call | Then |
 |---|---|---|
-| A design choice that is hard to undo | `crew_ask` agent `both`, depth `brief`, a different angle each in `tasks` | keep building what doesn't depend on it; decide when they answer |
+| An architecture choice that is hard to undo (data model, parser, storage) | `crew_ask` agent `codex`, depth `brief` | keep building what doesn't depend on it; decide when it answers |
 | Milestone item `M` | `crew_review` `target: branch:<sha of the last commit before this stretch>`, `folder` = the project (a range like `a^..HEAD` is refused) | read with `crew_read {"new": true}` |
 | The same failure twice | `crew_ask` `both`: the error, what you tried, the file | try their best idea once |
 | Final item `F` | `crew_review` `branch:<sha of the last milestone commit>`: only what no review has seen yet. The diff is cut at 30,000 characters; if the stretch is bigger, review it in parts with `files:<a,b>` | fix, re-run Done-when checks |
@@ -48,6 +48,7 @@ Then start the loop with the `loop` skill, no interval (self-paced): `work the n
 - Write the commit and Log line for a review only **after** its receipt comes back; a failed send is logged as failed.
 - Put the threat model in the plan (who could feed the tool bad input). Reviewers will keep asking for hardening; once the plan's threat model is covered, further hardening is out of scope.
 
+- **Code only.** The crew reviews code, never visuals or design taste: in the A/B test, crew design critiques cost the most time and were mostly rejected, while code reviews found real bugs. Critique your own screenshots instead.
 - **Never wait idle on the crew.** Send, continue the next independent item, read the notice when it comes.
 - **Verify every finding yourself** against the code before fixing. Rejected ones go in the Log with one reason.
 - Fixes from a review are their own commit: `review M2: fix F1, F3`.

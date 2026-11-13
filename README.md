@@ -34,7 +34,9 @@ machine already holds a git credential for github.com (`gh auth login`, then `gh
   `fleet-brief` skill answers decisions first, then crew work finished since your last briefing.
 - Skills shipped with FLEET: `fleet-brief`, `fleet-review` (Codex and agy review in parallel; Claude
   verifies every finding), `fleet-delegate` (when a helper pays for itself), `fleet-handoff`
-  (checkpoint, or hand work to a helper).
+  (checkpoint, or hand work to a helper), `fleet-kickoff` (an idea becomes a project folder: Claude drafts
+  the spec, Codex challenges it for 2–3 rounds, then SPEC/PLAN/CLAUDE/DECISIONS.md are written and the build
+  starts), `fleet-build` (work PLAN.md in a self-paced loop; Codex and agy review the code at milestones).
 
 ### The pane
 
