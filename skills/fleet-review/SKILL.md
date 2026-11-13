@@ -13,6 +13,5 @@ Run independent reviews on Codex and Antigravity, then act as the lead: verify, 
 4. **Read once:** `mcp__fleet__crew_read {"new": true}` shows one merged list: the same file within 5 lines counts once and names both reviewers. For one finding's detail, `{"thread": "<topic>-codex", "grep": "F2"}`.
 5. **Verify every finding yourself** against the current code. Two reviewers agreeing is not verification. Drop anything you can't reproduce or point to in the code.
 6. **Report** one list, most severe first: finding, file:line, why it matters, your verification (confirmed / plausible / rejected and why), and who raised it.
-7. Offer to save the review with `mcp__fleet__crew_save {"thread": "<topic>-codex"}`.
 
 For a review that needs a custom brief (not a diff), use `mcp__fleet__crew_ask` with `agent: "both"` and an angle each in `tasks`.

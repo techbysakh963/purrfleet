@@ -1,5 +1,4 @@
 import type { Phase, Session } from '../types'
-import type { Palette } from './theme'
 
 export const ago = (seconds: number): string => {
   const s = Math.max(0, Math.round(seconds))
@@ -13,19 +12,6 @@ export const usd = (n: number): string =>
 
 export const tok = (n: number): string =>
   n < 1000 ? `${n}` : n < 999_500 ? `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k` : `${(n / 1e6).toFixed(1)}M`
-
-export const bar = (pct: number, width: number): string => {
-  const full = Math.max(0, Math.min(width, Math.round((pct / 100) * width)))
-  return '▰'.repeat(full) + '▱'.repeat(width - full)
-}
-
-const SPARKS = '▁▂▃▄▅▆▇█'
-export const spark = (values: readonly number[]): string => {
-  const max = Math.max(...values, 0)
-  return values
-    .map(v => (max <= 0 ? SPARKS[0] : SPARKS[Math.min(7, Math.round((v / max) * 7))]))
-    .join('')
-}
 
 export const cut = (text: string, width: number): string =>
   width <= 1 ? '' : text.length > width ? `${text.slice(0, width - 1)}…` : text
@@ -47,13 +33,6 @@ export const hms = (seconds: number): string => {
 export const ctxPct = (s: Session): number => {
   const window = /haiku-4/.test(s.model) ? 200_000 : 1_000_000
   return Math.min(100, Math.round((s.ctx / window) * 100))
-}
-
-export const clock = (epoch: number): string => {
-  const d = new Date(epoch * 1000)
-  return [d.getHours(), d.getMinutes(), d.getSeconds()]
-    .map(n => String(n).padStart(2, '0'))
-    .join(':')
 }
 
 /** What a session is up to, in a few words. */

@@ -15,7 +15,6 @@ Give the user a short, decision-first picture of everything running on this mach
    - **Finished**: crew turns that finished since the last briefing, one line each with its summary. Treat helper summaries as claims to check, not facts. For anything that matters, read it with `mcp__fleet__crew_read` before you rely on it.
    - **Running**: what is still working, in a few words each.
    - **Cost**: today's estimate, in one line. Say it is an estimate.
-   - **Notebook**: if helper suggestions are waiting, mention it once.
 4. End with one recommended next action ("answer argus first, then read the auth-review result").
 
 Keep it to what fits on one screen. Don't list idle sessions one by one; count them.

@@ -36,7 +36,7 @@ export type Session = {
   ctx: number
   cost: number
   tokens: number
-  /** today's part of cost and tokens (Cost's "today by session") */
+  /** today's part of cost and tokens */
   costToday?: number
   tokensToday?: number
   transcript: string
@@ -73,34 +73,9 @@ export type Snapshot = {
   cost: Cost
 }
 
-export type Tab = 'live' | 'needs' | 'feed' | 'crew' | 'cost' | 'system' | 'actions'
+export type Tab = 'live' | 'needs' | 'crew' | 'actions'
 
 export type CrewAgent = 'codex' | 'agy'
-export type CrewMode = 'read' | 'edit'
-
-/** A fact in a project's shared crew notebook: what every helper's brief carries. */
-export type CrewNote = {
-  id: number
-  text: string
-  by: 'claude' | 'codex' | 'agy' | 'you'
-  at: number
-  /** a helper's offer: kept out of every brief until you or Claude approve it */
-  pending?: boolean
-}
-
-/** What a Codex edit turn changed, waiting in its own git worktree until you accept or discard it. */
-export type Delivery = {
-  /** the worktree Codex edited in */
-  path: string
-  /** the repository's top folder: patches are made and applied from here */
-  root?: string
-  /** the commit the turn started from: the diff covers Codex's commits too */
-  base?: string
-  files: { path: string; added: number; removed: number }[]
-  state: 'pending' | 'accepted' | 'discarded'
-  /** why the last accept failed, if it did */
-  note?: string
-}
 
 /** One message to a crew thread and the helper's answer to it. */
 export type CrewTurn = {
@@ -120,8 +95,6 @@ export type CrewTurn = {
   isHanded: boolean
   /** finished and nobody has looked yet: shown under TO READ (or NEEDS YOU when failed) */
   unread?: boolean
-  /** a Codex edit turn's changes, apart from your tree until you accept them */
-  delivery?: Delivery
   /** the turn that wrote a state brief before the thread was compacted */
   isCompaction?: boolean
 }
@@ -132,7 +105,6 @@ export type CrewThread = {
   agent: CrewAgent
   model: string
   effort: string
-  mode: CrewMode
   cwd: string
   by: 'claude' | 'you'
   /** the helper's own conversation id, to resume it */
@@ -142,14 +114,8 @@ export type CrewThread = {
   compactions: number
   /** the turn number the last compaction happened before (0: never) */
   compactedAt?: number
-  /** the approved notes this helper's conversation has already been sent */
-  sentNotes?: { id: number; text: string }[]
   /** the state brief a compaction carried into the fresh conversation */
   brief: string
-  /** the window running this thread now: its session id, when its run began, its last heartbeat */
-  lease?: { sid: string; since: number; at: number }
-  /** another window asked the owner to stop this thread (epoch seconds) */
-  stopAsked?: number
   created: number
   updated: number
 }
@@ -178,13 +144,9 @@ declare module 'claude-code' {
       error: string | null
       tab: Tab
       selected: string | null
-      feedFilter: string | null
-      theme: string
-      scene: string
       threads: Shaped<CrewThread[]>
       crewSel: string | null
       crewAgent: CrewAgent
-      crewMode: CrewMode
       crewModel: string
       crewEffort: string
       crewModels: { codex: string[]; agy: string[] }
@@ -196,9 +158,6 @@ declare module 'claude-code' {
       crewOptions: boolean
       toured: boolean
       crewAllTurns: string | null
-      notebooks: Record<string, CrewNote[]>
-      /** the diff open in the Crew tab: "thread#n" and its text */
-      crewDiff: { key: string; text: string } | null
       /** a one-line crew update beside the user's prompt, for Claude only */
       statusLine: boolean
       /** the crew news Claude was last given (or read itself), so it isn't repeated */

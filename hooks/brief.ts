@@ -3,7 +3,7 @@
 // to read, then what is working. Each crew turn is listed once. Pure: snapshot and
 // threads in, text out.
 
-import type { CrewNote, CrewThread, Snapshot } from '../types'
+import type { CrewThread, Snapshot } from '../types'
 import { summaryOf } from './crew'
 import { activity, ago, needsYou, usd } from './fmt'
 import type { Item } from './inbox'
@@ -17,12 +17,9 @@ export type BriefInput = {
   /** epoch seconds of the last briefing; finished work after it is "new" */
   since: number
   now: number
-  pendingNotes: number
-  /** every project's notebook, for the inbox */
-  notebooks?: Readonly<Record<string, readonly CrewNote[]>>
   self: string
   detail?: Detail
-  /** project: only this folder's sessions, threads and notebook */
+  /** project: only this folder's sessions and threads */
   scope?: 'project' | 'all'
   /** this session's folder, for scope project */
   cwd?: string
@@ -47,8 +44,7 @@ export function fleetReport(b: BriefInput): string {
   const inScope = (cwd: string) => b.scope !== 'project' || !b.cwd || cwd === b.cwd || cwd.startsWith(`${b.cwd}/`)
   const sessions = b.snap.sessions.filter(s => inScope(s.cwd))
   const threads = b.threads.filter(t => inScope(t.cwd))
-  const notebooks = Object.fromEntries(Object.entries(b.notebooks ?? {}).filter(([f]) => inScope(f)))
-  const items = inbox(sessions, threads, notebooks)
+  const items = inbox(sessions, threads)
   const n = tally(items)
   const age = Math.max(0, Math.round(b.now - b.snap.now))
   const stale = age > 6 ? ' (STALE: the collector may have stopped)' : ''
@@ -76,10 +72,6 @@ export function fleetReport(b: BriefInput): string {
       const wait = needsYou(s) ? `${short(b.now - s.phaseSince)} · ` : ''
       return `- ${clean(s.name, 60)}${here} · ${wait}${clean(activity(s))}${agents}${where}`
     }
-    if (x.kind === 'notes') {
-      const project = x.folder.split('/').filter(Boolean).pop() ?? x.folder
-      return `- notebook ${clean(project, 40)} · ${x.count} suggestion${x.count === 1 ? '' : 's'} (crew_note {"folder": "${clean(x.folder, 120)}"})`
-    }
     if (x.kind === 'running') {
       const u = x.u
       return `- ${x.t.agent} › ${clean(x.t.name, 40)} · ${u ? short(b.now - u.started) : ''} · ${clean(u?.log[u.log.length - 1] ?? 'working')}`
@@ -88,8 +80,7 @@ export function fleetReport(b: BriefInput): string {
     if (u.status === 'failed') {
       return `- ${x.t.agent} › ${clean(x.t.name, 40)} · turn ${u.n} failed ${short(b.now - (u.ended ?? b.now))} ago · ${clean(u.log[u.log.length - 1] ?? '') || 'no log'}`
     }
-    const changes = u.delivery?.state === 'pending' ? ' · Codex changes waiting for the user' : ''
-    return `- ${x.t.agent} › ${clean(x.t.name, 40)}#${u.n} · ${clean(summaryOf(u.answer), 220) || '(no answer)'}${changes}`
+    return `- ${x.t.agent} › ${clean(x.t.name, 40)}#${u.n} · ${clean(summaryOf(u.answer), 220) || '(no answer)'}`
   }
 
   const section = (group: Item['group'], title: string) => {

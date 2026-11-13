@@ -1,6 +1,6 @@
 {
   "name": "purrfleet",
   "owner": { "name": "techbysakh963" },
-  "description": "FLEET: a cat-run command center for Claude Code, in the terminal.",
+  "description": "FLEET: a command center for Claude Code and its Codex/Antigravity crew, in the terminal.",
   "plugins": [{ "name": "fleet", "source": "./" }]
 }
