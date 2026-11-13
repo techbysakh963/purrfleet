@@ -77,7 +77,8 @@ export function fleetReport(b: BriefInput): string {
       return `- ${clean(s.name, 60)}${here} · ${wait}${clean(activity(s))}${agents}${where}`
     }
     if (x.kind === 'notes') {
-      return `- notebook · ${x.count} suggestion${x.count === 1 ? '' : 's'} (crew_note)${detail === 'full' ? ` · ${clean(x.folder, 120)}` : ''}`
+      const project = x.folder.split('/').filter(Boolean).pop() ?? x.folder
+      return `- notebook ${clean(project, 40)} · ${x.count} suggestion${x.count === 1 ? '' : 's'} (crew_note {"folder": "${clean(x.folder, 120)}"})`
     }
     if (x.kind === 'running') {
       const u = x.u
