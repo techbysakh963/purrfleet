@@ -41,9 +41,12 @@ Then start the loop with the `loop` skill, no interval (self-paced): `work the n
 | Moment | Call | Then |
 |---|---|---|
 | A design choice that is hard to undo | `crew_ask` agent `both`, depth `brief`, a different angle each in `tasks` | keep building what doesn't depend on it; decide when they answer |
-| Milestone item `M` | `crew_review` `target: commit:<first-sha-of-stretch>^..HEAD` or `branch:<base>`, `folder` = the project | read with `crew_read {"new": true}` |
+| Milestone item `M` | `crew_review` `target: branch:<sha of the last commit before this stretch>`, `folder` = the project (a range like `a^..HEAD` is refused) | read with `crew_read {"new": true}` |
 | The same failure twice | `crew_ask` `both`: the error, what you tried, the file | try their best idea once |
-| Final item `F` | `crew_review` of everything since the first commit | fix, re-run Done-when checks |
+| Final item `F` | `crew_review` `branch:<sha of the last milestone commit>`: only what no review has seen yet. The diff is cut at 30,000 characters; if the stretch is bigger, review it in parts with `files:<a,b>` | fix, re-run Done-when checks |
+
+- Write the commit and Log line for a review only **after** its receipt comes back; a failed send is logged as failed.
+- Put the threat model in the plan (who could feed the tool bad input). Reviewers will keep asking for hardening; once the plan's threat model is covered, further hardening is out of scope.
 
 - **Never wait idle on the crew.** Send, continue the next independent item, read the notice when it comes.
 - **Verify every finding yourself** against the code before fixing. Rejected ones go in the Log with one reason.
