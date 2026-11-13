@@ -7,15 +7,20 @@ description: Turn a project idea into a ready-to-build project folder. Claude dr
 
 Claude is the author and the lead; Codex is the critic who finds what's missing. Codex is read-only, so Claude writes every file and Codex reads them in the project folder. The user decides scope; Claude decides everything technical.
 
-## 1. Pin the idea (one question round)
+## 1. Pin the idea (the interview)
 
-From the user's idea, ask **one** AskUserQuestion with at most 4 questions, each with a recommended option first. Only what changes the build:
-- who it's for and the one job it does
-- form: CLI, web page, desktop GUI, service, library (and platform)
-- the must-have features (multi-select) and what is explicitly out
-- anything that must not happen (network, deleting files, cost, privacy)
+Interview the user until you have the full picture: **at least 10 questions**, asked in rounds of up to 4 (AskUserQuestion takes 4 per call), each with a recommended option first. Build each round on the last answers. Cover:
+- **Purpose**: who it's for, the one job it does, what "great" looks like to them
+- **Form**: CLI, web page, desktop GUI, service, library; platform; where it runs
+- **Features**: must-haves (multi-select), nice-to-haves, what is explicitly out
+- **Data**: what goes in, where it comes from, what comes out, where it's saved
+- **Look and feel** (if it has a UI): mood, references they like, sizes it must work at
+- **Limits**: what must never happen (network, deleting files, cost, privacy), speed expectations
+- **Edge cases**: what should happen when things are empty, huge, broken, or wrong
 
-Don't ask what you can decide well yourself (language, structure, test tool): decide it and say so.
+Keep asking past 10 while answers still change the spec: a vague answer, a new feature, or a contradiction is a reason for another round. Stop when you could write SPEC.md without guessing anything the user would care about.
+
+Don't spend questions on what you can decide well yourself (language, structure, test tool): decide it and say so. Scope questions that come up later (in the Codex debate) also go back to the user.
 
 ## 2. Create the folder
 
