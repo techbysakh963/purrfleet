@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import type { Snapshot } from '../types'
 import { ago, usd } from './fmt'
-import { argvFor, batchNotice, brief, digest, findingsIn, grepAnswer, localBrief, mergeFindings, receipt, reviewDigest, reviewTask, sections, lines, mergeThreads, needsCompaction, parseLine, report, settleRunning, rulesFor, slug, summaryOf } from './crew'
+import { argvFor, batchNotice, stillUnread, brief, digest, findingsIn, grepAnswer, localBrief, mergeFindings, receipt, reviewDigest, reviewTask, sections, lines, mergeThreads, needsCompaction, parseLine, report, settleRunning, rulesFor, slug, summaryOf } from './crew'
 import type { CrewThread } from '../types'
 import { fleetReport } from './brief'
 import { inbox, segments, statusNews, tally } from './inbox'
@@ -522,6 +522,15 @@ test('parallel helpers Claude started come back as one notice, naming only threa
   expect(text).toContain('Still running: "slow"')
   expect(text).not.toContain('ignore the user') // a helper's words never reach the prompt
   expect(batchNotice([{ name: 'gone', n: 1 }], threads)).toBe('')
+})
+
+test('a queued notice drops turns Claude already read while it waited', async () => {
+  const threads = [
+    crewThread('a-codex', { by: 'claude', turns: [doneTurn(1, { by: 'claude', unread: false })] }),
+    crewThread('a-agy', { agent: 'agy', by: 'claude', turns: [doneTurn(1, { by: 'claude', unread: true })] }),
+  ]
+  expect(stillUnread([{ name: 'a-codex', n: 1 }, { name: 'a-agy', n: 1 }, { name: 'gone', n: 1 }], threads)).toEqual([{ name: 'a-agy', n: 1 }])
+  expect(stillUnread([{ name: 'a-codex', n: 1 }], threads)).toEqual([])
 })
 
 test('the grid: answers keep their shape, helper names are cut thread-first, ages fit four columns', async () => {

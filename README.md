@@ -9,20 +9,18 @@ Claude can hand read-only work to: second opinions, broad reads, and two-helper 
 
 ## Install
 
-At the prompt of a Claude Code terminal session:
+On any machine, one command (installs, or updates if FLEET is already there):
 
 ```
-/plugin install fleet --marketplace techbysakh963/purrfleet
+bash <(gh api -H 'Accept: application/vnd.github.raw' repos/techbysakh963/purrfleet/contents/install.sh)
 ```
 
-From a shell:
+It needs Claude Code, git, Python 3 and the GitHub CLI signed in (`gh auth login`), because the
+repository is private. It checks each one and says what's missing. Codex and Antigravity are optional.
+Then type `/reload-plugins` in a running session (or start a new one) and `/fleet`.
 
-```
-claude plugin install fleet --marketplace techbysakh963/purrfleet
-```
-
-This is a private repository: it installs only for people who can read it on GitHub and whose
-machine already holds a git credential for github.com (`gh auth login`, then `gh auth setup-git`).
+By hand instead: `claude plugin install fleet --marketplace techbysakh963/purrfleet`
+(after `gh auth setup-git`, so git can clone the private repository).
 
 ## Use
 

@@ -7,7 +7,7 @@ import {
   COMPACT_PROMPT,
   EFFORTS,
   argvFor,
-  batchNotice,
+  batchNotice, stillUnread,
   brief,
   digest,
   findingsIn,
@@ -591,11 +591,12 @@ async function queueForClaude($: EngineInterface, name: string, n: number): Prom
 
 /** Sends what's queued as one notice; if the notice can't be sent, it is kept and tried again. */
 async function flushForClaude($: EngineInterface): Promise<void> {
-  const due = handQueue
+  const queued = handQueue
   handQueue = []
   handGen++
-  if (due.length === 0) return
   const list = await read($, threads)
+  const due = stillUnread(queued, list)
+  if (due.length === 0) return
   const text = due.length === 1 ? singleNotice(list, due[0]!.name, due[0]!.n) : batchNotice(due, list)
   if (!text) return
   const isSent = await $.prompt

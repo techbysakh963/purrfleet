@@ -342,6 +342,17 @@ export const settleRunning = (list: readonly CrewThread[], now: number): CrewThr
   )
 
 /**
+ * Queued finished turns Claude hasn't read yet. A notice waits for its siblings
+ * (up to a few minutes); if Claude read a turn with crew_read meanwhile, telling
+ * it again only costs a turn ending in "Nothing unread".
+ */
+export const stillUnread = (
+  due: readonly { name: string; n: number }[],
+  threads: readonly CrewThread[],
+): { name: string; n: number }[] =>
+  due.filter(({ name, n }) => threads.find(t => t.name === name)?.turns.find(u => u.n === n)?.unread === true)
+
+/**
  * The one notice Claude gets when several threads it started finish together:
  * fixed wording and thread names only (a helper's words reach Claude through
  * crew_read, never through the prompt). Empty when none of them still exists.
