@@ -20,7 +20,9 @@ if claude plugin list 2>/dev/null | grep -q 'fleet@purrfleet'; then
   claude plugin marketplace update purrfleet
   claude plugin update fleet@purrfleet
 else
-  claude plugin install fleet --marketplace "$REPO"
+  # HTTPS, not SSH: gh's sign-in covers it, and a new machine may have no SSH key
+  claude plugin marketplace add "https://github.com/$REPO.git"
+  claude plugin install fleet@purrfleet
 fi
 
 for helper in codex agy; do
