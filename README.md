@@ -82,6 +82,10 @@ One collector serves every Claude window: it scans under a lock and the others r
 `$XDG_RUNTIME_DIR/claude-hud/`, and transcripts under `~/.claude/projects/`, parsed incrementally
 by `bin/fleet_scan.py`. Cost is an estimate at API list prices (`PRICES` in that file).
 
+A second Claude Code setup (`CLAUDE_CONFIG_DIR=~/.claude-x`) gets its own FLEET: it reads that folder's
+`sessions/` and `projects/` instead, and keeps its cache and helper answers in `~/.cache/purrfleet-claude-x/`.
+Crew threads and the briefing marker live in Claude Code's per-plugin store, which is already under the config dir.
+
 ## Develop
 
 This folder is both the repository and the installed plugin's source (marketplace `purrfleet`,

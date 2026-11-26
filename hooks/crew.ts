@@ -328,6 +328,17 @@ export function mergeThreads(mine: readonly CrewThread[], stored: readonly CrewT
   return out
 }
 
+/**
+ * Where full helper answers are kept: ~/.cache/purrfleet/answers, or purrfleet-<name> for
+ * another Claude Code setup (CLAUDE_CONFIG_DIR=~/.claude-x), matching bin/fleet_scan.py.
+ */
+export function answersRoot(home: string, configDir: string | undefined): string {
+  const dir = (configDir ?? '').replace(/^~(?=\/|$)/, home).replace(/\/+$/, '')
+  const name = dir.split('/').pop()?.replace(/^\.+/, '') || 'alt'
+  const suffix = !dir || dir === `${home}/.claude` ? '' : `-${name}`
+  return `${home}/.cache/purrfleet${suffix}/answers`
+}
+
 /** At start: a turn left running died with the window that ran it. */
 export const settleRunning = (list: readonly CrewThread[], now: number): CrewThread[] =>
   list.map(t =>

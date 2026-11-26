@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import type { Snapshot } from '../types'
 import { ago, usd } from './fmt'
-import { argvFor, batchNotice, stillUnread, brief, digest, findingsIn, grepAnswer, localBrief, mergeFindings, receipt, reviewDigest, reviewTask, sections, lines, mergeThreads, needsCompaction, parseLine, report, settleRunning, rulesFor, slug, summaryOf } from './crew'
+import { answersRoot, argvFor, batchNotice, stillUnread, brief, digest, findingsIn, grepAnswer, localBrief, mergeFindings, receipt, reviewDigest, reviewTask, sections, lines, mergeThreads, needsCompaction, parseLine, report, settleRunning, rulesFor, slug, summaryOf } from './crew'
 import type { CrewThread } from '../types'
 import { fleetReport } from './brief'
 import { inbox, segments, statusNews, tally } from './inbox'
@@ -706,4 +706,12 @@ test('helpers are pointed to the project rules they would not load themselves', 
   const t = crewThread('r', { session: '' })
   expect(brief(t, 'claude', 'look', '', undefined, 'normal', ['CLAUDE.md'])).toContain("This project's rules are in CLAUDE.md")
   expect(brief(t, 'claude', 'look', '')).not.toContain('rules are in')
+})
+
+test('helper answers are kept per Claude Code setup, as the collector keeps its cache', async () => {
+  expect(answersRoot('/h', undefined)).toBe('/h/.cache/purrfleet/answers')
+  expect(answersRoot('/h', '')).toBe('/h/.cache/purrfleet/answers')
+  expect(answersRoot('/h', '~/.claude/')).toBe('/h/.cache/purrfleet/answers')
+  expect(answersRoot('/h', '/h/.claude-x')).toBe('/h/.cache/purrfleet-claude-x/answers')
+  expect(answersRoot('/h', '~/.claude-x/')).toBe('/h/.cache/purrfleet-claude-x/answers')
 })

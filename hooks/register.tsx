@@ -7,7 +7,7 @@ import {
   COMPACT_PROMPT,
   EFFORTS,
   argvFor,
-  batchNotice, stillUnread,
+  answersRoot, batchNotice, stillUnread,
   brief,
   digest,
   findingsIn,
@@ -1194,7 +1194,7 @@ export const register: Register = on => {
     await update($, toured, () => false)
     if ((await $.store.get('toured')) === true) await update($, toured, () => true)
     const homeDir = (await $.env.get('HOME')) ?? ''
-    if (homeDir) answersDir = `${homeDir}/.cache/purrfleet/answers`
+    if (homeDir) answersDir = answersRoot(homeDir, await $.env.get('CLAUDE_CONFIG_DIR'))
     // a turn left running died with the window (or reload) that ran it
     await update($, threads, list => settleRunning(list, now()))
     await registerCrewTools($)
