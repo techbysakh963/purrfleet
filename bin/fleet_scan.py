@@ -2,12 +2,13 @@
 """FLEET collector: one JSON snapshot of every live Claude Code session.
 
 Read-only over Claude Code's own files:
-  ~/.claude/sessions/<pid>.json            live sessions (alive if /proc/<pid> exists)
-  $XDG_RUNTIME_DIR/claude-hud/s-<sid>/     Claude Core HUD hook state (phase, tools, agents)
-  ~/.claude/projects/<slug>/<sid>.jsonl    transcripts (feed, tokens, cost), read incrementally
+  $CLAUDE_CONFIG_DIR/sessions/<pid>.json          live sessions (alive if /proc/<pid> exists)
+  $XDG_RUNTIME_DIR/claude-hud/s-<sid>/           Claude Core HUD hook state (phase, tools, agents)
+  $CLAUDE_CONFIG_DIR/projects/<slug>/<sid>.jsonl  transcripts (feed, tokens, cost), read incrementally
+($CLAUDE_CONFIG_DIR defaults to ~/.claude.)
 
-Its only write is its own cache: $XDG_RUNTIME_DIR/claude-fleet/cache.json, holding the
-byte offset reached in each transcript, so each run parses only the lines that are new.
+Its only writes are its own: ~/.cache/purrfleet/ (purrfleet-<name> for another config dir), holding
+the byte offset reached in each transcript (so each run parses only new lines) and the last snapshot.
 """
 import fcntl
 import json
@@ -20,11 +21,15 @@ import time
 from datetime import datetime, timedelta
 
 HOME = os.path.expanduser("~")
-CLAUDE = os.path.join(HOME, ".claude")
+DEFAULT_CLAUDE = os.path.join(HOME, ".claude")
+# a second Claude Code setup (CLAUDE_CONFIG_DIR=~/.claude-x) gets its own sessions, transcripts and cache
+CLAUDE = (os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "").rstrip("/") or DEFAULT_CLAUDE)
 RT = os.environ.get("XDG_RUNTIME_DIR") or ""
 HUD = os.path.join(RT, "claude-hud") if RT and os.path.isdir(os.path.join(RT, "claude-hud")) else f"/tmp/claude-hud-{os.getuid()}"
 # the cache lives in a private per-user folder, never a shared temp folder
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "purrfleet")
+# shortcut: the suffix is the config dir's basename, so two setups whose dirs share a basename would share a cache
+SUFFIX = "" if os.path.realpath(CLAUDE) == os.path.realpath(DEFAULT_CLAUDE) else "-" + (os.path.basename(CLAUDE).lstrip(".") or "alt")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "purrfleet" + SUFFIX)
 CACHE = os.path.join(CACHE_DIR, "cache.json")
 SNAPSHOT = os.path.join(CACHE_DIR, "snapshot.json")  # the last result, shared by every Claude window
 LOCK = os.path.join(CACHE_DIR, "scan.lock")
